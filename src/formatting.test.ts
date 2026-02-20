@@ -102,34 +102,34 @@ describe('formatMessages', () => {
 // --- TRIGGER_PATTERN ---
 
 describe('TRIGGER_PATTERN', () => {
-  it('matches @Andy at start of message', () => {
-    expect(TRIGGER_PATTERN.test('@Andy hello')).toBe(true);
+  it('matches @Jarvis at start of message', () => {
+    expect(TRIGGER_PATTERN.test('@Jarvis hello')).toBe(true);
   });
 
   it('matches case-insensitively', () => {
-    expect(TRIGGER_PATTERN.test('@andy hello')).toBe(true);
-    expect(TRIGGER_PATTERN.test('@ANDY hello')).toBe(true);
+    expect(TRIGGER_PATTERN.test('@jarvis hello')).toBe(true);
+    expect(TRIGGER_PATTERN.test('@JARVIS hello')).toBe(true);
   });
 
   it('does not match when not at start of message', () => {
-    expect(TRIGGER_PATTERN.test('hello @Andy')).toBe(false);
+    expect(TRIGGER_PATTERN.test('hello @Jarvis')).toBe(false);
   });
 
-  it('does not match partial name like @Andrew (word boundary)', () => {
-    expect(TRIGGER_PATTERN.test('@Andrew hello')).toBe(false);
+  it('does not match partial name like @Jarvison (word boundary)', () => {
+    expect(TRIGGER_PATTERN.test('@Jarvison hello')).toBe(false);
   });
 
   it('matches with word boundary before apostrophe', () => {
-    expect(TRIGGER_PATTERN.test("@Andy's thing")).toBe(true);
+    expect(TRIGGER_PATTERN.test("@Jarvis's thing")).toBe(true);
   });
 
-  it('matches @Andy alone (end of string is a word boundary)', () => {
-    expect(TRIGGER_PATTERN.test('@Andy')).toBe(true);
+  it('matches @Jarvis alone (end of string is a word boundary)', () => {
+    expect(TRIGGER_PATTERN.test('@Jarvis')).toBe(true);
   });
 
   it('matches with leading whitespace after trim', () => {
     // The actual usage trims before testing: TRIGGER_PATTERN.test(m.content.trim())
-    expect(TRIGGER_PATTERN.test('@Andy hey'.trim())).toBe(true);
+    expect(TRIGGER_PATTERN.test('@Jarvis hey'.trim())).toBe(true);
   });
 });
 
@@ -219,7 +219,7 @@ describe('trigger gating (requiresTrigger interaction)', () => {
   });
 
   it('non-main group with requiresTrigger=true processes when trigger present', () => {
-    const msgs = [makeMsg({ content: '@Andy do something' })];
+    const msgs = [makeMsg({ content: '@Jarvis do something' })];
     expect(shouldProcess(false, true, msgs)).toBe(true);
   });
 
