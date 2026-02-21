@@ -503,6 +503,7 @@ async function main(): Promise<void> {
       groupJid: voiceJid,
       tlsCert: VOICE_TLS_CERT || undefined,
       tlsKey: VOICE_TLS_KEY || undefined,
+      warmContainer: (jid) => queue.enqueueMessageCheck(jid),
     });
     channels.push(voice);
     await voice.connect();

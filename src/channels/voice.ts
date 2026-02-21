@@ -24,6 +24,7 @@ export interface VoiceChannelOpts {
   groupJid: string; // e.g. "voice:main@local"
   tlsCert?: string; // path to TLS cert file
   tlsKey?: string;  // path to TLS key file
+  warmContainer?: (groupJid: string) => void; // Pre-warm container on connection
 }
 
 export class VoiceChannel implements Channel {
@@ -111,6 +112,12 @@ export class VoiceChannel implements Channel {
                 'voice',
                 true,
               );
+
+              // Pre-warm container for fast first response
+              if (this.opts.warmContainer && this.activeClients.size === 1) {
+                logger.info({ groupJid: this.opts.groupJid }, 'Pre-warming container for voice');
+                this.opts.warmContainer(this.opts.groupJid);
+              }
             } else {
               ws.close(4001, 'Invalid token');
             }
