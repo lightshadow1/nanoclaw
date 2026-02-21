@@ -179,7 +179,9 @@ export class VoiceChannel implements Channel {
     if (!this.ownsJid(jid)) return;
 
     try {
-      const audioBuffer = await this.synthesize(text);
+      // Clean text for TTS - remove markdown and emojis
+      const cleanText = this.sanitizeForTTS(text);
+      const audioBuffer = await this.synthesize(cleanText);
       for (const [, ws] of this.activeClients) {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(
@@ -300,6 +302,30 @@ export class VoiceChannel implements Channel {
       logger.error({ err }, 'Smallest.ai transcription failed');
       return null;
     }
+  }
+
+  private sanitizeForTTS(text: string): string {
+    return text
+      // Remove emojis
+      .replace(/[\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '')
+      // Remove markdown bold/italic
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/\*([^*]+)\*/g, '$1')
+      .replace(/__([^_]+)__/g, '$1')
+      .replace(/_([^_]+)_/g, '$1')
+      // Remove markdown headers
+      .replace(/^#{1,6}\s+/gm, '')
+      // Remove markdown links [text](url) -> text
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      // Remove markdown code blocks
+      .replace(/```[\s\S]*?```/g, '')
+      .replace(/`([^`]+)`/g, '$1')
+      // Remove bullet points and list markers
+      .replace(/^[•\-*]\s+/gm, '')
+      // Clean up multiple spaces and newlines
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
   }
 
   private async synthesize(text: string): Promise<Buffer> {
