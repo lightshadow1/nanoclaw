@@ -49,6 +49,7 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 ## What It Supports
 
 - **WhatsApp I/O** - Message Claude from your phone
+- **Voice interface** - Real-time voice conversations via browser with STT/TTS (Smallest.ai)
 - **Isolated group context** - Each group has its own `CLAUDE.md` memory, isolated filesystem, and runs in its own container sandbox with only that filesystem mounted
 - **Main channel** - Your private channel (self-chat) for admin control; every other group is completely isolated
 - **Scheduled tasks** - Recurring jobs that run Claude and can message you back
@@ -135,14 +136,17 @@ Skills we'd love to see:
 ## Architecture
 
 ```
-WhatsApp (baileys) --> SQLite --> Polling loop --> Container (Claude Agent SDK) --> Response
+WhatsApp (baileys) ──┐
+                     ├──> SQLite --> Polling loop --> Container (Claude Agent SDK) --> Response
+Voice (WebSocket) ───┘
 ```
 
-Single Node.js process. Agents execute in isolated Linux containers with mounted directories. Per-group message queue with concurrency control. IPC via filesystem.
+Single Node.js process with multi-channel support. Agents execute in isolated Linux containers with mounted directories. Per-group message queue with concurrency control. IPC via filesystem.
 
 Key files:
-- `src/index.ts` - Orchestrator: state, message loop, agent invocation
+- `src/index.ts` - Orchestrator: state, message loop, multi-channel routing
 - `src/channels/whatsapp.ts` - WhatsApp connection, auth, send/receive
+- `src/channels/voice.ts` - Voice WebSocket server, Smallest.ai STT/TTS
 - `src/ipc.ts` - IPC watcher and task processing
 - `src/router.ts` - Message formatting and outbound routing
 - `src/group-queue.ts` - Per-group queue with global concurrency limit
@@ -150,6 +154,7 @@ Key files:
 - `src/task-scheduler.ts` - Runs scheduled tasks
 - `src/db.ts` - SQLite operations (messages, groups, sessions, state)
 - `groups/*/CLAUDE.md` - Per-group memory
+- `clients/voice-web/index.html` - Browser voice client
 
 ## FAQ
 
