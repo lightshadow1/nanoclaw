@@ -9,7 +9,14 @@ import {
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
   TRIGGER_PATTERN,
+  VOICE_ENABLED,
+  VOICE_GROUP,
+  VOICE_HOST,
+  VOICE_PORT,
+  VOICE_TLS_CERT,
+  VOICE_TLS_KEY,
 } from './config.js';
+import { VoiceChannel } from './channels/voice.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import {
   ContainerOutput,
@@ -100,7 +107,11 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
   const registeredJids = new Set(Object.keys(registeredGroups));
 
   return chats
-    .filter((c) => c.jid !== '__group_sync__' && c.is_group)
+    .filter(
+      (c) =>
+        c.jid !== '__group_sync__' &&
+        (c.is_group || c.jid.startsWith('voice:')),
+    )
     .map((c) => ({
       jid: c.jid,
       name: c.name,
@@ -482,6 +493,30 @@ async function main(): Promise<void> {
   whatsapp = new WhatsAppChannel(channelOpts);
   channels.push(whatsapp);
   await whatsapp.connect();
+
+  if (VOICE_ENABLED) {
+    const voiceJid = `voice:${VOICE_GROUP}@local`;
+    const voice = new VoiceChannel({
+      ...channelOpts,
+      port: VOICE_PORT,
+      host: VOICE_HOST,
+      groupJid: voiceJid,
+      tlsCert: VOICE_TLS_CERT || undefined,
+      tlsKey: VOICE_TLS_KEY || undefined,
+    });
+    channels.push(voice);
+    await voice.connect();
+
+    if (!registeredGroups[voiceJid]) {
+      registerGroup(voiceJid, {
+        name: `Voice (${VOICE_GROUP})`,
+        folder: VOICE_GROUP,
+        trigger: `@${ASSISTANT_NAME}`,
+        added_at: new Date().toISOString(),
+        requiresTrigger: false,
+      });
+    }
+  }
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({

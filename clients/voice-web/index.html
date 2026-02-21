@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>NanoClaw Voice</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: #0a0a0a; color: #e0e0e0;
+      height: 100vh; display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    .header {
+      padding: 12px 16px; display: flex; align-items: center;
+      justify-content: space-between; border-bottom: 1px solid #222;
+    }
+    .header h1 { font-size: 16px; font-weight: 500; }
+    .connection-info { font-size: 11px; color: #666; }
+    .status-area {
+      flex: 0 0 auto; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; padding: 32px 16px;
+    }
+    .status-orb {
+      width: 80px; height: 80px; border-radius: 50%;
+      background: #333; transition: all 0.3s ease;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 28px;
+    }
+    .status-orb.listening { background: #1a3a5c; box-shadow: 0 0 20px #1a5a9a44; }
+    .status-orb.transcribing { background: #5c4a1a; box-shadow: 0 0 20px #9a7a1a44; }
+    .status-orb.thinking { background: #5c4a1a; box-shadow: 0 0 20px #9a7a1a44; animation: pulse 1.5s infinite; }
+    .status-orb.speaking { background: #1a5c2a; box-shadow: 0 0 20px #1a9a3a44; }
+    .status-orb.disconnected { background: #5c1a1a; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+    .status-label {
+      margin-top: 8px; font-size: 13px; text-transform: uppercase;
+      letter-spacing: 1px; color: #888;
+    }
+    .transcript-area {
+      flex: 1; overflow-y: auto; padding: 16px;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .msg { padding: 8px 12px; border-radius: 8px; max-width: 85%; font-size: 14px; line-height: 1.4; }
+    .msg.user { align-self: flex-end; background: #1a3a5c; }
+    .msg.agent { align-self: flex-start; background: #222; }
+    .msg.system { align-self: center; color: #666; font-size: 12px; }
+    .controls {
+      padding: 16px; border-top: 1px solid #222;
+      display: flex; gap: 8px; align-items: center;
+    }
+    .controls input {
+      flex: 1; padding: 8px 12px; border: 1px solid #333;
+      border-radius: 6px; background: #111; color: #e0e0e0;
+      font-size: 14px;
+    }
+    .controls button {
+      padding: 8px 16px; border: none; border-radius: 6px;
+      font-size: 14px; cursor: pointer; font-weight: 500;
+    }
+    .btn-connect { background: #1a5a9a; color: white; }
+    .btn-connect:hover { background: #2a6aaa; }
+    .btn-disconnect { background: #9a1a1a; color: white; }
+    .btn-disconnect:hover { background: #aa2a2a; }
+    .setup-screen {
+      flex: 1; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 16px; padding: 32px;
+    }
+    .setup-screen input {
+      width: 100%; max-width: 300px; padding: 10px 14px;
+      border: 1px solid #333; border-radius: 8px;
+      background: #111; color: #e0e0e0; font-size: 14px;
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>NanoClaw Voice</h1>
+    <span class="connection-info" id="connInfo">Disconnected</span>
+  </div>
+
+  <!-- Setup screen -->
+  <div class="setup-screen" id="setupScreen">
+    <input type="text" id="serverUrl" placeholder="WebSocket URL">
+    <input type="password" id="authToken" placeholder="Auth token">
+    <button class="btn-connect" onclick="connectVoice()">Connect</button>
+  </div>
+
+  <!-- Main interface (hidden until connected) -->
+  <div class="status-area hidden" id="mainUI">
+    <div class="status-orb disconnected" id="statusOrb">🎤</div>
+    <div class="status-label" id="statusLabel">disconnected</div>
+  </div>
+  <div class="transcript-area hidden" id="transcriptArea"></div>
+  <div class="controls hidden" id="controlsArea">
+    <button class="btn-disconnect" onclick="disconnectVoice()">Disconnect</button>
+  </div>
+
+  <script>
+    let ws = null;
+    let audioContext = null;
+    let mediaStream = null;
+    let processor = null;
+    let isRecording = false;
+    let audioChunks = [];
+    let silenceFrames = 0;
+    const SILENCE_THRESHOLD = 0.01;
+    const SILENCE_FRAMES_TO_STOP = 2;
+    const MIN_SPEECH_FRAMES = 3;
+    let speechFrames = 0;
+
+    // Auto-fill WebSocket URL from current page
+    const loc = window.location;
+    const wsProtocol = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+    document.getElementById('serverUrl').value =
+      `${wsProtocol}//${loc.hostname}:${loc.port}/voice`;
+
+    function addMessage(text, type) {
+      const area = document.getElementById('transcriptArea');
+      const div = document.createElement('div');
+      div.className = `msg ${type}`;
+      div.textContent = text;
+      area.appendChild(div);
+      area.scrollTop = area.scrollHeight;
+    }
+
+    function setStatus(state) {
+      const orb = document.getElementById('statusOrb');
+      const label = document.getElementById('statusLabel');
+      orb.className = `status-orb ${state}`;
+      label.textContent = state;
+      const emoji = {
+        listening: '🎤', transcribing: '📝',
+        thinking: '🤔', speaking: '🔊', disconnected: '🔇'
+      };
+      orb.textContent = emoji[state] || '❓';
+    }
+
+    async function connectVoice() {
+      const url = document.getElementById('serverUrl').value;
+      const token = document.getElementById('authToken').value;
+      if (!url || !token) { alert('Enter server URL and token'); return; }
+
+      try {
+        ws = new WebSocket(url);
+
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'auth', token }));
+          document.getElementById('connInfo').textContent = 'Authenticating...';
+        };
+
+        ws.onmessage = async (event) => {
+          const msg = JSON.parse(event.data);
+
+          switch (msg.type) {
+            case 'auth_ok':
+              document.getElementById('setupScreen').classList.add('hidden');
+              document.getElementById('mainUI').classList.remove('hidden');
+              document.getElementById('transcriptArea').classList.remove('hidden');
+              document.getElementById('controlsArea').classList.remove('hidden');
+              document.getElementById('connInfo').textContent = `Connected (${msg.sessionId.slice(0,8)})`;
+              addMessage('Connected to NanoClaw', 'system');
+              await startMicrophone();
+              setStatus('listening');
+              break;
+
+            case 'status':
+              setStatus(msg.state);
+              break;
+
+            case 'transcript':
+              if (msg.isFinal) addMessage(msg.text, 'user');
+              break;
+
+            case 'audio_response':
+              addMessage(msg.text, 'agent');
+              if (msg.data) await playAudio(msg.data, msg.sampleRate || 24000);
+              break;
+
+            case 'text_response':
+              addMessage(msg.text, 'agent');
+              break;
+          }
+        };
+
+        ws.onclose = (e) => {
+          document.getElementById('connInfo').textContent = `Disconnected (${e.code})`;
+          setStatus('disconnected');
+          stopMicrophone();
+        };
+
+        ws.onerror = () => {
+          document.getElementById('connInfo').textContent = 'Connection error';
+        };
+      } catch (err) {
+        alert('Connection failed: ' + err.message);
+      }
+    }
+
+    function disconnectVoice() {
+      if (ws) { ws.close(); ws = null; }
+      stopMicrophone();
+      document.getElementById('setupScreen').classList.remove('hidden');
+      document.getElementById('mainUI').classList.add('hidden');
+      document.getElementById('transcriptArea').classList.add('hidden');
+      document.getElementById('controlsArea').classList.add('hidden');
+    }
+
+    async function startMicrophone() {
+      try {
+        audioContext = new AudioContext({ sampleRate: 16000 });
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+        });
+
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        processor = audioContext.createScriptProcessor(4096, 1, 1);
+        audioChunks = [];
+        silenceFrames = 0;
+        speechFrames = 0;
+        isRecording = false;
+
+        processor.onaudioprocess = (e) => {
+          const input = e.inputBuffer.getChannelData(0);
+          let energy = 0;
+          for (let i = 0; i < input.length; i++) energy += input[i] * input[i];
+          energy = Math.sqrt(energy / input.length);
+
+          if (energy > SILENCE_THRESHOLD) {
+            silenceFrames = 0;
+            speechFrames++;
+            if (!isRecording && speechFrames > MIN_SPEECH_FRAMES) isRecording = true;
+            if (isRecording) {
+              const pcm = new Int16Array(input.length);
+              for (let i = 0; i < input.length; i++)
+                pcm[i] = Math.max(-32768, Math.min(32767, Math.round(input[i] * 32767)));
+              audioChunks.push(pcm);
+            }
+          } else {
+            silenceFrames++;
+            if (isRecording) {
+              if (silenceFrames >= SILENCE_FRAMES_TO_STOP) {
+                sendAudio();
+                isRecording = false;
+                speechFrames = 0;
+                audioChunks = [];
+              } else {
+                const pcm = new Int16Array(input.length);
+                for (let i = 0; i < input.length; i++)
+                  pcm[i] = Math.max(-32768, Math.min(32767, Math.round(input[i] * 32767)));
+                audioChunks.push(pcm);
+              }
+            } else {
+              speechFrames = 0;
+            }
+          }
+        };
+
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+      } catch (err) {
+        addMessage('Microphone error: ' + err.message, 'system');
+      }
+    }
+
+    function sendAudio() {
+      if (!ws || ws.readyState !== WebSocket.OPEN || audioChunks.length === 0) return;
+
+      const totalLength = audioChunks.reduce((sum, c) => sum + c.length, 0);
+      const combined = new Int16Array(totalLength);
+      let offset = 0;
+      for (const chunk of audioChunks) { combined.set(chunk, offset); offset += chunk.length; }
+
+      const bytes = new Uint8Array(combined.buffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+
+      ws.send(JSON.stringify({
+        type: 'audio',
+        data: btoa(binary),
+        format: 'pcm_s16le',
+        sampleRate: 16000,
+        channels: 1,
+        isFinal: true,
+      }));
+    }
+
+    function stopMicrophone() {
+      if (processor) { processor.disconnect(); processor = null; }
+      if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+      if (audioContext) { audioContext.close(); audioContext = null; }
+    }
+
+    async function playAudio(base64Data, sampleRate) {
+      try {
+        const rate = sampleRate || 24000;
+        const playCtx = new AudioContext({ sampleRate: rate });
+        const binary = atob(base64Data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+        const int16 = new Int16Array(bytes.buffer);
+        const float32 = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+
+        const audioBuffer = playCtx.createBuffer(1, float32.length, rate);
+        audioBuffer.getChannelData(0).set(float32);
+
+        const source = playCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(playCtx.destination);
+        source.start();
+        source.onended = () => playCtx.close();
+      } catch (err) {
+        console.error('Audio playback error:', err);
+      }
+    }
+  </script>
+</body>
+</html>

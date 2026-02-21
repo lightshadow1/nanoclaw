@@ -66,3 +66,24 @@ export const TRIGGER_PATTERN = new RegExp(
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// Voice channel
+const voiceEnv = readEnvFile([
+  'VOICE_ENABLED', 'VOICE_PORT', 'VOICE_HOST', 'VOICE_GROUP',
+  'VOICE_TLS_CERT', 'VOICE_TLS_KEY',
+]);
+export const VOICE_ENABLED =
+  (process.env.VOICE_ENABLED || voiceEnv.VOICE_ENABLED) === 'true';
+export const VOICE_PORT = parseInt(
+  process.env.VOICE_PORT || voiceEnv.VOICE_PORT || '8443', 10,
+);
+export const VOICE_HOST =
+  process.env.VOICE_HOST || voiceEnv.VOICE_HOST || '127.0.0.1';
+export const VOICE_GROUP =
+  process.env.VOICE_GROUP || voiceEnv.VOICE_GROUP || 'main';
+export const VOICE_TLS_CERT =
+  process.env.VOICE_TLS_CERT || voiceEnv.VOICE_TLS_CERT || '';
+export const VOICE_TLS_KEY =
+  process.env.VOICE_TLS_KEY || voiceEnv.VOICE_TLS_KEY || '';
+// VOICE_AUTH_TOKEN and SMALLEST_AI_API_KEY are read at runtime by VoiceChannel
+// (not exported here — kept out of process environment)
