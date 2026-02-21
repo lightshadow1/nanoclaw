@@ -29,6 +29,7 @@
       font-size: 28px;
     }
     .status-orb.listening { background: #1a3a5c; box-shadow: 0 0 20px #1a5a9a44; }
+    .status-orb.recording { background: #8a1a1a; box-shadow: 0 0 30px #ff000088; animation: pulse 0.8s infinite; }
     .status-orb.transcribing { background: #5c4a1a; box-shadow: 0 0 20px #9a7a1a44; }
     .status-orb.thinking { background: #5c4a1a; box-shadow: 0 0 20px #9a7a1a44; animation: pulse 1.5s infinite; }
     .status-orb.speaking { background: #1a5c2a; box-shadow: 0 0 20px #1a9a3a44; }
@@ -106,10 +107,11 @@
     let isRecording = false;
     let audioChunks = [];
     let silenceFrames = 0;
-    const SILENCE_THRESHOLD = 0.02;  // Higher = less sensitive to background noise
-    const SILENCE_FRAMES_TO_STOP = 5; // ~0.5s of silence before sending
-    const MIN_SPEECH_FRAMES = 5;      // ~0.5s of speech before recording
+    const SILENCE_THRESHOLD = 0.015; // Balanced sensitivity
+    const SILENCE_FRAMES_TO_STOP = 4; // ~0.4s of silence before sending
+    const MIN_SPEECH_FRAMES = 4;      // ~0.4s of speech before recording
     let speechFrames = 0;
+    let lastRecordingState = false;
 
     // Auto-fill WebSocket URL from current page
     const loc = window.location;
@@ -144,7 +146,7 @@
       orb.className = `status-orb ${state}`;
       label.textContent = state;
       const emoji = {
-        listening: '🎤', transcribing: '📝',
+        listening: '🎤', recording: '🔴', transcribing: '📝',
         thinking: '🤔', speaking: '🔊', disconnected: '🔇'
       };
       orb.textContent = emoji[state] || '❓';
@@ -243,7 +245,10 @@
           if (energy > SILENCE_THRESHOLD) {
             silenceFrames = 0;
             speechFrames++;
-            if (!isRecording && speechFrames > MIN_SPEECH_FRAMES) isRecording = true;
+            if (!isRecording && speechFrames > MIN_SPEECH_FRAMES) {
+              isRecording = true;
+              setStatus('recording');
+            }
             if (isRecording) {
               const pcm = new Int16Array(input.length);
               for (let i = 0; i < input.length; i++)
@@ -258,6 +263,7 @@
                 isRecording = false;
                 speechFrames = 0;
                 audioChunks = [];
+                setStatus('listening');
               } else {
                 const pcm = new Int16Array(input.length);
                 for (let i = 0; i < input.length; i++)
