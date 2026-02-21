@@ -715,6 +715,55 @@ curl -X POST \
 # Should produce test.pcm file with audio data
 ```
 
+## Smallest.ai Best Practices
+
+**IMPORTANT:** Smallest.ai Lightning TTS does NOT support SSML tags. The API expects plain text or text with natural punctuation.
+
+### Text Formatting Guidelines
+
+Based on [Smallest.ai TTS Best Practices](https://waves-docs.smallest.ai/v4.0.0/content/best-practices/tts-best-practices):
+
+**Character Limits:**
+- Lightning model: 250 characters per request
+- Lightning-large model: 140 characters per request
+- Implementation: `chunkText()` method splits at punctuation or spaces
+
+**Numbers and Math:**
+- ❌ "2+3=5", "10/2=5"
+- ✅ "two plus three equals five", "10 divided by 2 equals 5"
+- ❌ "~20 mins"
+- ✅ "approximately 20 minutes"
+
+**Dates and Times:**
+- ✅ "12/02/2025" → "twelve, two, twenty twenty-five"
+- ✅ "12 February 2025" → "twelve February twenty twenty five"
+- ✅ "14:30" → "fourteen thirty"
+- ❌ "14.30" (reads as "fourteen [pause] thirty")
+
+**Units and Measurements:**
+- ❌ "5km", "20kg"
+- ✅ "5 kilometers", "20 kilograms"
+
+**Phone Numbers:**
+- Default: "9876543210" → "987-6543-210" (auto-grouped)
+- Custom: Write out "double nine triple eight..." if specific pattern needed
+
+### Natural Pauses Without SSML
+
+Since SSML is not supported, use punctuation and text structure:
+
+**Commas:** Create ~120-300ms pauses
+- "Well, let me think about that"
+- "However, there's another option"
+
+**Periods:** Create ~400-700ms pauses
+- "Step one. Step two. Step three."
+
+**Ellipses:** Create thinking/dramatic pauses
+- "Let me see... yes, that works"
+
+**Implementation:** The `enhanceProsody()` method automatically adds strategic punctuation to create natural speech rhythm.
+
 ## Warm Container Support
 
 Voice needs low latency. The standard container model (spawn per message batch) adds 3-5 seconds of cold start. **IMPLEMENTED:** The VoiceChannel pre-warms a container on first client connection.
@@ -842,6 +891,8 @@ Added red pulsing orb (🔴) when actively recording to show VAD status
 
 **Problem:** AI voice lacks pauses and intonation, sounds monotone and robotic
 
+**Why not SSML?** Smallest.ai Lightning TTS does NOT support SSML tags (like `<break time="500ms"/>`). The API expects plain text with natural punctuation. See "Smallest.ai Best Practices" section for details.
+
 **Solution:** `enhanceProsody()` method adds natural pauses through strategic punctuation:
 ```typescript
 private enhanceProsody(text: string): string {
@@ -867,7 +918,7 @@ private enhanceProsody(text: string): string {
 - Use contractions ("it's", "you're") for casual tone
 - Vary sentence length to avoid monotone delivery
 
-**Effect:** Creates 120-300ms pauses at commas and 400-700ms at periods, mimicking human speech rhythm without requiring SSML support
+**Effect:** Creates 120-300ms pauses at commas and 400-700ms at periods, mimicking human speech rhythm. This approach works with any TTS engine and doesn't over-constrain neural voice models.
 
 ## Security Notes
 
@@ -875,7 +926,7 @@ private enhanceProsody(text: string): string {
 - **Pre-shared token** in `.env` — validated on WebSocket connect before any audio is accepted.
 - **Audio never hits disk** — buffered in memory, transcribed, discarded.
 - **Transcribed text IS stored** in SQLite (same as WhatsApp messages) for conversation continuity.
-- **STT/TTS services run locally** — no external API calls for voice processing.
+- **STT/TTS handled by Smallest.ai API** — audio sent to external service over HTTPS with API key authentication.
 
 ## What NOT to Build
 
