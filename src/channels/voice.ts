@@ -312,7 +312,7 @@ export class VoiceChannel implements Channel {
   }
 
   private sanitizeForTTS(text: string): string {
-    return text
+    let clean = text
       // Remove Sources/Citations section and everything after
       .replace(/\*?Sources?\*?:?[\s\S]*$/i, '')
       .replace(/\*?References?\*?:?[\s\S]*$/i, '')
@@ -343,6 +343,36 @@ export class VoiceChannel implements Channel {
       .replace(/\n/g, '. ')
       .replace(/\s{2,}/g, ' ')
       .replace(/\.\.+/g, '.')
+      .trim();
+
+    // Enhance prosody with natural pauses
+    return this.enhanceProsody(clean);
+  }
+
+  /**
+   * Add natural pauses and intonation through punctuation.
+   * This creates more human-like speech without requiring SSML support.
+   */
+  private enhanceProsody(text: string): string {
+    return text
+      // Add pause after transition words for natural phrasing
+      .replace(/\b(however|therefore|meanwhile|furthermore|moreover|additionally|consequently)\b/gi, '$1,')
+      // Add pause after introductory phrases
+      .replace(/\b(well|so|now|okay|alright|listen|look)\b(?=\s+\w)/gi, '$1,')
+      // Add pause before conjunctions if missing
+      .replace(/([^,])\s+(but|and|or|yet|so)\s+/g, '$1, $2 ')
+      // Convert double periods to ellipsis for thinking pauses
+      .replace(/\.\.+/g, '...')
+      // Add comma before "which" for natural phrasing
+      .replace(/\s+which\s+/g, ', which ')
+      // Add pause after questions followed by statements
+      .replace(/\?\s+([A-Z])/g, '? $1')
+      // Ensure space after sentence-ending punctuation
+      .replace(/([.!?])([A-Z])/g, '$1 $2')
+      // Clean up any double commas or comma-space-comma
+      .replace(/,\s*,/g, ',')
+      // Remove comma before sentence-ending punctuation
+      .replace(/,\s*([.!?])/g, '$1')
       .trim();
   }
 

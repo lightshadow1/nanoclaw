@@ -838,6 +838,37 @@ if (transcript && transcript.text && transcript.text.trim()) {
 
 Added red pulsing orb (🔴) when actively recording to show VAD status
 
+### 9. Natural Speech Prosody
+
+**Problem:** AI voice lacks pauses and intonation, sounds monotone and robotic
+
+**Solution:** `enhanceProsody()` method adds natural pauses through strategic punctuation:
+```typescript
+private enhanceProsody(text: string): string {
+  return text
+    // Add pause after transition words
+    .replace(/\b(however|therefore|meanwhile|furthermore)\b/gi, '$1,')
+    // Add pause after introductory phrases
+    .replace(/\b(well|so|now|okay|alright)\b(?=\s+\w)/gi, '$1,')
+    // Add pause before conjunctions
+    .replace(/([^,])\s+(but|and|or|yet|so)\s+/g, '$1, $2 ')
+    // Convert double periods to ellipsis (thinking pauses)
+    .replace(/\.\.+/g, '...')
+    // Add comma before "which" for natural phrasing
+    .replace(/\s+which\s+/g, ', which ')
+    .trim();
+}
+```
+
+**Claude guidance added to CLAUDE.md:**
+- Use transition words like "well", "so", "however" for natural pauses
+- Add conversational fillers: "Let me see...", "Alright,", "Here's what I found:"
+- Break long sentences with commas for breathing room
+- Use contractions ("it's", "you're") for casual tone
+- Vary sentence length to avoid monotone delivery
+
+**Effect:** Creates 120-300ms pauses at commas and 400-700ms at periods, mimicking human speech rhythm without requiring SSML support
+
 ## Security Notes
 
 - **Bind to localhost only** (`127.0.0.1`). External access via Tailscale/WireGuard.
