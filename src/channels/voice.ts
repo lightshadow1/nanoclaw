@@ -122,7 +122,7 @@ export class VoiceChannel implements Channel {
             const audioBuffer = Buffer.from(msg.data, 'base64');
             const transcript = await this.transcribe(audioBuffer);
 
-            if (transcript && transcript.text.trim()) {
+            if (transcript && transcript.text && transcript.text.trim()) {
               this.sendStatus(ws, 'thinking');
               ws.send(
                 JSON.stringify({
@@ -291,7 +291,10 @@ export class VoiceChannel implements Channel {
         throw new Error(`Smallest.ai STT returned ${res.status}: ${errorText}`);
       }
 
-      const result = (await res.json()) as { transcription: string };
+      const result = (await res.json()) as { transcription?: string };
+      if (!result.transcription) {
+        return null;
+      }
       return { text: result.transcription };
     } catch (err) {
       logger.error({ err }, 'Smallest.ai transcription failed');
