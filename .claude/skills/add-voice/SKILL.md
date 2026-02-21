@@ -307,12 +307,35 @@ export class VoiceChannel implements Channel {
     ws.send(JSON.stringify({ type: 'status', state }));
   }
 
+  private async fetchWithRetry(
+    url: string,
+    opts: RequestInit,
+    maxAttempts = 3,
+  ): Promise<Response> {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await fetch(url, opts);
+      } catch (err) {
+        lastErr = err;
+        const cause = (err as { cause?: { code?: string } }).cause;
+        const isTransient = cause?.code === 'EAI_AGAIN' ||
+          cause?.code === 'ECONNRESET' || cause?.code === 'ETIMEDOUT';
+        if (!isTransient || attempt === maxAttempts) throw err;
+        const delay = attempt * 500;
+        logger.warn({ attempt, delay, code: cause?.code }, 'Smallest.ai fetch transient error, retrying');
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+    throw lastErr;
+  }
+
   private async transcribe(audio: Buffer): Promise<{ text: string; confidence: number } | null> {
     try {
       // Convert PCM to WAV for Smallest.ai Waves API (Pulse model)
       const wav = this.pcmToWav(audio, 16000, 1);
       
-      const res = await fetch(
+      const res = await this.fetchWithRetry(
         'https://waves-api.smallest.ai/api/v1/pulse/get_text?model=pulse&language=en',
         {
           method: 'POST',
@@ -343,7 +366,7 @@ export class VoiceChannel implements Channel {
     const audioBuffers: Buffer[] = [];
 
     for (const chunk of chunks) {
-      const res = await fetch(
+      const res = await this.fetchWithRetry(
         'https://waves-api.smallest.ai/api/v1/lightning/get_speech',
         {
           method: 'POST',
