@@ -567,14 +567,31 @@ VOICE_GROUP=main
 
 # Smallest.ai API
 SMALLEST_AI_API_KEY=<your key from https://www.smallest.ai/>
+
+# Optional: TLS/SSL with Tailscale HTTPS (recommended for remote access)
+# VOICE_TLS_CERT=/var/lib/tailscale/certs/<hostname>.ts.net.crt
+# VOICE_TLS_KEY=/var/lib/tailscale/certs/<hostname>.ts.net.key
 ```
 
 Sync to container env: `cp .env data/env/env`
 
-**For remote access via Tailscale:**
+**For remote access via Tailscale (HTTP):**
 - Keep `VOICE_HOST=127.0.0.1` (localhost)
 - Access from remote machine using Tailscale IP (e.g., `http://100.64.1.5:8443`)
 - Tailscale proxies the connection securely through encrypted tunnel
+
+**For HTTPS with Tailscale certificates (recommended):**
+1. Enable HTTPS in your Tailscale admin console: https://tailscale.com/docs/how-to/set-up-https-certificates
+2. On the Linux machine, certificates are automatically provisioned at:
+   - `/var/lib/tailscale/certs/<hostname>.ts.net.crt`
+   - `/var/lib/tailscale/certs/<hostname>.ts.net.key`
+3. Set environment variables:
+   ```bash
+   VOICE_TLS_CERT=/var/lib/tailscale/certs/<hostname>.ts.net.crt
+   VOICE_TLS_KEY=/var/lib/tailscale/certs/<hostname>.ts.net.key
+   VOICE_HOST=0.0.0.0  # Bind to all interfaces for Tailscale hostname
+   ```
+4. Access via `https://<hostname>.ts.net:8443` (no browser certificate warnings!)
 
 ### Step 7: Build and Test
 
