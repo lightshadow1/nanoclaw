@@ -106,9 +106,9 @@
     let isRecording = false;
     let audioChunks = [];
     let silenceFrames = 0;
-    const SILENCE_THRESHOLD = 0.01;
-    const SILENCE_FRAMES_TO_STOP = 2;
-    const MIN_SPEECH_FRAMES = 3;
+    const SILENCE_THRESHOLD = 0.02;  // Higher = less sensitive to background noise
+    const SILENCE_FRAMES_TO_STOP = 5; // ~0.5s of silence before sending
+    const MIN_SPEECH_FRAMES = 5;      // ~0.5s of speech before recording
     let speechFrames = 0;
 
     // Auto-fill WebSocket URL from current page
