@@ -681,8 +681,39 @@ open http://localhost:8443
 4. When you see "listening", start speaking
 
 **Latency expectations:**
-- First request: 1-2 seconds (Smallest.ai API cold start)
-- Subsequent requests: <100ms
+- First request: ~500ms (with container pre-warming)
+- Subsequent requests: ~200-500ms
+
+### Step 8: Smoke Tests
+
+Before full pipeline testing, validate the Smallest.ai API integration:
+
+**Test STT API:**
+```bash
+# Create a test WAV file (silence, 1 second, 16kHz mono)
+ffmpeg -f lavfi -i anullsrc=r=16000:cl=mono -t 1 -f wav test.wav
+
+# Test the Pulse API
+curl -X POST \
+  'https://waves-api.smallest.ai/api/v1/pulse/get_text?model=pulse&language=en' \
+  -H "Authorization: Bearer $SMALLEST_AI_API_KEY" \
+  -H "Content-Type: audio/wav" \
+  --data-binary @test.wav
+
+# Expected: {"transcription": ""} or similar
+```
+
+**Test TTS API:**
+```bash
+curl -X POST \
+  'https://waves-api.smallest.ai/api/v1/lightning/get_speech' \
+  -H "Authorization: Bearer $SMALLEST_AI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Hello world","voice_id":"emily","sample_rate":24000,"add_wav_header":false}' \
+  --output test.pcm
+
+# Should produce test.pcm file with audio data
+```
 
 ## Warm Container Support
 
@@ -824,31 +855,127 @@ Added red pulsing orb (🔴) when actively recording to show VAD status
 - No mobile app (web client first)
 - No container image changes (voice processing is on the host, agents receive/return text)
 
+## Advanced Configuration
+
+### Rate Limiting
+
+Smallest.ai has rate limits on their API. If you encounter 429 errors:
+- Free tier: ~100 requests/min
+- Paid tier: Higher limits (check your plan)
+
+**Mitigation:**
+- The retry logic already handles transient failures
+- Consider adding request queuing for high-traffic scenarios
+- Monitor usage via Smallest.ai dashboard
+
+### Multi-Client Behavior
+
+**Current implementation:**
+- Multiple clients can connect simultaneously
+- All clients receive broadcast responses (not isolated sessions)
+- Container pre-warms only on first client connection
+
+**For isolated sessions:**
+- Use different `VOICE_GROUP` values (e.g., `voice:alice`, `voice:bob`)
+- Each group gets its own container and context
+
+### Voice Customization
+
+**Change TTS voice:**
+Edit `src/channels/voice.ts` line ~290:
+```typescript
+voice_id: 'emily',  // Options: emily, jessica, michael, etc.
+```
+
+**Adjust audio quality:**
+```typescript
+sample_rate: 24000,  // Options: 16000, 22050, 24000, 44100
+```
+
+**Change VAD sensitivity:**
+Edit `clients/voice-web/index.html` lines 110-112 and refresh browser.
+
 ## Troubleshooting
 
-### STT service not responding
-```bash
-curl -X POST http://127.0.0.1:8700/health
-# Should return {"status": "ok"}
-```
+### Smallest.ai API Issues
 
-### TTS service not responding
-```bash
-curl -X POST http://127.0.0.1:8701/health
-# Should return {"status": "ok"}
-```
+**401 Unauthorized:**
+- Verify `SMALLEST_AI_API_KEY` is set correctly in `.env`
+- Check key hasn't expired at https://www.smallest.ai/
+- Ensure key is synced to `data/env/env` if using containers
+
+**404 Not Found:**
+- Verify you're using Waves API endpoints (not legacy API)
+- Check endpoint URLs match exactly as documented
+
+**400 Bad Request:**
+- Text too long: Should be chunked at 250 chars (already implemented)
+- Invalid audio format: Must be WAV, 16kHz, mono for STT
+
+**429 Rate Limited:**
+- Wait and retry (automatic with `fetchWithRetry`)
+- Upgrade Smallest.ai plan if hitting limits frequently
 
 ### No audio in browser
-- Check browser permissions (microphone access)
-- Verify WebSocket connects: open browser dev tools → Network → WS
-- Ensure `VOICE_AUTH_TOKEN` matches between `.env` and the web client
+- **Check browser permissions:** Allow microphone access
+- **Verify WebSocket:** Open dev tools → Network → WS, should show connected
+- **Check auth token:** Must match between `.env` and web client
+- **Test locally first:** Use `http://localhost:8443` before remote access
 
 ### Voice channel not starting
-- Verify `VOICE_ENABLED=true` in `.env`
-- Check port isn't in use: `lsof -i :8443`
-- Check logs: `tail -f logs/nanoclaw.log | grep -i voice`
+- **Check VOICE_ENABLED:** Must be `true` in `.env`
+- **Port conflict:** Run `lsof -i :8443` to check if port is in use
+- **Check logs:** `tail -f logs/nanoclaw.log | grep -i voice`
+- **TLS issues:** If using TLS, verify cert/key paths exist and are readable
+
+### Transcription issues
+
+**Empty transcriptions:**
+- VAD might be too sensitive (increase `SILENCE_THRESHOLD`)
+- Audio too quiet (check microphone levels)
+- Background noise triggering false positives
+
+**Cut-off speech:**
+- Decrease `MIN_SPEECH_FRAMES` to start recording faster
+- Increase `SILENCE_FRAMES_TO_STOP` to allow pauses
+
+**Garbled/incorrect transcriptions:**
+- Check audio quality (noise suppression in browser helps)
+- Verify sample rate is 16kHz for STT
+- Test with clear, louder speech first
 
 ### High latency
-- Use `small` Whisper model (faster) instead of `medium` or `large`
-- Ensure TTS model is preloaded (first request may be slow)
-- Check that STT/TTS services are running on the same machine (not over network)
+
+**First message slow (>3s):**
+- Container pre-warming should eliminate this
+- Check `warmContainer` is called on connection (see logs)
+
+**All messages slow:**
+- Network latency to Smallest.ai API
+- Test API directly with curl to isolate issue
+- Check retry logic isn't triggering (would log warnings)
+
+**TTS playback stuttering:**
+- Browser audio buffering issues
+- Try reducing text length (more chunks = smoother streaming effect)
+- Check network bandwidth
+
+### DNS/Network failures
+
+**EAI_AGAIN errors:**
+- Retry logic should handle this automatically
+- If persistent, check DNS configuration: `cat /etc/resolv.conf`
+- Workaround: Add to `/etc/hosts`: `3.33.178.96 waves-api.smallest.ai`
+
+## Post-Implementation Checklist
+
+✅ Voice channel connects and authenticates
+✅ Speech is transcribed correctly
+✅ Agent responds with synthesized voice
+✅ Container pre-warms on connection (fast responses)
+✅ VAD tuned for your microphone/environment
+✅ Text sanitization working (no asterisks/URLs spoken)
+✅ CLAUDE.md updated with voice guidelines
+✅ Tested from remote device via Tailscale
+✅ Error handling and retry logic validated
+✅ Documentation updated with any custom changes
