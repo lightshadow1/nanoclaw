@@ -306,6 +306,11 @@ export class VoiceChannel implements Channel {
 
   private sanitizeForTTS(text: string): string {
     return text
+      // Remove Sources/Citations section and everything after
+      .replace(/\*?Sources?\*?:?[\s\S]*$/i, '')
+      .replace(/\*?References?\*?:?[\s\S]*$/i, '')
+      // Remove bare URLs
+      .replace(/https?:\/\/[^\s)]+/g, '')
       // Remove ALL emojis including variation selectors and modifiers
       .replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{E000}-\u{F8FF}\u{FE00}-\u{FE0F}\u{1F900}-\u{1F9FF}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}]/gu, '')
       // Remove markdown bold - process before single asterisk
