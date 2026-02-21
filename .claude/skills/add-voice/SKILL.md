@@ -686,15 +686,126 @@ open http://localhost:8443
 
 ## Warm Container Support
 
-Voice needs low latency. The standard container model (spawn per message batch) adds 3-5 seconds of cold start. When a voice client connects, the VoiceChannel should pre-warm a container.
+Voice needs low latency. The standard container model (spawn per message batch) adds 3-5 seconds of cold start. **IMPLEMENTED:** The VoiceChannel pre-warms a container on first client connection.
 
-The GroupQueue already supports message piping to active containers via `queue.sendMessage(groupJid, text)`. For voice:
+**Implementation:**
+1. Add `warmContainer?: (groupJid: string) => void` to `VoiceChannelOpts`
+2. In `index.ts`, pass `warmContainer: (jid) => queue.enqueueMessageCheck(jid)` when creating VoiceChannel
+3. On first authenticated connection, call `this.opts.warmContainer(this.opts.groupJid)` if `activeClients.size === 1`
 
-1. On first authenticated voice connection: call `queue.enqueueMessageCheck(voiceJid)` with a synthetic greeting to spin up the container
-2. While voice is active: transcribed text goes through `queue.sendMessage` if a container is running, otherwise through the normal message loop
-3. On last voice client disconnect: optionally `queue.closeStdin(voiceJid)` to release the container
+```typescript
+// In voice.ts after authentication
+if (this.opts.warmContainer && this.activeClients.size === 1) {
+  logger.info({ groupJid: this.opts.groupJid }, 'Pre-warming container for voice');
+  this.opts.warmContainer(this.opts.groupJid);
+}
+```
 
 The voice group registration has `requiresTrigger: false`, so the message loop processes all voice messages automatically.
+
+## Production Fixes & Optimizations
+
+### 1. VAD (Voice Activity Detection) Tuning
+
+**Problem:** VAD too sensitive (false positives) or too slow (cuts off start of speech)
+
+**Solution:** Balanced settings in `clients/voice-web/index.html`:
+```javascript
+const SILENCE_THRESHOLD = 0.01;  // Sensitive enough to catch speech start
+const SILENCE_FRAMES_TO_STOP = 6; // ~0.6s silence before sending
+const MIN_SPEECH_FRAMES = 1;      // Start recording immediately
+```
+
+**Tuning guide:**
+- Lower `SILENCE_THRESHOLD` (0.008-0.012) = more sensitive
+- Higher `MIN_SPEECH_FRAMES` (2-4) = less false positives
+- Higher `SILENCE_FRAMES_TO_STOP` (5-8) = captures pauses between words
+
+### 2. TTS Text Sanitization
+
+**Problem:** TTS reads "asterisk", emoji names, and long URLs
+
+**Solution:** `sanitizeForTTS()` method in voice.ts:
+```typescript
+private sanitizeForTTS(text: string): string {
+  return text
+    // Remove Sources/References sections entirely
+    .replace(/\*?Sources?\*?:?[\s\S]*$/i, '')
+    .replace(/\*?References?\*?:?[\s\S]*$/i, '')
+    // Remove all URLs
+    .replace(/https?:\/\/[^\s)]+/g, '')
+    // Remove ALL emojis (including variation selectors)
+    .replace(/[\u{1F000}-\u{1FFFF}...]/gu, '')
+    // Remove all asterisks
+    .replace(/\*+/g, '')
+    // Convert newlines to periods for natural flow
+    .replace(/\n/g, '. ')
+    // Clean up
+    .trim();
+}
+```
+
+### 3. Text Chunking for TTS
+
+**Problem:** Lightning model has 250-char limit, returns 400 error
+
+**Solution:** `chunkText()` method splits at natural boundaries:
+- Prefers punctuation (`.,:;!?`)
+- Falls back to spaces
+- Concatenates audio buffers
+
+### 4. Concise Voice Responses
+
+**Problem:** Agent gives long, detailed responses with citations
+
+**Solution:** Added voice-specific guidelines to `groups/main/CLAUDE.md`:
+```markdown
+## Voice Interface Guidelines
+
+When responding to voice messages (from `voice:main@local`):
+- Give direct, spoken-word answers (2-3 sentences max)
+- Skip citations, sources, and URLs entirely
+- Avoid lists, bullet points, and structured formatting
+- Speak naturally as if having a conversation
+```
+
+### 5. API Endpoint Fixes
+
+**Problem:** Using incorrect Smallest.ai endpoints (404 errors)
+
+**Correct endpoints:**
+- **STT:** `https://waves-api.smallest.ai/api/v1/pulse/get_text?model=pulse&language=en`
+  - Headers: `Authorization: Bearer <key>`, `Content-Type: audio/wav`
+  - Body: raw WAV data
+  - Response: `{ transcription: string }`
+
+- **TTS:** `https://waves-api.smallest.ai/api/v1/lightning/get_speech`
+  - Body: `{ text, voice_id: 'emily', sample_rate: 24000, add_wav_header: false }`
+  - Returns: raw PCM audio
+
+### 6. Retry Logic for Network Issues
+
+**Problem:** Transient DNS failures (EAI_AGAIN) at startup
+
+**Solution:** `fetchWithRetry()` wrapper:
+- Retries up to 3 times on `EAI_AGAIN`, `ECONNRESET`, `ETIMEDOUT`
+- Exponential backoff: 500ms, 1000ms, 1500ms
+- Used for all Smallest.ai API calls
+
+### 7. Null Safety for Transcriptions
+
+**Problem:** Empty transcriptions cause `undefined.trim()` errors
+
+**Solution:**
+```typescript
+if (transcript && transcript.text && transcript.text.trim()) {
+  // Process transcript
+}
+```
+
+### 8. Visual Recording Feedback
+
+Added red pulsing orb (🔴) when actively recording to show VAD status
 
 ## Security Notes
 
