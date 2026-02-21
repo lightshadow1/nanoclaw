@@ -277,29 +277,77 @@ export class VoiceChannel implements Channel {
   }
 
   private async synthesize(text: string): Promise<Buffer> {
-    const res = await fetch(
-      'https://waves-api.smallest.ai/api/v1/lightning/get_speech',
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.smallestApiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          text,
-          voice_id: 'emily',
-          sample_rate: 24000,
-          add_wav_header: false,
-        }),
-      },
-    );
+    // Lightning model has max 250 chars per request
+    const chunks = this.chunkText(text, 250);
+    const audioBuffers: Buffer[] = [];
 
-    if (!res.ok) {
-      const errorText = await res.text();
-      throw new Error(`Smallest.ai TTS returned ${res.status}: ${errorText}`);
+    for (const chunk of chunks) {
+      const res = await fetch(
+        'https://waves-api.smallest.ai/api/v1/lightning/get_speech',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.smallestApiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            text: chunk,
+            voice_id: 'emily',
+            sample_rate: 24000,
+            add_wav_header: false,
+          }),
+        },
+      );
+
+      if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(`Smallest.ai TTS returned ${res.status}: ${errorText}`);
+      }
+
+      audioBuffers.push(Buffer.from(await res.arrayBuffer()));
     }
 
-    return Buffer.from(await res.arrayBuffer());
+    return Buffer.concat(audioBuffers);
+  }
+
+  private chunkText(text: string, maxChunkSize: number): string[] {
+    const chunks: string[] = [];
+    let remaining = text;
+
+    while (remaining.length > 0) {
+      if (remaining.length <= maxChunkSize) {
+        chunks.push(remaining);
+        break;
+      }
+
+      // Look for punctuation within last 50 chars of max chunk size
+      let chunkEnd = maxChunkSize;
+      const punctuation = '.,:;!?';
+      let foundPunct = false;
+
+      for (let i = chunkEnd; i > Math.max(chunkEnd - 50, 0); i--) {
+        if (i < remaining.length && punctuation.includes(remaining[i])) {
+          chunkEnd = i + 1; // Include the punctuation
+          foundPunct = true;
+          break;
+        }
+      }
+
+      // If no punctuation, look for space
+      if (!foundPunct) {
+        for (let i = chunkEnd; i > Math.max(chunkEnd - 50, 0); i--) {
+          if (i < remaining.length && remaining[i] === ' ') {
+            chunkEnd = i;
+            break;
+          }
+        }
+      }
+
+      chunks.push(remaining.slice(0, chunkEnd).trim());
+      remaining = remaining.slice(chunkEnd).trim();
+    }
+
+    return chunks;
   }
 
   private pcmToWav(pcm: Buffer, sampleRate: number, channels: number): Buffer {
