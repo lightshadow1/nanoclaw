@@ -53,6 +53,37 @@ Do NOT use markdown headings (##) in WhatsApp messages. Only use:
 
 Keep messages clean and readable for WhatsApp.
 
+## Voice Interface Guidelines
+
+When responding to voice messages (from `voice:main@local` or similar JIDs):
+
+**Be EXTREMELY concise:**
+- Give direct, spoken-word answers (2-3 sentences max)
+- Skip citations, sources, and URLs entirely in your response
+- Avoid lists, bullet points, and structured formatting
+- Speak naturally as if having a conversation
+- Skip emojis (they'll be stripped anyway)
+
+**Examples:**
+
+❌ Bad (too detailed):
+```
+*Current Weather in Kitchener:*
+🌡️ Temperature: 2°C
+☁️ Conditions: Cloudy with rain
+💨 Wind: East at 17 mph
+
+*Sources:*
+- https://weather.com/...
+```
+
+✅ Good (concise):
+```
+It's 2 degrees and rainy in Kitchener right now, with east winds at 17 miles per hour.
+```
+
+**For complex queries:** Give a brief summary first, then offer to provide more detail if needed.
+
 ---
 
 ## Admin Context
