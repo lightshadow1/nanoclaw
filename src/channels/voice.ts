@@ -250,24 +250,26 @@ export class VoiceChannel implements Channel {
   ): Promise<{ text: string } | null> {
     try {
       const wav = this.pcmToWav(audio, 16000, 1);
-      const formData = new FormData();
-      const blob = new Blob([wav], { type: 'audio/wav' });
-      formData.append('audio', blob, 'audio.wav');
-      formData.append('language', 'en');
 
-      const res = await fetch('https://api.smallest.ai/api/Transcribe', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${this.smallestApiKey}` },
-        body: formData,
-      });
+      const res = await fetch(
+        'https://waves-api.smallest.ai/api/v1/pulse/get_text?model=pulse&language=en',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.smallestApiKey}`,
+            'Content-Type': 'audio/wav',
+          },
+          body: wav,
+        },
+      );
 
       if (!res.ok) {
         const errorText = await res.text();
         throw new Error(`Smallest.ai STT returned ${res.status}: ${errorText}`);
       }
 
-      const result = (await res.json()) as { text: string };
-      return { text: result.text };
+      const result = (await res.json()) as { transcription: string };
+      return { text: result.transcription };
     } catch (err) {
       logger.error({ err }, 'Smallest.ai transcription failed');
       return null;
@@ -275,19 +277,22 @@ export class VoiceChannel implements Channel {
   }
 
   private async synthesize(text: string): Promise<Buffer> {
-    const res = await fetch('https://api.smallest.ai/api/Speak', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.smallestApiKey}`,
-        'Content-Type': 'application/json',
+    const res = await fetch(
+      'https://waves-api.smallest.ai/api/v1/lightning/get_speech',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.smallestApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text,
+          voice_id: 'emily',
+          sample_rate: 24000,
+          add_wav_header: false,
+        }),
       },
-      body: JSON.stringify({
-        text,
-        voice_id: 'default',
-        sample_rate: 24000,
-        format: 'pcm',
-      }),
-    });
+    );
 
     if (!res.ok) {
       const errorText = await res.text();
