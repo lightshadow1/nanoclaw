@@ -107,9 +107,9 @@
     let isRecording = false;
     let audioChunks = [];
     let silenceFrames = 0;
-    const SILENCE_THRESHOLD = 0.015; // Balanced sensitivity
-    const SILENCE_FRAMES_TO_STOP = 4; // ~0.4s of silence before sending
-    const MIN_SPEECH_FRAMES = 4;      // ~0.4s of speech before recording
+    const SILENCE_THRESHOLD = 0.012; // More sensitive to catch start of speech
+    const SILENCE_FRAMES_TO_STOP = 5; // ~0.5s of silence before sending
+    const MIN_SPEECH_FRAMES = 2;      // ~0.2s to start recording (faster!)
     let speechFrames = 0;
     let lastRecordingState = false;
 
