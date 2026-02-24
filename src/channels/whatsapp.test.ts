@@ -95,6 +95,7 @@ vi.mock('@whiskeysockets/baileys', () => {
   };
 });
 
+import { ASSISTANT_NAME } from '../config.js';
 import { WhatsAppChannel, WhatsAppChannelOpts } from './whatsapp.js';
 import { getLastGroupSync, updateChatName, setLastGroupSync } from '../db.js';
 
@@ -108,7 +109,7 @@ function createTestOpts(overrides?: Partial<WhatsAppChannelOpts>): WhatsAppChann
       'registered@g.us': {
         name: 'Test Group',
         folder: 'test-group',
-        trigger: '@Andy',
+        trigger: `@${ASSISTANT_NAME}`,
         added_at: '2024-01-01T00:00:00.000Z',
       },
     })),
