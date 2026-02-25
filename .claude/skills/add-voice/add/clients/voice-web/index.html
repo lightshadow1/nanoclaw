@@ -111,6 +111,7 @@
     const SILENCE_FRAMES_TO_STOP = 6; // ~0.6s of silence before sending
     let speechFrames = 0;
     let lastRecordingState = false;
+    let energyLog = [];  // Collect energy samples for debugging
 
     // Auto-fill WebSocket URL from current page
     const loc = window.location;
@@ -245,6 +246,12 @@
             pcm[i] = Math.max(-32768, Math.min(32767, Math.round(s * 32767)));
           }
           energy = Math.sqrt(energy / input.length);
+
+          // Log energy for calibration (sample every 10th frame to avoid spam).
+          if (energyLog.length < 1000) energyLog.push(energy);
+          if (energyLog.length % 10 === 0 && energyLog.length < 50) {
+            console.log(`Energy: ${energy.toFixed(6)}, Threshold: ${SILENCE_THRESHOLD}`);
+          }
 
           if (energy > SILENCE_THRESHOLD) {
             silenceFrames = 0;
