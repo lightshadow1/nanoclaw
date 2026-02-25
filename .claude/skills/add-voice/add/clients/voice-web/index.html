@@ -267,10 +267,12 @@
             if (!isRecording && speechFrames >= MIN_SPEECH_FRAMES) {
               isRecording = true;
               setStatus('recording');
-              audioChunks = lookbackBuffer.slice();
+              // Include lookback buffer + current frame to capture utterance start.
+              audioChunks.push(...lookbackBuffer, pcm);
+            } else if (isRecording) {
+              // Subsequent frames: just append.
+              audioChunks.push(pcm);
             }
-
-            if (isRecording) audioChunks.push(pcm);
           } else {
             silenceFrames++;
             if (isRecording) {
