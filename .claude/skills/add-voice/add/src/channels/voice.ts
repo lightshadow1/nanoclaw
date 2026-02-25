@@ -1,14 +1,18 @@
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import http from 'http';
+import https from 'https';
 import path from 'path';
 import { WebSocket, WebSocketServer } from 'ws';
 
-import { ASSISTANT_NAME } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import {
-  Channel, NewMessage, OnChatMetadata, OnInboundMessage, RegisteredGroup,
+  Channel,
+  NewMessage,
+  OnChatMetadata,
+  OnInboundMessage,
+  RegisteredGroup,
 } from '../types.js';
 
 export interface VoiceChannelOpts {
@@ -18,6 +22,9 @@ export interface VoiceChannelOpts {
   port: number;
   host: string;
   groupJid: string; // e.g. "voice:main@local"
+  tlsCert?: string; // path to TLS cert file
+  tlsKey?: string;  // path to TLS key file
+  warmContainer?: (groupJid: string) => void; // Pre-warm container on connection
 }
 
 export class VoiceChannel implements Channel {
@@ -32,11 +39,11 @@ export class VoiceChannel implements Channel {
 
   constructor(opts: VoiceChannelOpts) {
     this.opts = opts;
-    // Read secrets at construction — stays in memory, not exported
     const secrets = readEnvFile(['VOICE_AUTH_TOKEN', 'SMALLEST_AI_API_KEY']);
     this.authToken = process.env.VOICE_AUTH_TOKEN || secrets.VOICE_AUTH_TOKEN || '';
-    this.smallestApiKey = process.env.SMALLEST_AI_API_KEY || secrets.SMALLEST_AI_API_KEY || '';
-    
+    this.smallestApiKey =
+      process.env.SMALLEST_AI_API_KEY || secrets.SMALLEST_AI_API_KEY || '';
+
     if (!this.authToken) {
       logger.warn('VOICE_AUTH_TOKEN not set — voice connections will be rejected');
     }
@@ -46,15 +53,26 @@ export class VoiceChannel implements Channel {
   }
 
   async connect(): Promise<void> {
-    this.httpServer = http.createServer((req, res) => {
-      // Serve web client on GET /
+    const handler = (req: http.IncomingMessage, res: http.ServerResponse) => {
       if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
         this.serveWebClient(res);
         return;
       }
       res.writeHead(404);
       res.end();
-    });
+    };
+
+    const { tlsCert, tlsKey } = this.opts;
+    if (tlsCert && tlsKey) {
+      const cert = fs.readFileSync(tlsCert);
+      const key = fs.readFileSync(tlsKey);
+      this.httpServer = https.createServer({ cert, key }, handler);
+    } else {
+      this.httpServer = http.createServer(handler);
+    }
+
+    const protocol = tlsCert && tlsKey ? 'https' : 'http';
+    const wsProtocol = tlsCert && tlsKey ? 'wss' : 'ws';
 
     this.wss = new WebSocketServer({ server: this.httpServer, path: '/voice' });
 
@@ -62,16 +80,18 @@ export class VoiceChannel implements Channel {
       let authenticated = false;
       let sessionId = '';
 
-      // Auth timeout — must authenticate within 5 seconds
       const authTimeout = setTimeout(() => {
-        if (!authenticated) {
-          ws.close(4001, 'Auth timeout');
-        }
+        if (!authenticated) ws.close(4001, 'Auth timeout');
       }, 5000);
 
       ws.on('message', async (data) => {
         try {
-          const msg = JSON.parse(data.toString());
+          const msg = JSON.parse(data.toString()) as {
+            type: string;
+            token?: string;
+            data?: string;
+            isFinal?: boolean;
+          };
 
           if (!authenticated) {
             if (msg.type === 'auth' && msg.token === this.authToken) {
@@ -82,31 +102,46 @@ export class VoiceChannel implements Channel {
               ws.send(JSON.stringify({ type: 'auth_ok', sessionId }));
               this.sendStatus(ws, 'listening');
               logger.info({ sessionId }, 'Voice client authenticated');
+
+              // Register chat so the orchestrator knows this group exists
+              const timestamp = new Date().toISOString();
+              this.opts.onChatMetadata(
+                this.opts.groupJid,
+                timestamp,
+                `Voice (${this.opts.groupJid.split(':')[1]?.split('@')[0]})`,
+                'voice',
+                true,
+              );
+
+              // Pre-warm container for fast first response
+              if (this.opts.warmContainer && this.activeClients.size === 1) {
+                logger.info({ groupJid: this.opts.groupJid }, 'Pre-warming container for voice');
+                this.opts.warmContainer(this.opts.groupJid);
+              }
             } else {
               ws.close(4001, 'Invalid token');
             }
             return;
           }
 
-          // Handle audio frames
-          if (msg.type === 'audio' && msg.isFinal) {
+          if (msg.type === 'audio' && msg.isFinal && msg.data) {
             this.sendStatus(ws, 'transcribing');
             const audioBuffer = Buffer.from(msg.data, 'base64');
             const transcript = await this.transcribe(audioBuffer);
 
-            if (transcript && transcript.text.trim()) {
+            if (transcript && transcript.text && transcript.text.trim()) {
               this.sendStatus(ws, 'thinking');
-              // Send partial transcript to client for display
-              ws.send(JSON.stringify({
-                type: 'transcript', text: transcript.text, isFinal: true,
-                confidence: transcript.confidence,
-              }));
+              ws.send(
+                JSON.stringify({
+                  type: 'transcript',
+                  text: transcript.text,
+                  isFinal: true,
+                }),
+              );
 
-              // Deliver to orchestrator as a normal message
               const timestamp = new Date().toISOString();
               const chatJid = this.opts.groupJid;
-              this.opts.onChatMetadata(chatJid, timestamp, 'Voice');
-              this.opts.onMessage(chatJid, {
+              const newMsg: NewMessage = {
                 id: randomUUID(),
                 chat_jid: chatJid,
                 sender: 'voice-user',
@@ -114,7 +149,8 @@ export class VoiceChannel implements Channel {
                 content: transcript.text,
                 timestamp,
                 is_from_me: false,
-              });
+              };
+              this.opts.onMessage(chatJid, newMsg);
             } else {
               this.sendStatus(ws, 'listening');
             }
@@ -136,11 +172,11 @@ export class VoiceChannel implements Channel {
     return new Promise<void>((resolve) => {
       this.httpServer!.listen(this.opts.port, this.opts.host, () => {
         logger.info(
-          { port: this.opts.port, host: this.opts.host },
+          { port: this.opts.port, host: this.opts.host, tls: !!(tlsCert && tlsKey) },
           'Voice channel listening',
         );
-        console.log(`\n  Voice: http://${this.opts.host}:${this.opts.port}`);
-        console.log(`  WebSocket: ws://${this.opts.host}:${this.opts.port}/voice\n`);
+        console.log(`\n  Voice UI: ${protocol}://${this.opts.host}:${this.opts.port}`);
+        console.log(`  WebSocket: ${wsProtocol}://${this.opts.host}:${this.opts.port}/voice\n`);
         resolve();
       });
     });
@@ -149,26 +185,27 @@ export class VoiceChannel implements Channel {
   async sendMessage(jid: string, text: string): Promise<void> {
     if (!this.ownsJid(jid)) return;
 
-    // Synthesize speech and send to all active clients
     try {
-      const audioBuffer = await this.synthesizeWithSmallest(text);
-
+      // Clean text for TTS - remove markdown and emojis
+      const cleanText = this.sanitizeForTTS(text);
+      const audioBuffer = await this.synthesize(cleanText);
       for (const [, ws] of this.activeClients) {
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            type: 'audio_response',
-            text,
-            data: audioBuffer.toString('base64'),
-            format: 'pcm_s16le',
-            sampleRate: 24000,
-            isFinal: true,
-          }));
+          ws.send(
+            JSON.stringify({
+              type: 'audio_response',
+              text,
+              data: audioBuffer.toString('base64'),
+              format: 'pcm_s16le',
+              sampleRate: 24000,
+              isFinal: true,
+            }),
+          );
           this.sendStatus(ws, 'listening');
         }
       }
     } catch (err) {
-      logger.error({ err }, 'TTS synthesis failed');
-      // Fall back to text-only
+      logger.error({ err }, 'TTS synthesis failed — falling back to text');
       for (const [, ws] of this.activeClients) {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'text_response', text }));
@@ -217,69 +254,208 @@ export class VoiceChannel implements Channel {
     ws.send(JSON.stringify({ type: 'status', state }));
   }
 
-  private async transcribe(audio: Buffer): Promise<{ text: string; confidence: number } | null> {
-    try {
-      // Convert PCM to WAV for Smallest.ai API
-      const wav = this.pcmToWav(audio, 16000, 1);
-      
-      const formData = new FormData();
-      const blob = new Blob([wav], { type: 'audio/wav' });
-      formData.append('audio', blob, 'audio.wav');
-      formData.append('language', 'en');
+  private async fetchWithRetry(
+    url: string,
+    opts: RequestInit,
+    maxAttempts = 3,
+  ): Promise<Response> {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await fetch(url, opts);
+      } catch (err) {
+        lastErr = err;
+        const cause = (err as { cause?: { code?: string } }).cause;
+        const isTransient = cause?.code === 'EAI_AGAIN' ||
+          cause?.code === 'ECONNRESET' || cause?.code === 'ETIMEDOUT';
+        if (!isTransient || attempt === maxAttempts) throw err;
+        const delay = attempt * 500;
+        logger.warn({ attempt, delay, code: cause?.code }, 'Smallest.ai fetch transient error, retrying');
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+    throw lastErr;
+  }
 
-      const res = await fetch('https://api.smallest.ai/api/Transcribe', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${this.smallestApiKey}` },
-        body: formData,
-      });
+  private async transcribe(
+    audio: Buffer,
+  ): Promise<{ text: string } | null> {
+    try {
+      const wav = this.pcmToWav(audio, 16000, 1);
+
+      const res = await this.fetchWithRetry(
+        'https://waves-api.smallest.ai/api/v1/pulse/get_text?model=pulse&language=en',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.smallestApiKey}`,
+            'Content-Type': 'audio/wav',
+          },
+          body: wav,
+        },
+      );
 
       if (!res.ok) {
         const errorText = await res.text();
-        throw new Error(`Smallest.ai returned ${res.status}: ${errorText}`);
+        throw new Error(`Smallest.ai STT returned ${res.status}: ${errorText}`);
       }
 
-      const result = await res.json() as { text: string };
-      return { text: result.text, confidence: 1.0 };
+      const result = (await res.json()) as { transcription?: string };
+      if (!result.transcription) {
+        return null;
+      }
+      return { text: result.transcription };
     } catch (err) {
       logger.error({ err }, 'Smallest.ai transcription failed');
       return null;
     }
   }
 
-  private async synthesizeWithSmallest(text: string): Promise<Buffer> {
-    const res = await fetch('https://api.smallest.ai/api/Speak', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${this.smallestApiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        text,
-        voice_id: 'default',
-        sample_rate: 24000,
-        format: 'pcm',
-      }),
-    });
+  private sanitizeForTTS(text: string): string {
+    let clean = text
+      // Remove Sources/Citations section and everything after
+      .replace(/\*?Sources?\*?:?[\s\S]*$/i, '')
+      .replace(/\*?References?\*?:?[\s\S]*$/i, '')
+      // Remove bare URLs
+      .replace(/https?:\/\/[^\s)]+/g, '')
+      // Remove ALL emojis including variation selectors and modifiers
+      .replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{E000}-\u{F8FF}\u{FE00}-\u{FE0F}\u{1F900}-\u{1F9FF}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}]/gu, '')
+      // Remove markdown bold - process before single asterisk
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      // Remove markdown italic/emphasis - any remaining asterisks
+      .replace(/\*+/g, '')
+      // Remove markdown underscores
+      .replace(/__([^_]+)__/g, '$1')
+      .replace(/_([^_]+)_/g, '$1')
+      // Remove markdown headers
+      .replace(/^#{1,6}\s+/gm, '')
+      // Remove markdown links [text](url) -> text
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      // Remove markdown code blocks
+      .replace(/```[\s\S]*?```/g, '')
+      .replace(/`([^`]+)`/g, '$1')
+      // Remove bullet points and list markers
+      .replace(/^[•\-*+]\s+/gm, '')
+      // Remove colons used for labels (but keep in times like 2:30)
+      .replace(/([A-Za-z]+):/g, '$1')
+      // Clean up multiple spaces and newlines
+      .replace(/\n{3,}/g, '. ')
+      .replace(/\n/g, '. ')
+      .replace(/\s{2,}/g, ' ')
+      .replace(/\.\.+/g, '.')
+      .trim();
 
-    if (!res.ok) {
-      const errorText = await res.text();
-      throw new Error(`Smallest.ai TTS returned ${res.status}: ${errorText}`);
+    // Enhance prosody with natural pauses
+    return this.enhanceProsody(clean);
+  }
+
+  /**
+   * Add natural pauses and intonation through punctuation.
+   * This creates more human-like speech without requiring SSML support.
+   */
+  private enhanceProsody(text: string): string {
+    return text
+      // Add pause after transition words for natural phrasing
+      .replace(/\b(however|therefore|meanwhile|furthermore|moreover|additionally|consequently)\b/gi, '$1,')
+      // Add pause after introductory phrases
+      .replace(/\b(well|so|now|okay|alright|listen|look)\b(?=\s+\w)/gi, '$1,')
+      // Add pause before conjunctions if missing
+      .replace(/([^,])\s+(but|and|or|yet|so)\s+/g, '$1, $2 ')
+      // Convert double periods to ellipsis for thinking pauses
+      .replace(/\.\.+/g, '...')
+      // Add comma before "which" for natural phrasing
+      .replace(/\s+which\s+/g, ', which ')
+      // Add pause after questions followed by statements
+      .replace(/\?\s+([A-Z])/g, '? $1')
+      // Ensure space after sentence-ending punctuation
+      .replace(/([.!?])([A-Z])/g, '$1 $2')
+      // Clean up any double commas or comma-space-comma
+      .replace(/,\s*,/g, ',')
+      // Remove comma before sentence-ending punctuation
+      .replace(/,\s*([.!?])/g, '$1')
+      .trim();
+  }
+
+  private async synthesize(text: string): Promise<Buffer> {
+    // Lightning model has max 250 chars per request
+    const chunks = this.chunkText(text, 250);
+    const audioBuffers: Buffer[] = [];
+
+    for (const chunk of chunks) {
+      const res = await this.fetchWithRetry(
+        'https://waves-api.smallest.ai/api/v1/lightning/get_speech',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.smallestApiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            text: chunk,
+            voice_id: 'emily',
+            sample_rate: 24000,
+            add_wav_header: false,
+          }),
+        },
+      );
+
+      if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(`Smallest.ai TTS returned ${res.status}: ${errorText}`);
+      }
+
+      audioBuffers.push(Buffer.from(await res.arrayBuffer()));
     }
 
-    const arrayBuf = await res.arrayBuffer();
-    return Buffer.from(arrayBuf);
+    return Buffer.concat(audioBuffers);
+  }
+
+  private chunkText(text: string, maxChunkSize: number): string[] {
+    const chunks: string[] = [];
+    let remaining = text;
+
+    while (remaining.length > 0) {
+      if (remaining.length <= maxChunkSize) {
+        chunks.push(remaining);
+        break;
+      }
+
+      // Look for punctuation within last 50 chars of max chunk size
+      let chunkEnd = maxChunkSize;
+      const punctuation = '.,:;!?';
+      let foundPunct = false;
+
+      for (let i = chunkEnd; i > Math.max(chunkEnd - 50, 0); i--) {
+        if (i < remaining.length && punctuation.includes(remaining[i])) {
+          chunkEnd = i + 1; // Include the punctuation
+          foundPunct = true;
+          break;
+        }
+      }
+
+      // If no punctuation, look for space
+      if (!foundPunct) {
+        for (let i = chunkEnd; i > Math.max(chunkEnd - 50, 0); i--) {
+          if (i < remaining.length && remaining[i] === ' ') {
+            chunkEnd = i;
+            break;
+          }
+        }
+      }
+
+      chunks.push(remaining.slice(0, chunkEnd).trim());
+      remaining = remaining.slice(chunkEnd).trim();
+    }
+
+    return chunks;
   }
 
   private pcmToWav(pcm: Buffer, sampleRate: number, channels: number): Buffer {
     const dataSize = pcm.length;
     const header = Buffer.alloc(44);
-
-    // RIFF header
     header.write('RIFF', 0);
     header.writeUInt32LE(36 + dataSize, 4);
     header.write('WAVE', 8);
-
-    // fmt chunk
     header.write('fmt ', 12);
     header.writeUInt32LE(16, 16);
     header.writeUInt16LE(1, 20);
@@ -288,23 +464,25 @@ export class VoiceChannel implements Channel {
     header.writeUInt32LE(sampleRate * channels * 2, 28);
     header.writeUInt16LE(channels * 2, 32);
     header.writeUInt16LE(16, 34);
-
-    // data chunk
     header.write('data', 36);
     header.writeUInt32LE(dataSize, 40);
-
     return Buffer.concat([header, pcm]);
   }
 
   private serveWebClient(res: http.ServerResponse): void {
-    const clientPath = path.resolve(process.cwd(), 'clients/voice-web/index.html');
+    const clientPath = path.resolve(
+      process.cwd(),
+      'clients/voice-web/index.html',
+    );
     try {
       const html = fs.readFileSync(clientPath, 'utf-8');
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end(html);
     } catch {
       res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<html><body><h1>Voice Client</h1><p>Web client not found at clients/voice-web/index.html</p></body></html>');
+      res.end(
+        '<html><body><h1>Voice Client</h1><p>Web client not found at clients/voice-web/index.html</p></body></html>',
+      );
     }
   }
 }

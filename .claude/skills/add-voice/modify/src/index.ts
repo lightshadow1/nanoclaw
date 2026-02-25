@@ -12,8 +12,10 @@ import {
   VOICE_PORT,
   VOICE_HOST,
   VOICE_GROUP,
+  VOICE_TLS_CERT,
+  VOICE_TLS_KEY,
   TRIGGER_PATTERN,
-} from './config.js';
+}
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import { VoiceChannel } from './channels/voice.js';
 import {
@@ -497,6 +499,8 @@ async function main(): Promise<void> {
       port: VOICE_PORT,
       host: VOICE_HOST,
       groupJid: voiceJid,
+      tlsCert: VOICE_TLS_CERT || undefined,
+      tlsKey: VOICE_TLS_KEY || undefined,
     });
     channels.push(voice);
     await voice.connect();

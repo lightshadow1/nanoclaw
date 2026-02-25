@@ -9,12 +9,14 @@ import { readEnvFile } from './env.js';
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
+  'CHANNELS',
   'VOICE_ENABLED',
   'VOICE_PORT',
   'VOICE_HOST',
   'VOICE_GROUP',
+  'VOICE_TLS_CERT',
+  'VOICE_TLS_KEY',
 ]);
-
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
 export const ASSISTANT_HAS_OWN_NUMBER =
@@ -27,6 +29,8 @@ export const VOICE_ENABLED =
 export const VOICE_PORT = parseInt(process.env.VOICE_PORT || envConfig.VOICE_PORT || '8080', 10);
 export const VOICE_HOST = process.env.VOICE_HOST || envConfig.VOICE_HOST || 'localhost';
 export const VOICE_GROUP = process.env.VOICE_GROUP || envConfig.VOICE_GROUP || 'voice-main';
+export const VOICE_TLS_CERT = process.env.VOICE_TLS_CERT || envConfig.VOICE_TLS_CERT || '';
+export const VOICE_TLS_KEY = process.env.VOICE_TLS_KEY || envConfig.VOICE_TLS_KEY || '';
 
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
