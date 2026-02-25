@@ -247,10 +247,10 @@
           }
           energy = Math.sqrt(energy / input.length);
 
-          // Log energy for calibration (sample every 10th frame to avoid spam).
-          if (energyLog.length < 1000) energyLog.push(energy);
-          if (energyLog.length % 10 === 0 && energyLog.length < 50) {
-            console.log(`Energy: ${energy.toFixed(6)}, Threshold: ${SILENCE_THRESHOLD}`);
+          // Log energy for calibration (every frame for first 50 frames).
+          if (energyLog.length < 50) {
+            energyLog.push(energy);
+            console.log(`[${energyLog.length}] Energy: ${energy.toFixed(6)}, Threshold: ${SILENCE_THRESHOLD}, Recording: ${isRecording}`);
           }
 
           if (energy > SILENCE_THRESHOLD) {
