@@ -29,6 +29,7 @@
       font-size: 28px;
     }
     .status-orb.listening { background: #1a3a5c; box-shadow: 0 0 20px #1a5a9a44; }
+    .status-orb.recording { background: #8a1a1a; box-shadow: 0 0 30px #ff000088; animation: pulse 0.8s infinite; }
     .status-orb.transcribing { background: #5c4a1a; box-shadow: 0 0 20px #9a7a1a44; }
     .status-orb.thinking { background: #5c4a1a; box-shadow: 0 0 20px #9a7a1a44; animation: pulse 1.5s infinite; }
     .status-orb.speaking { background: #1a5c2a; box-shadow: 0 0 20px #1a9a3a44; }
@@ -42,7 +43,7 @@
       flex: 1; overflow-y: auto; padding: 16px;
       display: flex; flex-direction: column; gap: 8px;
     }
-    .msg { padding: 8px 12px; border-radius: 8px; max-width: 85%; font-size: 14px; line-height: 1.4; }
+    .msg { padding: 8px 12px; border-radius: 8px; max-width: 85%; font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
     .msg.user { align-self: flex-end; background: #1a3a5c; }
     .msg.agent { align-self: flex-start; background: #222; }
     .msg.system { align-self: center; color: #666; font-size: 12px; }
@@ -83,8 +84,7 @@
 
   <!-- Setup screen -->
   <div class="setup-screen" id="setupScreen">
-    <input type="text" id="serverUrl" placeholder="Server URL"
-           value="">
+    <input type="text" id="serverUrl" placeholder="WebSocket URL">
     <input type="password" id="authToken" placeholder="Auth token">
     <button class="btn-connect" onclick="connectVoice()">Connect</button>
   </div>
@@ -100,7 +100,6 @@
   </div>
 
   <script>
-    // --- State ---
     let ws = null;
     let audioContext = null;
     let mediaStream = null;
@@ -108,12 +107,13 @@
     let isRecording = false;
     let audioChunks = [];
     let silenceFrames = 0;
-    const SILENCE_THRESHOLD = 0.01;
-    const SILENCE_FRAMES_TO_STOP = 2; // ~2 frames * 4096 samples / 16000 = ~0.5s
-    const MIN_SPEECH_FRAMES = 3; // ~0.38s of speech to start recording
+    const SILENCE_THRESHOLD = 0.01;  // Very sensitive
+    const SILENCE_FRAMES_TO_STOP = 6; // ~0.6s of silence before sending
+    const MIN_SPEECH_FRAMES = 1;      // START IMMEDIATELY on first speech frame
     let speechFrames = 0;
+    let lastRecordingState = false;
 
-    // Auto-fill server URL from current page
+    // Auto-fill WebSocket URL from current page
     const loc = window.location;
     const wsProtocol = loc.protocol === 'https:' ? 'wss:' : 'ws:';
     document.getElementById('serverUrl').value =
@@ -123,7 +123,19 @@
       const area = document.getElementById('transcriptArea');
       const div = document.createElement('div');
       div.className = `msg ${type}`;
-      div.textContent = text;
+      
+      // Format text with line breaks - convert emojis + text pattern to newlines
+      let formatted = text
+        // Add line breaks after emoji + colon patterns
+        .replace(/([🌡️☁️💨📊🌨️⭐🔥💧🌊🌪️⚡🌤️🌥️☀️🌙⛅🌈])\s*\*([^*:]+):\*/g, '\n$1 $2:')
+        // Add line breaks before standalone emoji patterns at start of segments
+        .replace(/\s([🌡️☁️💨📊🌨️⭐🔥💧🌊🌪️⚡🌤️🌥️☀️🌙⛅🌈])\s*\*/g, '\n$1 ')
+        // Add space after initial pattern if no leading newline
+        .replace(/^\*([^*]+):\*/, '$1:\n')
+        // Clean up leading newline
+        .replace(/^\n/, '');
+      
+      div.textContent = formatted;
       area.appendChild(div);
       area.scrollTop = area.scrollHeight;
     }
@@ -133,9 +145,8 @@
       const label = document.getElementById('statusLabel');
       orb.className = `status-orb ${state}`;
       label.textContent = state;
-
       const emoji = {
-        listening: '🎤', transcribing: '📝',
+        listening: '🎤', recording: '🔴', transcribing: '📝',
         thinking: '🤔', speaking: '🔊', disconnected: '🔇'
       };
       orb.textContent = emoji[state] || '❓';
@@ -174,16 +185,12 @@
               break;
 
             case 'transcript':
-              if (msg.isFinal) {
-                addMessage(msg.text, 'user');
-              }
+              if (msg.isFinal) addMessage(msg.text, 'user');
               break;
 
             case 'audio_response':
               addMessage(msg.text, 'agent');
-              if (msg.data) {
-                await playAudio(msg.data, msg.sampleRate || 22050);
-              }
+              if (msg.data) await playAudio(msg.data, msg.sampleRate || 24000);
               break;
 
             case 'text_response':
@@ -201,7 +208,6 @@
         ws.onerror = () => {
           document.getElementById('connInfo').textContent = 'Connection error';
         };
-
       } catch (err) {
         alert('Connection failed: ' + err.message);
       }
@@ -224,8 +230,6 @@
         });
 
         const source = audioContext.createMediaStreamSource(mediaStream);
-
-        // Use ScriptProcessorNode (simpler than AudioWorklet for single-file)
         processor = audioContext.createScriptProcessor(4096, 1, 1);
         audioChunks = [];
         silenceFrames = 0;
@@ -234,46 +238,36 @@
 
         processor.onaudioprocess = (e) => {
           const input = e.inputBuffer.getChannelData(0);
-
-          // Simple energy-based VAD
           let energy = 0;
-          for (let i = 0; i < input.length; i++) {
-            energy += input[i] * input[i];
-          }
+          for (let i = 0; i < input.length; i++) energy += input[i] * input[i];
           energy = Math.sqrt(energy / input.length);
 
           if (energy > SILENCE_THRESHOLD) {
             silenceFrames = 0;
             speechFrames++;
-
             if (!isRecording && speechFrames > MIN_SPEECH_FRAMES) {
               isRecording = true;
+              setStatus('recording');
             }
-
             if (isRecording) {
-              // Convert float32 to int16 PCM
               const pcm = new Int16Array(input.length);
-              for (let i = 0; i < input.length; i++) {
+              for (let i = 0; i < input.length; i++)
                 pcm[i] = Math.max(-32768, Math.min(32767, Math.round(input[i] * 32767)));
-              }
               audioChunks.push(pcm);
             }
           } else {
             silenceFrames++;
-
             if (isRecording) {
               if (silenceFrames >= SILENCE_FRAMES_TO_STOP) {
-                // End of utterance (~0.5s silence) — send accumulated audio
                 sendAudio();
                 isRecording = false;
                 speechFrames = 0;
                 audioChunks = [];
+                setStatus('listening');
               } else {
-                // Still recording during short pause
                 const pcm = new Int16Array(input.length);
-                for (let i = 0; i < input.length; i++) {
+                for (let i = 0; i < input.length; i++)
                   pcm[i] = Math.max(-32768, Math.min(32767, Math.round(input[i] * 32767)));
-                }
                 audioChunks.push(pcm);
               }
             } else {
@@ -284,7 +278,6 @@
 
         source.connect(processor);
         processor.connect(audioContext.destination);
-
       } catch (err) {
         addMessage('Microphone error: ' + err.message, 'system');
       }
@@ -293,26 +286,18 @@
     function sendAudio() {
       if (!ws || ws.readyState !== WebSocket.OPEN || audioChunks.length === 0) return;
 
-      // Concatenate all chunks
       const totalLength = audioChunks.reduce((sum, c) => sum + c.length, 0);
       const combined = new Int16Array(totalLength);
       let offset = 0;
-      for (const chunk of audioChunks) {
-        combined.set(chunk, offset);
-        offset += chunk.length;
-      }
+      for (const chunk of audioChunks) { combined.set(chunk, offset); offset += chunk.length; }
 
-      // Convert to base64
       const bytes = new Uint8Array(combined.buffer);
       let binary = '';
-      for (let i = 0; i < bytes.length; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      const base64 = btoa(binary);
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
 
       ws.send(JSON.stringify({
         type: 'audio',
-        data: base64,
+        data: btoa(binary),
         format: 'pcm_s16le',
         sampleRate: 16000,
         channels: 1,
@@ -322,29 +307,21 @@
 
     function stopMicrophone() {
       if (processor) { processor.disconnect(); processor = null; }
-      if (mediaStream) {
-        mediaStream.getTracks().forEach(t => t.stop());
-        mediaStream = null;
-      }
+      if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
       if (audioContext) { audioContext.close(); audioContext = null; }
     }
 
     async function playAudio(base64Data, sampleRate) {
       try {
-        const rate = sampleRate || 24000; // Smallest.ai default
+        const rate = sampleRate || 24000;
         const playCtx = new AudioContext({ sampleRate: rate });
         const binary = atob(base64Data);
         const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) {
-          bytes[i] = binary.charCodeAt(i);
-        }
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
-        // Convert int16 PCM to float32
         const int16 = new Int16Array(bytes.buffer);
         const float32 = new Float32Array(int16.length);
-        for (let i = 0; i < int16.length; i++) {
-          float32[i] = int16[i] / 32768;
-        }
+        for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
 
         const audioBuffer = playCtx.createBuffer(1, float32.length, rate);
         audioBuffer.getChannelData(0).set(float32);
@@ -353,8 +330,6 @@
         source.buffer = audioBuffer;
         source.connect(playCtx.destination);
         source.start();
-
-        // Clean up after playback
         source.onended = () => playCtx.close();
       } catch (err) {
         console.error('Audio playback error:', err);
