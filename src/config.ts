@@ -10,10 +10,6 @@ const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
   'CHANNELS',
-  'VOICE_ENABLED',
-  'VOICE_PORT',
-  'VOICE_HOST',
-  'VOICE_GROUP',
 ]);
 
 export const ASSISTANT_NAME =
@@ -24,13 +20,6 @@ export const POLL_INTERVAL = 2000;
 
 // Channel configuration
 export const CHANNELS = (process.env.CHANNELS || envConfig.CHANNELS || 'whatsapp').split(',').map((c) => c.trim());
-
-// Voice channel configuration
-export const VOICE_ENABLED =
-  (process.env.VOICE_ENABLED || envConfig.VOICE_ENABLED) === 'true';
-export const VOICE_PORT = parseInt(process.env.VOICE_PORT || envConfig.VOICE_PORT || '8080', 10);
-export const VOICE_HOST = process.env.VOICE_HOST || envConfig.VOICE_HOST || 'localhost';
-export const VOICE_GROUP = process.env.VOICE_GROUP || envConfig.VOICE_GROUP || 'voice-main';
 
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
