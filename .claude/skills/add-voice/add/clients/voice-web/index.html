@@ -109,15 +109,8 @@
     let silenceFrames = 0;
     const SILENCE_THRESHOLD = 0.01;  // Very sensitive
     const SILENCE_FRAMES_TO_STOP = 6; // ~0.6s of silence before sending
-    const MIN_SPEECH_FRAMES = 1;      // START IMMEDIATELY on first speech frame
     let speechFrames = 0;
     let lastRecordingState = false;
-
-    // Keep a small amount of audio before speech starts so we don't clip the first words.
-    // 8 frames * 4096 samples / 16000 Hz ≈ 2.0s worst-case, but in practice ScriptProcessor callbacks
-    // are often less frequent due to scheduling; this is a safe upper bound.
-    const LOOKBACK_FRAMES = 8;
-    let lookbackBuffer = []; // Array<Int16Array>
 
     // Auto-fill WebSocket URL from current page
     const loc = window.location;
@@ -244,8 +237,6 @@
 
         processor.onaudioprocess = (e) => {
           const input = e.inputBuffer.getChannelData(0);
-
-          // Convert float32 -> int16 PCM once per frame.
           const pcm = new Int16Array(input.length);
           let energy = 0;
           for (let i = 0; i < input.length; i++) {
@@ -255,40 +246,28 @@
           }
           energy = Math.sqrt(energy / input.length);
 
-          // Maintain a small lookback buffer so we can prepend audio when speech starts.
-          lookbackBuffer.push(pcm);
-          if (lookbackBuffer.length > LOOKBACK_FRAMES) lookbackBuffer.shift();
-
           if (energy > SILENCE_THRESHOLD) {
             silenceFrames = 0;
-            speechFrames++;
-
-            // Start recording immediately on first detected speech frame.
-            if (!isRecording && speechFrames >= MIN_SPEECH_FRAMES) {
+            
+            // Start recording immediately on first frame above threshold.
+            if (!isRecording) {
               isRecording = true;
               setStatus('recording');
-              // Include lookback buffer + current frame to capture utterance start.
-              audioChunks.push(...lookbackBuffer, pcm);
-            } else if (isRecording) {
-              // Subsequent frames: just append.
-              audioChunks.push(pcm);
             }
+            
+            if (isRecording) audioChunks.push(pcm);
           } else {
             silenceFrames++;
             if (isRecording) {
               if (silenceFrames >= SILENCE_FRAMES_TO_STOP) {
                 sendAudio();
                 isRecording = false;
-                speechFrames = 0;
                 audioChunks = [];
-                lookbackBuffer = [];
                 setStatus('listening');
               } else {
                 // Keep recording through short pauses.
                 audioChunks.push(pcm);
               }
-            } else {
-              speechFrames = 0;
             }
           }
         };
