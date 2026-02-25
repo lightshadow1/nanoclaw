@@ -4,6 +4,7 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  CHANNELS,
   DATA_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
@@ -485,12 +486,16 @@ async function main(): Promise<void> {
     registeredGroups: () => registeredGroups,
   };
 
-  // Create and connect channels
-  whatsapp = new WhatsAppChannel(channelOpts);
-  channels.push(whatsapp);
-  await whatsapp.connect();
+  // Create and connect channels based on CHANNELS config
+  const enabledChannels = CHANNELS;
+  
+  if (enabledChannels.includes('whatsapp')) {
+    whatsapp = new WhatsAppChannel(channelOpts);
+    channels.push(whatsapp);
+    await whatsapp.connect();
+  }
 
-  if (VOICE_ENABLED) {
+  if (enabledChannels.includes('voice')) {
     const voiceJid = `voice:${VOICE_GROUP}@local`;
     const voice = new VoiceChannel({
       ...channelOpts,

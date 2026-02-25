@@ -9,6 +9,7 @@ import { readEnvFile } from './env.js';
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
+  'CHANNELS',
   'VOICE_ENABLED',
   'VOICE_PORT',
   'VOICE_HOST',
@@ -20,6 +21,9 @@ export const ASSISTANT_NAME =
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 export const POLL_INTERVAL = 2000;
+
+// Channel configuration
+export const CHANNELS = (process.env.CHANNELS || envConfig.CHANNELS || 'whatsapp').split(',').map((c) => c.trim());
 
 // Voice channel configuration
 export const VOICE_ENABLED =
