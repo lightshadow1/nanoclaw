@@ -113,6 +113,12 @@
     let speechFrames = 0;
     let lastRecordingState = false;
 
+    // Keep a small amount of audio before speech starts so we don't clip the first words.
+    // 8 frames * 4096 samples / 16000 Hz ≈ 2.0s worst-case, but in practice ScriptProcessor callbacks
+    // are often less frequent due to scheduling; this is a safe upper bound.
+    const LOOKBACK_FRAMES = 8;
+    let lookbackBuffer = []; // Array<Int16Array>
+
     // Auto-fill WebSocket URL from current page
     const loc = window.location;
     const wsProtocol = loc.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -238,23 +244,33 @@
 
         processor.onaudioprocess = (e) => {
           const input = e.inputBuffer.getChannelData(0);
+
+          // Convert float32 -> int16 PCM once per frame.
+          const pcm = new Int16Array(input.length);
           let energy = 0;
-          for (let i = 0; i < input.length; i++) energy += input[i] * input[i];
+          for (let i = 0; i < input.length; i++) {
+            const s = input[i];
+            energy += s * s;
+            pcm[i] = Math.max(-32768, Math.min(32767, Math.round(s * 32767)));
+          }
           energy = Math.sqrt(energy / input.length);
+
+          // Maintain a small lookback buffer so we can prepend audio when speech starts.
+          lookbackBuffer.push(pcm);
+          if (lookbackBuffer.length > LOOKBACK_FRAMES) lookbackBuffer.shift();
 
           if (energy > SILENCE_THRESHOLD) {
             silenceFrames = 0;
             speechFrames++;
-            if (!isRecording && speechFrames > MIN_SPEECH_FRAMES) {
+
+            // Start recording immediately on first detected speech frame.
+            if (!isRecording && speechFrames >= MIN_SPEECH_FRAMES) {
               isRecording = true;
               setStatus('recording');
+              audioChunks = lookbackBuffer.slice();
             }
-            if (isRecording) {
-              const pcm = new Int16Array(input.length);
-              for (let i = 0; i < input.length; i++)
-                pcm[i] = Math.max(-32768, Math.min(32767, Math.round(input[i] * 32767)));
-              audioChunks.push(pcm);
-            }
+
+            if (isRecording) audioChunks.push(pcm);
           } else {
             silenceFrames++;
             if (isRecording) {
@@ -263,11 +279,10 @@
                 isRecording = false;
                 speechFrames = 0;
                 audioChunks = [];
+                lookbackBuffer = [];
                 setStatus('listening');
               } else {
-                const pcm = new Int16Array(input.length);
-                for (let i = 0; i < input.length; i++)
-                  pcm[i] = Math.max(-32768, Math.min(32767, Math.round(input[i] * 32767)));
+                // Keep recording through short pauses.
                 audioChunks.push(pcm);
               }
             } else {
