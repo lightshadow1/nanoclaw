@@ -75,6 +75,14 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS capability_migrations (
+      capability TEXT NOT NULL,
+      version TEXT NOT NULL,
+      applied_at TEXT NOT NULL,
+      rolled_back_at TEXT,
+      PRIMARY KEY (capability, version)
+    );
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -132,6 +140,11 @@ export function initDatabase(): void {
 export function _initTestDatabase(): void {
   db = new Database(':memory:');
   createSchema(db);
+}
+
+export function getDb(): Database.Database {
+  if (!db) throw new Error('Database not initialized. Call initDatabase() first.');
+  return db;
 }
 
 /**

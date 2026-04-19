@@ -5,6 +5,7 @@ import {
   ASSISTANT_NAME,
   CHANNELS,
   DATA_DIR,
+  GROUPS_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
@@ -24,6 +25,7 @@ import {
   getAllSessions,
   getAllTasks,
   getMessagesSince,
+  getDb,
   getNewMessages,
   getRouterState,
   initDatabase,
@@ -39,6 +41,8 @@ import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { loadCapabilities, teardownCapabilities } from './capabilities/registry.js';
+import { dispatchMessageStored, dispatchMessageSent, dispatchShutdown } from './capabilities/hooks.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -182,6 +186,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
         await channel.sendMessage(chatJid, text);
+        dispatchMessageSent({
+          chatJid,
+          content: text,
+          timestamp: new Date().toISOString(),
+          groupFolder: group.folder,
+        });
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -414,11 +424,20 @@ async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
+  await loadCapabilities({
+    db: getDb(),
+    registeredGroups: () => registeredGroups,
+    projectRoot: process.cwd(),
+    groupsDir: GROUPS_DIR,
+    dataDir: DATA_DIR,
+  });
   loadState();
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    await dispatchShutdown();
+    await teardownCapabilities();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -428,7 +447,21 @@ async function main(): Promise<void> {
 
   // Channel callbacks (shared by all channels)
   const channelOpts = {
-    onMessage: (_chatJid: string, msg: NewMessage) => storeMessage(msg),
+    onMessage: (_chatJid: string, msg: NewMessage) => {
+      storeMessage(msg);
+      const group = registeredGroups[msg.chat_jid];
+      dispatchMessageStored({
+        id: msg.id,
+        chatJid: msg.chat_jid,
+        sender: msg.sender,
+        senderName: msg.sender_name,
+        content: msg.content,
+        timestamp: msg.timestamp,
+        isFromMe: msg.is_from_me ?? false,
+        isBotMessage: msg.is_bot_message ?? false,
+        groupFolder: group?.folder ?? null,
+      });
+    },
     onChatMetadata: (chatJid: string, timestamp: string, name?: string, channel?: string, isGroup?: boolean) =>
       storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
