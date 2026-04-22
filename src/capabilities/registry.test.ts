@@ -248,11 +248,10 @@ describe('teardown', () => {
   });
 });
 
-describe('loadCapabilities with empty array', () => {
-  it('loads without error when no capabilities registered', async () => {
-    // The CAPABILITIES array is empty, so this should be a no-op
+describe('loadCapabilities', () => {
+  it('loads registered capabilities', async () => {
     await loadCapabilities(makeContext());
-    expect(getActiveCapabilities()).toHaveLength(0);
+    expect(getActiveCapabilities().length).toBeGreaterThanOrEqual(1);
     await teardownCapabilities();
   });
 });
