@@ -7,8 +7,9 @@ import { logger } from '../logger.js';
 // Add new capabilities here. Order matters: capabilities are initialized
 // in array order, torn down in reverse order.
 import { debugLoggerCapability } from './debug-logger/index.js';
+import { soulCapability } from './soul/index.js';
 
-const CAPABILITIES: Capability[] = [debugLoggerCapability];
+const CAPABILITIES: Capability[] = [debugLoggerCapability, soulCapability];
 
 let activeCapabilities: Capability[] = [];
 

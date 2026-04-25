@@ -10,6 +10,7 @@ export interface StoredMessage {
   isFromMe: boolean;
   isBotMessage: boolean;
   groupFolder: string | null;
+  source: string | null;
 }
 
 export interface SentMessage {

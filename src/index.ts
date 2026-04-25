@@ -450,6 +450,7 @@ async function main(): Promise<void> {
     onMessage: (_chatJid: string, msg: NewMessage) => {
       storeMessage(msg);
       const group = registeredGroups[msg.chat_jid];
+      const source = channels.find((c) => c.ownsJid(msg.chat_jid))?.name ?? null;
       dispatchMessageStored({
         id: msg.id,
         chatJid: msg.chat_jid,
@@ -460,6 +461,7 @@ async function main(): Promise<void> {
         isFromMe: msg.is_from_me ?? false,
         isBotMessage: msg.is_bot_message ?? false,
         groupFolder: group?.folder ?? null,
+        source,
       });
     },
     onChatMetadata: (chatJid: string, timestamp: string, name?: string, channel?: string, isGroup?: boolean) =>

@@ -171,6 +171,7 @@ describe('hooks', () => {
       isFromMe: false,
       isBotMessage: false,
       groupFolder: 'main',
+      source: 'whatsapp',
     });
 
     expect(calls).toEqual(['a', 'b']);
@@ -198,6 +199,7 @@ describe('hooks', () => {
       isFromMe: false,
       isBotMessage: false,
       groupFolder: 'main',
+      source: 'whatsapp',
     });
 
     expect(calls).toEqual(['good']);
