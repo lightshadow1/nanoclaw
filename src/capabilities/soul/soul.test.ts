@@ -242,6 +242,52 @@ describe('soulCapability hook', () => {
     await soulCapability.teardown!();
   });
 
+  it('onMessageSent records agent output as action row', async () => {
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: () => ({}),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+
+    soulCapability.hooks!.onMessageSent!({
+      chatJid: 'tg:1903482562',
+      content: "Here's the current weather for Kitchener…",
+      timestamp: '2026-04-30T11:10:00Z',
+      groupFolder: 'main',
+    });
+
+    const rows = getUncurated(getDb(), 'main');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].type).toBe('action');
+    expect(rows[0].source).toBe('agent');
+    expect(JSON.parse(rows[0].metadata!)).toEqual({ chatJid: 'tg:1903482562' });
+
+    await soulCapability.teardown!();
+  });
+
+  it('onMessageSent scaffolds the wiki for a never-seen group', async () => {
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: () => ({}),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+
+    soulCapability.hooks!.onMessageSent!({
+      chatJid: 'tg:1',
+      content: 'hi',
+      timestamp: '2026-04-30T11:10:00Z',
+      groupFolder: 'fresh',
+    });
+
+    expect(fs.existsSync(path.join(tmpDir, 'fresh', 'soul', 'wiki', '_index.md'))).toBe(true);
+
+    await soulCapability.teardown!();
+  });
+
   it('hook is a no-op after teardown', async () => {
     await soulCapability.init({
       db: getDb(),

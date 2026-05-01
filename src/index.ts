@@ -424,6 +424,7 @@ async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
+  loadState();
   await loadCapabilities({
     db: getDb(),
     registeredGroups: () => registeredGroups,
@@ -431,7 +432,6 @@ async function main(): Promise<void> {
     groupsDir: GROUPS_DIR,
     dataDir: DATA_DIR,
   });
-  loadState();
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
