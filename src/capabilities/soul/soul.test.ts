@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { _initTestDatabase, getDb } from '../../db.js';
+import { _initTestDatabase, getDb, getTaskById } from '../../db.js';
 import { runMigrations, rollbackCapability } from '../lifecycle.js';
 import { clearHooks } from '../hooks.js';
 import { heuristicScore } from './heuristic-score.js';
@@ -315,5 +315,181 @@ describe('soulCapability hook', () => {
       n: number;
     };
     expect(rows.n).toBe(0);
+  });
+});
+
+describe('ensureSoulTasks', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  function mainGroup() {
+    return {
+      'group-main@g.us': { name: 'Main', folder: 'main' },
+    };
+  }
+
+  it('creates curation and evening journal tasks for the main group', async () => {
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: mainGroup,
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+
+    const curation = getTaskById('soul-wiki-curation-main');
+    const journal = getTaskById('soul-evening-journal-main');
+
+    expect(curation).toBeDefined();
+    expect(curation!.group_folder).toBe('main');
+    expect(curation!.chat_jid).toBe('group-main@g.us');
+    expect(curation!.schedule_type).toBe('interval');
+    expect(curation!.schedule_value).toBe('1800000');
+    expect(curation!.context_mode).toBe('isolated');
+    expect(curation!.status).toBe('active');
+    expect(curation!.next_run).toBeTruthy();
+    expect(curation!.prompt).toContain('memory_stream');
+
+    expect(journal).toBeDefined();
+    expect(journal!.schedule_type).toBe('cron');
+    expect(journal!.schedule_value).toBe('0 22 * * *');
+    expect(journal!.prompt).toContain('evening journal');
+
+    await soulCapability.teardown!();
+  });
+
+  it('creates no tasks when no main group is registered', async () => {
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: () => ({
+        'g1@g.us': { name: 'Side', folder: 'side' },
+      }),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+
+    expect(getTaskById('soul-wiki-curation-main')).toBeUndefined();
+    expect(getTaskById('soul-evening-journal-main')).toBeUndefined();
+    expect(getTaskById('soul-wiki-curation-side')).toBeUndefined();
+
+    await soulCapability.teardown!();
+  });
+
+  it('is idempotent across re-init and does not duplicate tasks', async () => {
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: mainGroup,
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+    const firstNextRun = getTaskById('soul-wiki-curation-main')!.next_run;
+    await soulCapability.teardown!();
+
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: mainGroup,
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+
+    const count = getDb()
+      .prepare("SELECT COUNT(*) as n FROM scheduled_tasks WHERE id LIKE 'soul-%'")
+      .get() as { n: number };
+    expect(count.n).toBe(2);
+
+    // next_run was preserved (cadence not reset on re-init)
+    expect(getTaskById('soul-wiki-curation-main')!.next_run).toBe(firstNextRun);
+
+    await soulCapability.teardown!();
+  });
+});
+
+describe('ensureClaudeMdSection', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  it('creates CLAUDE.md with soul section when no file exists', async () => {
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: () => ({
+        'g@g.us': { name: 'Main', folder: 'main' },
+      }),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+
+    const claudePath = path.join(tmpDir, 'main', 'CLAUDE.md');
+    expect(fs.existsSync(claudePath)).toBe(true);
+    const contents = fs.readFileSync(claudePath, 'utf-8');
+    expect(contents).toContain('<!-- soul-section -->');
+    expect(contents).toContain('## Soul');
+
+    await soulCapability.teardown!();
+  });
+
+  it('appends soul section to existing CLAUDE.md', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'main'), { recursive: true });
+    const claudePath = path.join(tmpDir, 'main', 'CLAUDE.md');
+    fs.writeFileSync(claudePath, '# Andy\n\nExisting content here.\n', 'utf-8');
+
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: () => ({
+        'g@g.us': { name: 'Main', folder: 'main' },
+      }),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+
+    const contents = fs.readFileSync(claudePath, 'utf-8');
+    expect(contents).toMatch(/^# Andy\n\nExisting content here\.\n/);
+    expect(contents).toContain('<!-- soul-section -->');
+    expect(contents).toContain('## Soul');
+
+    await soulCapability.teardown!();
+  });
+
+  it('does not duplicate the soul section on re-init', async () => {
+    const ctx = {
+      db: getDb(),
+      registeredGroups: () => ({
+        'g@g.us': { name: 'Main', folder: 'main' },
+      }),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    };
+    await soulCapability.init(ctx);
+    await soulCapability.teardown!();
+    await soulCapability.init(ctx);
+
+    const contents = fs.readFileSync(path.join(tmpDir, 'main', 'CLAUDE.md'), 'utf-8');
+    const matches = contents.match(/<!-- soul-section -->/g) ?? [];
+    expect(matches).toHaveLength(1);
+
+    await soulCapability.teardown!();
+  });
+
+  it('does not touch CLAUDE.md when no main group is registered', async () => {
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: () => ({
+        'g@g.us': { name: 'Side', folder: 'side' },
+      }),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+
+    expect(fs.existsSync(path.join(tmpDir, 'main', 'CLAUDE.md'))).toBe(false);
+
+    await soulCapability.teardown!();
   });
 });
