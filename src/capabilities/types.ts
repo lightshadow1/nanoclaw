@@ -20,10 +20,20 @@ export interface SentMessage {
   groupFolder: string;
 }
 
+export interface ScheduledTaskInfo {
+  id: string;
+  group_folder: string;
+  schedule_type: 'cron' | 'interval' | 'once';
+}
+
 export interface CapabilityHooks {
   onMessageStored?(msg: StoredMessage): void;
   onMessageSent?(msg: SentMessage): void;
   onShutdown?(): Promise<void>;
+  // Return false to skip this task run. Lets a capability gate an
+  // expensive scheduled task (e.g. don't fire the soul curator if no
+  // new memories accumulated). Skipped runs still advance next_run.
+  beforeTaskRun?(task: ScheduledTaskInfo): boolean | Promise<boolean>;
 }
 
 export interface MigrationBundle {

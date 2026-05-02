@@ -10,6 +10,7 @@ import {
   SCHEDULER_POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
+import { dispatchBeforeTaskRun } from './capabilities/hooks.js';
 import { ContainerOutput, runContainerAgent, writeTasksSnapshot } from './container-runner.js';
 import {
   getAllTasks,
@@ -37,6 +38,26 @@ async function runTask(
   const startTime = Date.now();
   const groupDir = path.join(GROUPS_DIR, task.group_folder);
   fs.mkdirSync(groupDir, { recursive: true });
+
+  // Capability gate: skip the run before any container spin-up cost.
+  // Skipped runs still advance next_run so the task fires at the next slot.
+  const allow = await dispatchBeforeTaskRun({
+    id: task.id,
+    group_folder: task.group_folder,
+    schedule_type: task.schedule_type,
+  });
+  if (!allow) {
+    let nextRun: string | null = null;
+    if (task.schedule_type === 'cron') {
+      nextRun = CronExpressionParser.parse(task.schedule_value, { tz: TIMEZONE })
+        .next()
+        .toISOString();
+    } else if (task.schedule_type === 'interval') {
+      nextRun = new Date(Date.now() + parseInt(task.schedule_value, 10)).toISOString();
+    }
+    updateTaskAfterRun(task.id, nextRun, 'skipped: gated by capability hook');
+    return;
+  }
 
   logger.info(
     { taskId: task.id, group: task.group_folder },

@@ -1,4 +1,9 @@
-import type { CapabilityHooks, StoredMessage, SentMessage } from './types.js';
+import type {
+  CapabilityHooks,
+  ScheduledTaskInfo,
+  StoredMessage,
+  SentMessage,
+} from './types.js';
 import { logger } from '../logger.js';
 
 interface RegisteredHook {
@@ -32,6 +37,28 @@ export function dispatchMessageSent(msg: SentMessage): void {
       logger.error({ capability: name, err }, 'Hook error in onMessageSent');
     }
   }
+}
+
+export async function dispatchBeforeTaskRun(
+  task: ScheduledTaskInfo,
+): Promise<boolean> {
+  for (const { name, hooks } of registered) {
+    if (!hooks.beforeTaskRun) continue;
+    try {
+      const allow = await hooks.beforeTaskRun(task);
+      if (allow === false) {
+        logger.info(
+          { capability: name, taskId: task.id },
+          'Task skipped by capability hook',
+        );
+        return false;
+      }
+    } catch (err) {
+      // A hook error shouldn't block the task — fail open.
+      logger.error({ capability: name, err }, 'Hook error in beforeTaskRun');
+    }
+  }
+  return true;
 }
 
 export async function dispatchShutdown(): Promise<void> {
