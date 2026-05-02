@@ -8,7 +8,7 @@ import { MAIN_GROUP_FOLDER, TIMEZONE, TRIGGER_PATTERN } from '../../config.js';
 import { logger } from '../../logger.js';
 import { createTask, getTaskById, updateTask } from '../../db.js';
 import { memoryStreamMigration } from './migrations.js';
-import { addMemory } from './memory-stream.js';
+import { addMemory, getUncurated } from './memory-stream.js';
 import { heuristicScore } from './heuristic-score.js';
 import { ensureWikiForGroup } from './wiki-scaffold.js';
 import {
@@ -111,7 +111,7 @@ function ensureSoulTasks(ctx: CapabilityContext): void {
     chat_jid: mainJid,
     prompt: buildWikiCurationPrompt(MAIN_GROUP_FOLDER),
     schedule_type: 'interval',
-    schedule_value: '1800000', // 30 minutes
+    schedule_value: '7200000', // 2 hours — the beforeTaskRun gate skips empty passes for free
   });
 
   upsertSoulTask({
@@ -199,6 +199,15 @@ export const soulCapability: Capability = {
   },
 
   hooks: {
+    beforeTaskRun: (task) => {
+      // Only gate the curation task. The evening journal runs unconditionally
+      // (it does the deep staleness review and daily-plan reconciliation
+      // even on quiet days).
+      if (task.id !== `soul-wiki-curation-${MAIN_GROUP_FOLDER}`) return true;
+      if (!db) return true; // fail open if soul never initialized
+      return getUncurated(db, MAIN_GROUP_FOLDER, 1).length > 0;
+    },
+
     onMessageStored: (msg) => {
       if (!db || !msg.groupFolder) return;
 

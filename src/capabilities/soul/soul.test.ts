@@ -345,7 +345,7 @@ describe('ensureSoulTasks', () => {
     expect(curation!.group_folder).toBe('main');
     expect(curation!.chat_jid).toBe('group-main@g.us');
     expect(curation!.schedule_type).toBe('interval');
-    expect(curation!.schedule_value).toBe('1800000');
+    expect(curation!.schedule_value).toBe('7200000');
     expect(curation!.context_mode).toBe('isolated');
     expect(curation!.status).toBe('active');
     expect(curation!.next_run).toBeTruthy();
@@ -405,6 +405,87 @@ describe('ensureSoulTasks', () => {
     expect(getTaskById('soul-wiki-curation-main')!.next_run).toBe(firstNextRun);
 
     await soulCapability.teardown!();
+  });
+});
+
+describe('soulCapability beforeTaskRun gate', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  function ctx() {
+    return {
+      db: getDb(),
+      registeredGroups: () => ({
+        'g@g.us': { name: 'Main', folder: 'main' },
+      }),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    };
+  }
+
+  function curationTask() {
+    return {
+      id: 'soul-wiki-curation-main',
+      group_folder: 'main',
+      schedule_type: 'interval' as const,
+    };
+  }
+
+  function journalTask() {
+    return {
+      id: 'soul-evening-journal-main',
+      group_folder: 'main',
+      schedule_type: 'cron' as const,
+    };
+  }
+
+  it('skips curation when there are no uncurated entries', async () => {
+    await soulCapability.init(ctx());
+    const allow = await soulCapability.hooks!.beforeTaskRun!(curationTask());
+    expect(allow).toBe(false);
+    await soulCapability.teardown!();
+  });
+
+  it('allows curation when at least one uncurated entry exists', async () => {
+    await soulCapability.init(ctx());
+    addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-04-30T12:00:00Z',
+      type: 'observation',
+      source: 'whatsapp',
+      content: 'real message',
+      importance: 5,
+    });
+    const allow = await soulCapability.hooks!.beforeTaskRun!(curationTask());
+    expect(allow).toBe(true);
+    await soulCapability.teardown!();
+  });
+
+  it('always allows the evening journal regardless of uncurated count', async () => {
+    await soulCapability.init(ctx());
+    const allow = await soulCapability.hooks!.beforeTaskRun!(journalTask());
+    expect(allow).toBe(true);
+    await soulCapability.teardown!();
+  });
+
+  it('does not gate unrelated tasks', async () => {
+    await soulCapability.init(ctx());
+    const allow = await soulCapability.hooks!.beforeTaskRun!({
+      id: 'task-from-some-other-feature',
+      group_folder: 'main',
+      schedule_type: 'interval',
+    });
+    expect(allow).toBe(true);
+    await soulCapability.teardown!();
+  });
+
+  it('fails open after teardown', async () => {
+    await soulCapability.init(ctx());
+    await soulCapability.teardown!();
+    const allow = await soulCapability.hooks!.beforeTaskRun!(curationTask());
+    expect(allow).toBe(true);
   });
 });
 
