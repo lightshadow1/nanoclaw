@@ -1,10 +1,18 @@
 import fs from 'fs';
+import http from 'http';
+import os from 'os';
 import path from 'path';
 import type Database from 'better-sqlite3';
 import { CronExpressionParser } from 'cron-parser';
 import type { Capability, CapabilityContext } from '../types.js';
 import { readEnvFile } from '../../env.js';
-import { MAIN_GROUP_FOLDER, TIMEZONE, TRIGGER_PATTERN } from '../../config.js';
+import {
+  ASSISTANT_NAME,
+  CHANNELS,
+  MAIN_GROUP_FOLDER,
+  TIMEZONE,
+  TRIGGER_PATTERN,
+} from '../../config.js';
 import { logger } from '../../logger.js';
 import { createTask, getTaskById, updateTask } from '../../db.js';
 import { memoryStreamMigration } from './migrations.js';
@@ -15,12 +23,93 @@ import {
   buildEveningJournalPrompt,
   buildWikiCurationPrompt,
 } from './curator-prompts.js';
+import { generateAgentDescription } from './agent-description.js';
+import {
+  encodeMultibase,
+  generateDIDDocument,
+  generateKeypair,
+  loadKeypair,
+} from './identity.js';
+import { startIdentityServer, stopIdentityServer } from './identity-server.js';
 
 // Module-level handles so the synchronous hook can reach them
 // without re-resolving on every dispatch. Mirrors src/db.ts's pattern.
 let db: Database.Database | null = null;
 let groupsDir: string | null = null;
+let identityServer: http.Server | null = null;
 const scaffoldedGroups = new Set<string>();
+
+function discoverSkills(projectRoot: string): string[] {
+  const skillsDir = path.join(projectRoot, '.claude', 'skills');
+  if (!fs.existsSync(skillsDir)) return [];
+  try {
+    return fs
+      .readdirSync(skillsDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name)
+      .sort();
+  } catch (err) {
+    logger.warn({ err }, 'Failed to enumerate skills directory');
+    return [];
+  }
+}
+
+async function startSoulIdentityServer(ctx: CapabilityContext): Promise<void> {
+  const env = readEnvFile([
+    'SOUL_DOMAIN',
+    'SOUL_PORT',
+    'SOUL_OWNER',
+    'SOUL_NAME',
+    'SOUL_TRAITS',
+    'SOUL_DESCRIPTION',
+  ]);
+  const domain = process.env.SOUL_DOMAIN ?? env.SOUL_DOMAIN;
+  if (!domain) {
+    logger.info('SOUL_DOMAIN not set, identity server disabled (local-only)');
+    return;
+  }
+
+  const port = parseInt(process.env.SOUL_PORT ?? env.SOUL_PORT ?? '8444', 10);
+  const owner = process.env.SOUL_OWNER ?? env.SOUL_OWNER ?? 'Unknown';
+  const agentName = process.env.SOUL_NAME ?? env.SOUL_NAME ?? ASSISTANT_NAME;
+  const description = process.env.SOUL_DESCRIPTION ?? env.SOUL_DESCRIPTION;
+  const traitsRaw = process.env.SOUL_TRAITS ?? env.SOUL_TRAITS;
+  const traits = traitsRaw
+    ? traitsRaw.split(',').map((t) => t.trim()).filter(Boolean)
+    : undefined;
+
+  const keyDir = path.join(os.homedir(), '.config', 'nanoclaw', 'soul');
+  generateKeypair(keyDir);
+  const { privateKey, publicKeyRaw } = loadKeypair(keyDir);
+
+  const publicKeyMultibase = encodeMultibase(publicKeyRaw);
+  const didDoc = generateDIDDocument({ domain, agentName, publicKeyMultibase });
+  const verificationMethodId = `did:wba:${domain}:agent:${agentName}#key-1`;
+
+  const skills = discoverSkills(ctx.projectRoot);
+  const agentDesc = generateAgentDescription({
+    domain,
+    agentName,
+    owner,
+    description,
+    traits,
+    channelNames: CHANNELS,
+    skillNames: skills,
+    hasScheduler: true,
+  });
+
+  identityServer = startIdentityServer({
+    port,
+    didDocument: didDoc,
+    agentDescription: agentDesc,
+    privateKey,
+    verificationMethodId,
+  });
+  logger.info(
+    { port, did: `did:wba:${domain}:agent:${agentName}`, skills: skills.length },
+    'Soul identity server started',
+  );
+}
 
 function scaffoldOnce(folder: string): void {
   if (!groupsDir || scaffoldedGroups.has(folder)) return;
@@ -189,10 +278,26 @@ export const soulCapability: Capability = {
       logger.error({ err }, 'Failed to register soul scheduled tasks');
     }
 
+    try {
+      await startSoulIdentityServer(ctx);
+    } catch (err) {
+      // Identity is optional. Failure here must not break message capture
+      // or wiki curation.
+      logger.error({ err }, 'Failed to start soul identity server');
+    }
+
     logger.info({ scaffolded: scaffoldedGroups.size }, 'Soul capability initialized');
   },
 
   teardown: async () => {
+    if (identityServer) {
+      try {
+        await stopIdentityServer(identityServer);
+      } catch (err) {
+        logger.error({ err }, 'Error stopping soul identity server');
+      }
+      identityServer = null;
+    }
     db = null;
     groupsDir = null;
     scaffoldedGroups.clear();
