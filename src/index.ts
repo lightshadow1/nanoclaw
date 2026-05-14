@@ -9,9 +9,11 @@ import {
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
+  TELEGRAM_BOT_TOKEN,
   TRIGGER_PATTERN,
 } from './config.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
+import { TelegramChannel } from './channels/telegram.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -476,6 +478,15 @@ async function main(): Promise<void> {
     whatsapp = new WhatsAppChannel(channelOpts);
     channels.push(whatsapp);
     await whatsapp.connect();
+  }
+
+  if (enabledChannels.includes('telegram')) {
+    if (!TELEGRAM_BOT_TOKEN) {
+      throw new Error('CHANNELS includes telegram but TELEGRAM_BOT_TOKEN is not set');
+    }
+    const telegram = new TelegramChannel(TELEGRAM_BOT_TOKEN, channelOpts);
+    channels.push(telegram);
+    await telegram.connect();
   }
 
   // Start subsystems (independently of connection handler)

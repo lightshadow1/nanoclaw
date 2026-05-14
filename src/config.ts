@@ -10,6 +10,7 @@ const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
   'CHANNELS',
+  'TELEGRAM_BOT_TOKEN',
 ]);
 
 export const ASSISTANT_NAME =
@@ -20,6 +21,10 @@ export const POLL_INTERVAL = 2000;
 
 // Channel configuration
 export const CHANNELS = (process.env.CHANNELS || envConfig.CHANNELS || 'whatsapp').split(',').map((c) => c.trim());
+
+// Telegram bot token — required when CHANNELS includes 'telegram'
+export const TELEGRAM_BOT_TOKEN =
+  process.env.TELEGRAM_BOT_TOKEN || envConfig.TELEGRAM_BOT_TOKEN || '';
 
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
