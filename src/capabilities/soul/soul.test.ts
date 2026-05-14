@@ -11,6 +11,7 @@ import { heuristicScore } from './heuristic-score.js';
 import { addMemory, getUncurated } from './memory-stream.js';
 import { ensureWikiForGroup } from './wiki-scaffold.js';
 import {
+  encodeEd25519PublicKeyMultibase,
   encodeMultibase,
   generateDIDDocument,
   generateKeypair,
@@ -609,6 +610,57 @@ describe('encodeMultibase', () => {
     const b = encodeMultibase(bytes);
     expect(a).toBe(b);
     expect(a.length).toBeGreaterThan(40);
+  });
+});
+
+describe('encodeEd25519PublicKeyMultibase', () => {
+  it('produces a "z6Mk" prefix for a real Ed25519 public key', () => {
+    // Properly multicodec-prefixed (0xed 0x01) Ed25519 keys encoded as
+    // base58btc multibase always start with "z6Mk". This is the canonical
+    // Ed25519VerificationKey2020 publicKeyMultibase format that DID/W3C
+    // verifiers expect — if this assertion ever fails, the multicodec prefix
+    // has been dropped or the encoding broke.
+    const keyDir = path.join(tmpDir, 'keys');
+    generateKeypair(keyDir);
+    const { publicKeyRaw } = loadKeypair(keyDir);
+    const mb = encodeEd25519PublicKeyMultibase(publicKeyRaw);
+    expect(mb.startsWith('z6Mk')).toBe(true);
+  });
+
+  it('produces a "z6Mk" prefix for a deterministic 32-byte input', () => {
+    // Independent of generateKeypair — any 32-byte buffer prefixed with
+    // 0xed 0x01 and base58btc-encoded yields "z6Mk...".
+    const bytes = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) bytes[i] = i;
+    expect(encodeEd25519PublicKeyMultibase(bytes).startsWith('z6Mk')).toBe(true);
+  });
+
+  it('is deterministic for the same input', () => {
+    const bytes = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) bytes[i] = i + 1;
+    expect(encodeEd25519PublicKeyMultibase(bytes)).toBe(
+      encodeEd25519PublicKeyMultibase(bytes),
+    );
+  });
+
+  it('throws on inputs that are not 32 bytes', () => {
+    expect(() => encodeEd25519PublicKeyMultibase(new Uint8Array(31))).toThrow(
+      /32 bytes/,
+    );
+    expect(() => encodeEd25519PublicKeyMultibase(new Uint8Array(33))).toThrow(
+      /32 bytes/,
+    );
+    expect(() => encodeEd25519PublicKeyMultibase(new Uint8Array(0))).toThrow(
+      /32 bytes/,
+    );
+  });
+
+  it('differs from the unprefixed multibase encoding of the same key', () => {
+    // Sanity check that the multicodec prefix actually changes the output —
+    // a regression where the prefix is silently dropped should fail here.
+    const bytes = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) bytes[i] = i;
+    expect(encodeEd25519PublicKeyMultibase(bytes)).not.toBe(encodeMultibase(bytes));
   });
 });
 

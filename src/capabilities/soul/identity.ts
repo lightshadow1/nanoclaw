@@ -11,8 +11,27 @@ export interface LoadedKeypair {
 const BASE58_ALPHABET =
   '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
+// Multicodec varint for Ed25519 public keys: 0xed 0x01.
+// The Ed25519VerificationKey2020 spec requires this prefix on the raw 32-byte
+// public key before base58btc encoding. Without it, conformant verifiers will
+// reject the key. Properly prefixed Ed25519 multibase strings start with "z6Mk".
+// Reference: https://w3c-ccg.github.io/lds-ed25519-2020/
+const ED25519_MULTICODEC_PREFIX = new Uint8Array([0xed, 0x01]);
+
 export function encodeMultibase(bytes: Uint8Array): string {
   return 'z' + base58btcEncode(bytes);
+}
+
+export function encodeEd25519PublicKeyMultibase(rawPublicKey: Uint8Array): string {
+  if (rawPublicKey.length !== 32) {
+    throw new Error(
+      `Ed25519 public key must be 32 bytes, got ${rawPublicKey.length}`,
+    );
+  }
+  const prefixed = new Uint8Array(2 + rawPublicKey.length);
+  prefixed.set(ED25519_MULTICODEC_PREFIX, 0);
+  prefixed.set(rawPublicKey, 2);
+  return encodeMultibase(prefixed);
 }
 
 function base58btcEncode(bytes: Uint8Array): string {

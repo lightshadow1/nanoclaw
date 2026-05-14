@@ -25,7 +25,7 @@ import {
 } from './curator-prompts.js';
 import { generateAgentDescription } from './agent-description.js';
 import {
-  encodeMultibase,
+  encodeEd25519PublicKeyMultibase,
   generateDIDDocument,
   generateKeypair,
   loadKeypair,
@@ -82,7 +82,7 @@ async function startSoulIdentityServer(ctx: CapabilityContext): Promise<void> {
   generateKeypair(keyDir);
   const { privateKey, publicKeyRaw } = loadKeypair(keyDir);
 
-  const publicKeyMultibase = encodeMultibase(publicKeyRaw);
+  const publicKeyMultibase = encodeEd25519PublicKeyMultibase(publicKeyRaw);
   const didDoc = generateDIDDocument({ domain, agentName, publicKeyMultibase });
   const verificationMethodId = `did:wba:${domain}:agent:${agentName}#key-1`;
 
