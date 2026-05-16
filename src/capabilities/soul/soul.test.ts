@@ -9,6 +9,13 @@ import { runMigrations, rollbackCapability } from '../lifecycle.js';
 import { clearHooks } from '../hooks.js';
 import { heuristicScore } from './heuristic-score.js';
 import { addMemory, getUncurated } from './memory-stream.js';
+import {
+  canSendProactive,
+  PROACTIVE_MAX_MESSAGES,
+  PROACTIVE_MIN_GAP_MS,
+  readBudget,
+  type ProactiveBudget,
+} from './proactive-budget.js';
 import { ensureWikiForGroup } from './wiki-scaffold.js';
 import {
   encodeEd25519PublicKeyMultibase,
@@ -134,6 +141,35 @@ describe('memory stream', () => {
     expect(getUncurated(getDb(), 'main')).toHaveLength(1);
     expect(getUncurated(getDb(), 'other')).toHaveLength(1);
     expect(getUncurated(getDb(), 'main')[0].content).toBe('main message');
+  });
+
+  it('accepts intervention and plan as MemoryType', () => {
+    // Phase 4 expanded the MemoryType union; the existing schema stores type
+    // as TEXT so no migration was needed — this test guards the type-level
+    // change against accidental future narrowing.
+    const interventionId = addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-05-15T10:00:00Z',
+      type: 'intervention',
+      source: 'agent',
+      content: 'Should I reschedule the dentist?',
+      importance: 8,
+      metadata: { intervention_type: 'approval_needed', status: 'pending' },
+    });
+    const planId = addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-05-15T06:00:00Z',
+      type: 'plan',
+      source: 'agent',
+      content: 'Generated daily plan with 4 items',
+      importance: 6,
+    });
+    expect(interventionId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(planId).toMatch(/^[0-9a-f-]{36}$/);
+
+    const rows = getUncurated(getDb(), 'main');
+    const types = rows.map((r) => r.type).sort();
+    expect(types).toEqual(['intervention', 'plan']);
   });
 
   it('migration rollback drops the table', () => {
@@ -347,7 +383,7 @@ describe('ensureSoulTasks', () => {
     };
   }
 
-  it('creates curation and evening journal tasks for the main group', async () => {
+  it('creates curation, journal, morning plan, and check-in tasks for the main group', async () => {
     await soulCapability.init({
       db: getDb(),
       registeredGroups: mainGroup,
@@ -358,6 +394,8 @@ describe('ensureSoulTasks', () => {
 
     const curation = getTaskById('soul-wiki-curation-main');
     const journal = getTaskById('soul-evening-journal-main');
+    const morning = getTaskById('soul-morning-plan-main');
+    const checkIn = getTaskById('soul-check-in-main');
 
     expect(curation).toBeDefined();
     expect(curation!.group_folder).toBe('main');
@@ -373,6 +411,16 @@ describe('ensureSoulTasks', () => {
     expect(journal!.schedule_type).toBe('cron');
     expect(journal!.schedule_value).toBe('0 22 * * *');
     expect(journal!.prompt).toContain('evening journal');
+
+    expect(morning).toBeDefined();
+    expect(morning!.schedule_type).toBe('cron');
+    expect(morning!.schedule_value).toBe('0 6 * * *');
+    expect(morning!.prompt).toContain('daily-plan.json');
+
+    expect(checkIn).toBeDefined();
+    expect(checkIn!.schedule_type).toBe('interval');
+    expect(checkIn!.schedule_value).toBe('7200000');
+    expect(checkIn!.prompt).toContain('proactive-budget.json');
 
     await soulCapability.teardown!();
   });
@@ -390,6 +438,8 @@ describe('ensureSoulTasks', () => {
 
     expect(getTaskById('soul-wiki-curation-main')).toBeUndefined();
     expect(getTaskById('soul-evening-journal-main')).toBeUndefined();
+    expect(getTaskById('soul-morning-plan-main')).toBeUndefined();
+    expect(getTaskById('soul-check-in-main')).toBeUndefined();
     expect(getTaskById('soul-wiki-curation-side')).toBeUndefined();
 
     await soulCapability.teardown!();
@@ -417,7 +467,7 @@ describe('ensureSoulTasks', () => {
     const count = getDb()
       .prepare("SELECT COUNT(*) as n FROM scheduled_tasks WHERE id LIKE 'soul-%'")
       .get() as { n: number };
-    expect(count.n).toBe(2);
+    expect(count.n).toBe(4);
 
     // next_run was preserved (cadence not reset on re-init)
     expect(getTaskById('soul-wiki-curation-main')!.next_run).toBe(firstNextRun);
@@ -504,6 +554,138 @@ describe('soulCapability beforeTaskRun gate', () => {
     await soulCapability.teardown!();
     const allow = await soulCapability.hooks!.beforeTaskRun!(curationTask());
     expect(allow).toBe(true);
+  });
+
+  function checkInTask() {
+    return {
+      id: 'soul-check-in-main',
+      group_folder: 'main',
+      schedule_type: 'interval' as const,
+    };
+  }
+
+  function morningPlanTask() {
+    return {
+      id: 'soul-morning-plan-main',
+      group_folder: 'main',
+      schedule_type: 'cron' as const,
+    };
+  }
+
+  function writePlan(folder: string, dateStr: string): void {
+    const soulDir = path.join(tmpDir, folder, 'soul');
+    fs.mkdirSync(soulDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(soulDir, 'daily-plan.json'),
+      JSON.stringify({ date: dateStr, items: [] }),
+      'utf-8',
+    );
+  }
+
+  function writeBudgetFile(
+    folder: string,
+    payload: { date: string; messages_sent: number; last_message_at: string | null },
+  ): void {
+    const soulDir = path.join(tmpDir, folder, 'soul');
+    fs.mkdirSync(soulDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(soulDir, 'proactive-budget.json'),
+      JSON.stringify(payload),
+      'utf-8',
+    );
+  }
+
+  function todayLocal(): string {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
+      d.getDate(),
+    ).padStart(2, '0')}`;
+  }
+
+  it('allows check-in when budget has capacity and within active hours', async () => {
+    await soulCapability.init(ctx());
+    writeBudgetFile('main', {
+      date: todayLocal(),
+      messages_sent: 0,
+      last_message_at: null,
+    });
+    const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+    const hour = new Date().getHours();
+    // Skip the assertion if we happen to be running tests during quiet hours —
+    // the budget gate is independent and would be tripped by canSendProactive.
+    if (hour >= 7 && hour < 22) {
+      expect(allow).toBe(true);
+    } else {
+      expect(allow).toBe(false);
+    }
+    await soulCapability.teardown!();
+  });
+
+  it('skips check-in when budget is exhausted', async () => {
+    await soulCapability.init(ctx());
+    writeBudgetFile('main', {
+      date: todayLocal(),
+      messages_sent: 3, // PROACTIVE_MAX_MESSAGES
+      last_message_at: '2000-01-01T00:00:00Z', // well past min gap
+    });
+    const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+    expect(allow).toBe(false);
+    await soulCapability.teardown!();
+  });
+
+  it('skips morning plan when today\'s plan already exists', async () => {
+    await soulCapability.init(ctx());
+    writePlan('main', todayLocal());
+    const allow = await soulCapability.hooks!.beforeTaskRun!(morningPlanTask());
+    expect(allow).toBe(false);
+    await soulCapability.teardown!();
+  });
+
+  it('allows morning plan when no plan exists', async () => {
+    await soulCapability.init(ctx());
+    const allow = await soulCapability.hooks!.beforeTaskRun!(morningPlanTask());
+    expect(allow).toBe(true);
+    await soulCapability.teardown!();
+  });
+
+  it('allows morning plan when existing plan is from a previous day', async () => {
+    await soulCapability.init(ctx());
+    writePlan('main', '2000-01-01');
+    const allow = await soulCapability.hooks!.beforeTaskRun!(morningPlanTask());
+    expect(allow).toBe(true);
+    await soulCapability.teardown!();
+  });
+
+  it('allows morning plan when the existing plan file is malformed', async () => {
+    await soulCapability.init(ctx());
+    const soulDir = path.join(tmpDir, 'main', 'soul');
+    fs.mkdirSync(soulDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(soulDir, 'daily-plan.json'),
+      '{not valid json',
+      'utf-8',
+    );
+    const allow = await soulCapability.hooks!.beforeTaskRun!(morningPlanTask());
+    expect(allow).toBe(true);
+    await soulCapability.teardown!();
+  });
+});
+
+describe('planning-prompts', () => {
+  it('buildMorningPlanPrompt substitutes the folder into the DB query', async () => {
+    const { buildMorningPlanPrompt } = await import('./planning-prompts.js');
+    const prompt = buildMorningPlanPrompt('weirdfolder');
+    expect(prompt).toContain("group_folder = 'weirdfolder'");
+    expect(prompt).toContain('daily-plan.json');
+    expect(prompt.length).toBeGreaterThan(200);
+  });
+
+  it('buildCheckInPrompt substitutes the folder into the intervention insert', async () => {
+    const { buildCheckInPrompt } = await import('./planning-prompts.js');
+    const prompt = buildCheckInPrompt('weirdfolder');
+    expect(prompt).toContain("'weirdfolder'");
+    expect(prompt).toContain('proactive-budget.json');
+    expect(prompt.length).toBeGreaterThan(200);
   });
 });
 
@@ -975,5 +1157,189 @@ describe('soulCapability identity integration', () => {
     } finally {
       if (prevDomain !== undefined) process.env.SOUL_DOMAIN = prevDomain;
     }
+  });
+});
+
+describe('readBudget', () => {
+  function writeBudget(folder: string, budget: ProactiveBudget): void {
+    const soulDir = path.join(tmpDir, folder, 'soul');
+    fs.mkdirSync(soulDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(soulDir, 'proactive-budget.json'),
+      JSON.stringify(budget),
+      'utf-8',
+    );
+  }
+
+  it('returns a fresh budget when the file does not exist', () => {
+    const now = new Date(2026, 4, 15, 14, 0, 0); // May 15, 2026, 2:00 PM local
+    const b = readBudget(tmpDir, 'main', now);
+    expect(b.date).toBe('2026-05-15');
+    expect(b.messages_sent).toBe(0);
+    expect(b.last_message_at).toBeNull();
+  });
+
+  it('returns the on-disk budget when the file is for today', () => {
+    const now = new Date(2026, 4, 15, 14, 0, 0);
+    writeBudget('main', {
+      date: '2026-05-15',
+      messages_sent: 2,
+      last_message_at: '2026-05-15T13:00:00Z',
+    });
+    const b = readBudget(tmpDir, 'main', now);
+    expect(b.messages_sent).toBe(2);
+    expect(b.last_message_at).toBe('2026-05-15T13:00:00Z');
+  });
+
+  it('resets to a fresh budget when the file is from a previous day', () => {
+    const now = new Date(2026, 4, 15, 9, 0, 0);
+    writeBudget('main', {
+      date: '2026-05-14',
+      messages_sent: 3,
+      last_message_at: '2026-05-14T21:00:00Z',
+    });
+    const b = readBudget(tmpDir, 'main', now);
+    expect(b.date).toBe('2026-05-15');
+    expect(b.messages_sent).toBe(0);
+    expect(b.last_message_at).toBeNull();
+  });
+
+  it('returns a fresh budget when the file is malformed JSON', () => {
+    const soulDir = path.join(tmpDir, 'main', 'soul');
+    fs.mkdirSync(soulDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(soulDir, 'proactive-budget.json'),
+      '{not valid json',
+      'utf-8',
+    );
+    const now = new Date(2026, 4, 15, 14, 0, 0);
+    const b = readBudget(tmpDir, 'main', now);
+    expect(b.messages_sent).toBe(0);
+    expect(b.date).toBe('2026-05-15');
+  });
+
+  it('returns a fresh budget when the file is missing required fields', () => {
+    const soulDir = path.join(tmpDir, 'main', 'soul');
+    fs.mkdirSync(soulDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(soulDir, 'proactive-budget.json'),
+      JSON.stringify({ date: '2026-05-15' }), // no messages_sent
+      'utf-8',
+    );
+    const now = new Date(2026, 4, 15, 14, 0, 0);
+    expect(readBudget(tmpDir, 'main', now).messages_sent).toBe(0);
+  });
+});
+
+describe('canSendProactive', () => {
+  // Mid-afternoon — well clear of quiet hours.
+  const activeHour = new Date(2026, 4, 15, 14, 0, 0);
+
+  it('returns true when fresh budget and active hours', () => {
+    const budget: ProactiveBudget = {
+      date: '2026-05-15',
+      messages_sent: 0,
+      last_message_at: null,
+    };
+    expect(canSendProactive(budget, activeHour)).toBe(true);
+  });
+
+  it('returns false during quiet hours (after PROACTIVE_QUIET_START)', () => {
+    const lateNight = new Date(2026, 4, 15, 22, 30, 0); // 10:30 PM
+    expect(
+      canSendProactive(
+        { date: '2026-05-15', messages_sent: 0, last_message_at: null },
+        lateNight,
+      ),
+    ).toBe(false);
+  });
+
+  it('returns false during quiet hours (before PROACTIVE_QUIET_END)', () => {
+    const earlyMorning = new Date(2026, 4, 15, 5, 0, 0); // 5:00 AM
+    expect(
+      canSendProactive(
+        { date: '2026-05-15', messages_sent: 0, last_message_at: null },
+        earlyMorning,
+      ),
+    ).toBe(false);
+  });
+
+  it('returns true at the very edge of the active window', () => {
+    // 7:00 AM is the first active minute (QUIET_END is exclusive)
+    const justOpened = new Date(2026, 4, 15, 7, 0, 0);
+    expect(
+      canSendProactive(
+        { date: '2026-05-15', messages_sent: 0, last_message_at: null },
+        justOpened,
+      ),
+    ).toBe(true);
+  });
+
+  it('returns false when daily cap is reached', () => {
+    expect(
+      canSendProactive(
+        {
+          date: '2026-05-15',
+          messages_sent: PROACTIVE_MAX_MESSAGES,
+          last_message_at: '2026-05-15T08:00:00Z',
+        },
+        activeHour,
+      ),
+    ).toBe(false);
+  });
+
+  it('returns false when last message is within the minimum gap', () => {
+    const tooSoon = new Date(activeHour.getTime() - (PROACTIVE_MIN_GAP_MS - 60_000));
+    expect(
+      canSendProactive(
+        {
+          date: '2026-05-15',
+          messages_sent: 1,
+          last_message_at: tooSoon.toISOString(),
+        },
+        activeHour,
+      ),
+    ).toBe(false);
+  });
+
+  it('returns true when the gap since last message has elapsed', () => {
+    const longAgo = new Date(activeHour.getTime() - (PROACTIVE_MIN_GAP_MS + 60_000));
+    expect(
+      canSendProactive(
+        {
+          date: '2026-05-15',
+          messages_sent: 1,
+          last_message_at: longAgo.toISOString(),
+        },
+        activeHour,
+      ),
+    ).toBe(true);
+  });
+
+  it('returns false on a future last_message_at (clock skew is conservative)', () => {
+    const future = new Date(activeHour.getTime() + 60 * 60 * 1000); // +1h
+    expect(
+      canSendProactive(
+        {
+          date: '2026-05-15',
+          messages_sent: 1,
+          last_message_at: future.toISOString(),
+        },
+        activeHour,
+      ),
+    ).toBe(false);
+  });
+
+  it('returns false on unparseable last_message_at', () => {
+    expect(
+      canSendProactive(
+        {
+          date: '2026-05-15',
+          messages_sent: 1,
+          last_message_at: 'definitely-not-a-date',
+        },
+        activeHour,
+      ),
+    ).toBe(false);
   });
 });
