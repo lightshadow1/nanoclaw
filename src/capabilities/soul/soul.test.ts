@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import crypto from 'crypto';
 import fs from 'fs';
 import http from 'http';
@@ -602,35 +602,84 @@ describe('soulCapability beforeTaskRun gate', () => {
     ).padStart(2, '0')}`;
   }
 
-  it('allows check-in when budget has capacity and within active hours', async () => {
-    await soulCapability.init(ctx());
-    writeBudgetFile('main', {
-      date: todayLocal(),
-      messages_sent: 0,
-      last_message_at: null,
-    });
-    const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
-    const hour = new Date().getHours();
-    // Skip the assertion if we happen to be running tests during quiet hours —
-    // the budget gate is independent and would be tripped by canSendProactive.
-    if (hour >= 7 && hour < 22) {
+  // Helpers to pin the clock so the check-in gate test is deterministic
+  // regardless of the wall-clock time the suite runs at.
+  function pinClock(at: Date): void {
+    // Only fake Date — leave setTimeout/setInterval real so async init/teardown
+    // don't deadlock on internal microtasks (e.g. logger flushes).
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(at);
+  }
+  function releaseClock(): void {
+    vi.useRealTimers();
+  }
+
+  it('allows check-in at 2 PM with a fresh budget', async () => {
+    pinClock(new Date(2026, 4, 15, 14, 0, 0)); // May 15, 2026, 2:00 PM local
+    try {
+      await soulCapability.init(ctx());
+      writeBudgetFile('main', {
+        date: todayLocal(),
+        messages_sent: 0,
+        last_message_at: null,
+      });
+      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
       expect(allow).toBe(true);
-    } else {
-      expect(allow).toBe(false);
+      await soulCapability.teardown!();
+    } finally {
+      releaseClock();
     }
-    await soulCapability.teardown!();
   });
 
-  it('skips check-in when budget is exhausted', async () => {
-    await soulCapability.init(ctx());
-    writeBudgetFile('main', {
-      date: todayLocal(),
-      messages_sent: 3, // PROACTIVE_MAX_MESSAGES
-      last_message_at: '2000-01-01T00:00:00Z', // well past min gap
-    });
-    const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
-    expect(allow).toBe(false);
-    await soulCapability.teardown!();
+  it('skips check-in at 11 PM (quiet hours) even when the budget is fresh', async () => {
+    pinClock(new Date(2026, 4, 15, 23, 0, 0));
+    try {
+      await soulCapability.init(ctx());
+      writeBudgetFile('main', {
+        date: todayLocal(),
+        messages_sent: 0,
+        last_message_at: null,
+      });
+      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+      expect(allow).toBe(false);
+      await soulCapability.teardown!();
+    } finally {
+      releaseClock();
+    }
+  });
+
+  it('skips check-in at 5 AM (quiet hours) even when the budget is fresh', async () => {
+    pinClock(new Date(2026, 4, 15, 5, 0, 0));
+    try {
+      await soulCapability.init(ctx());
+      writeBudgetFile('main', {
+        date: todayLocal(),
+        messages_sent: 0,
+        last_message_at: null,
+      });
+      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+      expect(allow).toBe(false);
+      await soulCapability.teardown!();
+    } finally {
+      releaseClock();
+    }
+  });
+
+  it('skips check-in at 2 PM when budget is exhausted', async () => {
+    pinClock(new Date(2026, 4, 15, 14, 0, 0));
+    try {
+      await soulCapability.init(ctx());
+      writeBudgetFile('main', {
+        date: todayLocal(),
+        messages_sent: 3, // PROACTIVE_MAX_MESSAGES
+        last_message_at: '2000-01-01T00:00:00Z', // well past min gap
+      });
+      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+      expect(allow).toBe(false);
+      await soulCapability.teardown!();
+    } finally {
+      releaseClock();
+    }
   });
 
   it('skips morning plan when today\'s plan already exists', async () => {
@@ -754,8 +803,98 @@ describe('ensureClaudeMdSection', () => {
     const contents = fs.readFileSync(path.join(tmpDir, 'main', 'CLAUDE.md'), 'utf-8');
     const matches = contents.match(/<!-- soul-section -->/g) ?? [];
     expect(matches).toHaveLength(1);
+    // Closing marker also appears exactly once.
+    const endMatches = contents.match(/<!-- \/soul-section -->/g) ?? [];
+    expect(endMatches).toHaveLength(1);
 
     await soulCapability.teardown!();
+  });
+
+  it('migrates a legacy soul section (no closing marker) by rewriting through EOF', async () => {
+    // Pre-Phase-4 files captured only the opening marker and let the section
+    // run to EOF. The new ensureClaudeMdSection should overwrite that block
+    // with the current section content while preserving the prefix.
+    fs.mkdirSync(path.join(tmpDir, 'main'), { recursive: true });
+    const claudePath = path.join(tmpDir, 'main', 'CLAUDE.md');
+    fs.writeFileSync(
+      claudePath,
+      '# Andy\n\nProject docs.\n\n<!-- soul-section -->\n## Soul\n\nOld stale soul content.\n',
+      'utf-8',
+    );
+
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: () => ({
+        'g@g.us': { name: 'Main', folder: 'main' },
+      }),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+
+    const contents = fs.readFileSync(claudePath, 'utf-8');
+    expect(contents.startsWith('# Andy\n\nProject docs.')).toBe(true);
+    expect(contents).not.toContain('Old stale soul content.');
+    expect(contents).toContain('daily-plan.json'); // current Phase 4 wording
+    expect(contents).toContain('<!-- /soul-section -->'); // end marker added on migration
+
+    await soulCapability.teardown!();
+  });
+
+  it('replaces a paired-marker soul section while preserving surrounding text', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'main'), { recursive: true });
+    const claudePath = path.join(tmpDir, 'main', 'CLAUDE.md');
+    fs.writeFileSync(
+      claudePath,
+      '# Andy\n\nPrefix.\n\n<!-- soul-section -->\nStale.\n<!-- /soul-section -->\n\n# Footer\n',
+      'utf-8',
+    );
+
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: () => ({
+        'g@g.us': { name: 'Main', folder: 'main' },
+      }),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+
+    const contents = fs.readFileSync(claudePath, 'utf-8');
+    expect(contents.startsWith('# Andy\n\nPrefix.')).toBe(true);
+    expect(contents).toContain('# Footer'); // suffix intact
+    expect(contents).not.toContain('Stale.');
+    expect(contents).toContain('## Soul');
+    expect(contents).toContain('daily-plan.json');
+
+    await soulCapability.teardown!();
+  });
+
+  it('is a no-op when CLAUDE.md already has the current soul section', async () => {
+    // First init writes the section; record mtime. Second init should not
+    // touch the file because the proposed content equals existing content.
+    const ctx = {
+      db: getDb(),
+      registeredGroups: () => ({
+        'g@g.us': { name: 'Main', folder: 'main' },
+      }),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    };
+    await soulCapability.init(ctx);
+    await soulCapability.teardown!();
+
+    const claudePath = path.join(tmpDir, 'main', 'CLAUDE.md');
+    const firstMtime = fs.statSync(claudePath).mtimeMs;
+    // Sleep a touch so mtime granularity (1ms on most fs, but coarser on some)
+    // can distinguish a write from a no-op.
+    await new Promise((r) => setTimeout(r, 20));
+
+    await soulCapability.init(ctx);
+    await soulCapability.teardown!();
+    const secondMtime = fs.statSync(claudePath).mtimeMs;
+    expect(secondMtime).toBe(firstMtime);
   });
 
   it('does not touch CLAUDE.md when no main group is registered', async () => {

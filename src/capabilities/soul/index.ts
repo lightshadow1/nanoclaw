@@ -237,6 +237,7 @@ function ensureSoulTasks(ctx: CapabilityContext): void {
 }
 
 const SOUL_CLAUDE_MD_MARKER = '<!-- soul-section -->';
+const SOUL_CLAUDE_MD_END_MARKER = '<!-- /soul-section -->';
 const SOUL_CLAUDE_MD_SECTION = `
 ${SOUL_CLAUDE_MD_MARKER}
 ## Soul
@@ -250,20 +251,59 @@ You have a soul — a persistent identity and memory that spans sessions.
 - Your wiki is curated between sessions by a scheduled task. Trust it as your long-term memory; do not duplicate its contents in chat replies.
 
 When you encounter a situation needing human input (approval, clarification, cost exceeding threshold), raise an **intervention** — store it in the memory stream with \`type = 'intervention'\` and structured metadata, then message the owner with the question and options.
+${SOUL_CLAUDE_MD_END_MARKER}
 `;
 
+// Refresh-in-place: replace content between paired markers so existing installs
+// pick up updated section content. Legacy installs (only the opening marker,
+// no closing marker — Phase 2/3 era) are migrated by replacing from the start
+// marker through EOF on the assumption the old section was appended last.
 function ensureClaudeMdSection(groupsDirectory: string, folder: string): void {
   const claudePath = path.join(groupsDirectory, folder, 'CLAUDE.md');
-  let existing = '';
-  if (fs.existsSync(claudePath)) {
-    existing = fs.readFileSync(claudePath, 'utf-8');
-    if (existing.includes(SOUL_CLAUDE_MD_MARKER)) return;
-  } else {
+
+  if (!fs.existsSync(claudePath)) {
     fs.mkdirSync(path.dirname(claudePath), { recursive: true });
+    fs.writeFileSync(claudePath, SOUL_CLAUDE_MD_SECTION, 'utf-8');
+    logger.info({ folder }, 'Created CLAUDE.md with soul section');
+    return;
   }
-  const separator = existing.length === 0 || existing.endsWith('\n') ? '' : '\n';
-  fs.writeFileSync(claudePath, existing + separator + SOUL_CLAUDE_MD_SECTION, 'utf-8');
-  logger.info({ folder }, 'Appended soul section to CLAUDE.md');
+
+  const existing = fs.readFileSync(claudePath, 'utf-8');
+  const startIdx = existing.indexOf(SOUL_CLAUDE_MD_MARKER);
+
+  if (startIdx === -1) {
+    // No marker yet — append the section.
+    const separator = existing.endsWith('\n') ? '' : '\n';
+    fs.writeFileSync(
+      claudePath,
+      existing + separator + SOUL_CLAUDE_MD_SECTION,
+      'utf-8',
+    );
+    logger.info({ folder }, 'Appended soul section to CLAUDE.md');
+    return;
+  }
+
+  // Marker exists. Pair it with an end marker if present (Phase 4+);
+  // otherwise treat from start marker to EOF as the legacy section.
+  const endMarkerSearchFrom = startIdx + SOUL_CLAUDE_MD_MARKER.length;
+  const endMarkerIdx = existing.indexOf(
+    SOUL_CLAUDE_MD_END_MARKER,
+    endMarkerSearchFrom,
+  );
+  const replaceEnd =
+    endMarkerIdx === -1
+      ? existing.length
+      : endMarkerIdx + SOUL_CLAUDE_MD_END_MARKER.length;
+
+  const before = existing.slice(0, startIdx).replace(/\n*$/, '\n');
+  const after = existing.slice(replaceEnd).replace(/^\n*/, '\n');
+  const insert = SOUL_CLAUDE_MD_SECTION.replace(/^\n+/, '').replace(/\n+$/, '');
+  const proposed = before + insert + after;
+
+  if (proposed === existing) return; // no-op — content already current
+
+  fs.writeFileSync(claudePath, proposed, 'utf-8');
+  logger.info({ folder }, 'Refreshed soul section in CLAUDE.md');
 }
 
 export const soulCapability: Capability = {

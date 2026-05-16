@@ -4,6 +4,21 @@
 // creation time and the container agent reads live data (DB, wiki, plan
 // files) itself on each run. The host never invokes the LLM.
 
+import {
+  PROACTIVE_MAX_MESSAGES,
+  PROACTIVE_MIN_GAP_MS,
+  PROACTIVE_QUIET_END,
+  PROACTIVE_QUIET_START,
+} from './proactive-budget.js';
+
+// Render an integer hour (0-23) as a 12-hour clock string ("7 AM", "10 PM").
+function formatHour(h: number): string {
+  if (h === 0) return '12 AM';
+  if (h === 12) return '12 PM';
+  if (h < 12) return `${h} AM`;
+  return `${h - 12} PM`;
+}
+
 export function buildMorningPlanPrompt(folder: string): string {
   return `You are generating your daily plan.
 
@@ -48,7 +63,7 @@ Write the plan to /workspace/group/soul/daily-plan.json with this structure:
 
 - Maximum 5 items per day. Quality over quantity.
 - At most 2 items should be proactive outreach (check_in or social type).
-- Never plan messages between 10 PM and 7 AM.
+- Never plan messages between ${formatHour(PROACTIVE_QUIET_START)} and ${formatHour(PROACTIVE_QUIET_END)}.
 - Only plan outreach to people/groups you have conversed with before (check people.md).
 - If yesterday's plan had uncompleted items, carry forward only if still relevant.
 - Include at least one "project_work" item if tasks-and-projects.md has active projects.
@@ -72,15 +87,15 @@ export function buildCheckInPrompt(folder: string): string {
    {"date": "YYYY-MM-DD", "messages_sent": 0, "last_message_at": null}
 
 3. Check if the budget allows a proactive message:
-   - Maximum 3 proactive messages per day
-   - Minimum 2 hours since the last proactive message
-   - Current time must be between 7 AM and 10 PM (run \`date\` to check)
+   - Maximum ${PROACTIVE_MAX_MESSAGES} proactive messages per day
+   - Minimum ${PROACTIVE_MIN_GAP_MS / 3_600_000} hours since the last proactive message
+   - Current time must be between ${formatHour(PROACTIVE_QUIET_END)} and ${formatHour(PROACTIVE_QUIET_START)} (run \`date\` to check)
    If any condition fails, skip proactive messaging entirely.
 
 4. Look at plan items with status "pending" and time_hint matching current time of day:
-   - 7 AM – 12 PM = "morning"
+   - ${formatHour(PROACTIVE_QUIET_END)} – 12 PM = "morning"
    - 12 PM – 5 PM = "afternoon"
-   - 5 PM – 10 PM = "evening"
+   - 5 PM – ${formatHour(PROACTIVE_QUIET_START)} = "evening"
 
 5. For each actionable item in this time window:
    a. If type is "check_in", "follow_up", or "social":
@@ -111,8 +126,8 @@ export function buildCheckInPrompt(folder: string): string {
 ## Guard Rails
 
 - NEVER send to a JID not in people.md
-- NEVER exceed the daily budget (3 messages)
-- NEVER message during quiet hours (10 PM – 7 AM)
+- NEVER exceed the daily budget (${PROACTIVE_MAX_MESSAGES} messages)
+- NEVER message during quiet hours (${formatHour(PROACTIVE_QUIET_START)} – ${formatHour(PROACTIVE_QUIET_END)})
 - If uncertain whether a message is appropriate, create an intervention instead (see below).
 
 ## Creating Interventions
