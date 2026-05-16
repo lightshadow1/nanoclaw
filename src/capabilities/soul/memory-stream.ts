@@ -1,7 +1,11 @@
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'crypto';
 
-export type MemoryType = 'observation' | 'action';
+// 'observation' — inbound message captured from a channel
+// 'action'      — outbound message the agent sent
+// 'intervention' — agent-raised question awaiting owner input (status in metadata)
+// 'plan'        — durable plan-related entry (e.g., morning plan generated, item completed)
+export type MemoryType = 'observation' | 'action' | 'intervention' | 'plan';
 
 export interface MemoryEntry {
   id: string;

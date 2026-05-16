@@ -23,6 +23,11 @@ import {
   buildEveningJournalPrompt,
   buildWikiCurationPrompt,
 } from './curator-prompts.js';
+import {
+  buildCheckInPrompt,
+  buildMorningPlanPrompt,
+} from './planning-prompts.js';
+import { canSendProactive, readBudget } from './proactive-budget.js';
 import { generateAgentDescription } from './agent-description.js';
 import {
   encodeEd25519PublicKeyMultibase,
@@ -211,6 +216,24 @@ function ensureSoulTasks(ctx: CapabilityContext): void {
     schedule_type: 'cron',
     schedule_value: '0 22 * * *',
   });
+
+  upsertSoulTask({
+    id: `soul-morning-plan-${MAIN_GROUP_FOLDER}`,
+    group_folder: MAIN_GROUP_FOLDER,
+    chat_jid: mainJid,
+    prompt: buildMorningPlanPrompt(MAIN_GROUP_FOLDER),
+    schedule_type: 'cron',
+    schedule_value: '0 6 * * *',
+  });
+
+  upsertSoulTask({
+    id: `soul-check-in-${MAIN_GROUP_FOLDER}`,
+    group_folder: MAIN_GROUP_FOLDER,
+    chat_jid: mainJid,
+    prompt: buildCheckInPrompt(MAIN_GROUP_FOLDER),
+    schedule_type: 'interval',
+    schedule_value: '7200000',
+  });
 }
 
 const SOUL_CLAUDE_MD_MARKER = '<!-- soul-section -->';
@@ -222,8 +245,11 @@ You have a soul — a persistent identity and memory that spans sessions.
 
 - Your knowledge wiki lives at \`soul/wiki/\` — start by reading \`soul/wiki/_index.md\` at the beginning of each session.
 - Load specific wiki pages (people / preferences / learnings / topic pages) based on what the conversation is about.
-- Today's plan: \`soul/daily-plan.json\` (may not exist yet — daily planning ships in a later phase).
+- Today's plan: \`soul/daily-plan.json\` — your scheduled intentions for today (regenerated each morning, archived to \`soul/plan-history/\` each evening).
+- Proactive budget: \`soul/proactive-budget.json\` — tracks how many outreach messages you've sent today. Stay within it.
 - Your wiki is curated between sessions by a scheduled task. Trust it as your long-term memory; do not duplicate its contents in chat replies.
+
+When you encounter a situation needing human input (approval, clarification, cost exceeding threshold), raise an **intervention** — store it in the memory stream with \`type = 'intervention'\` and structured metadata, then message the owner with the question and options.
 `;
 
 function ensureClaudeMdSection(groupsDirectory: string, folder: string): void {
@@ -305,12 +331,47 @@ export const soulCapability: Capability = {
 
   hooks: {
     beforeTaskRun: (task) => {
-      // Only gate the curation task. The evening journal runs unconditionally
-      // (it does the deep staleness review and daily-plan reconciliation
-      // even on quiet days).
-      if (task.id !== `soul-wiki-curation-${MAIN_GROUP_FOLDER}`) return true;
-      if (!db) return true; // fail open if soul never initialized
-      return getUncurated(db, MAIN_GROUP_FOLDER, 1).length > 0;
+      // Wiki curation: skip if nothing uncurated.
+      if (task.id === `soul-wiki-curation-${MAIN_GROUP_FOLDER}`) {
+        if (!db) return true; // fail open if soul never initialized
+        return getUncurated(db, MAIN_GROUP_FOLDER, 1).length > 0;
+      }
+
+      // Check-in: skip if proactive budget is exhausted or it's quiet hours.
+      // Cheap host-side gate — avoids spinning a container that would just
+      // exit immediately on its own budget check.
+      if (task.id === `soul-check-in-${MAIN_GROUP_FOLDER}`) {
+        if (!groupsDir) return true;
+        const now = new Date();
+        return canSendProactive(readBudget(groupsDir, MAIN_GROUP_FOLDER, now), now);
+      }
+
+      // Morning plan: skip if today's plan is already written.
+      if (task.id === `soul-morning-plan-${MAIN_GROUP_FOLDER}`) {
+        if (!groupsDir) return true;
+        const planPath = path.join(
+          groupsDir,
+          MAIN_GROUP_FOLDER,
+          'soul',
+          'daily-plan.json',
+        );
+        if (!fs.existsSync(planPath)) return true;
+        try {
+          const plan = JSON.parse(fs.readFileSync(planPath, 'utf-8')) as {
+            date?: string;
+          };
+          const today = new Date();
+          const todayStr = `${today.getFullYear()}-${String(
+            today.getMonth() + 1,
+          ).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+          return plan.date !== todayStr;
+        } catch {
+          return true; // malformed — let the task regenerate
+        }
+      }
+
+      // The evening journal and unrelated tasks run unconditionally.
+      return true;
     },
 
     onMessageStored: (msg) => {

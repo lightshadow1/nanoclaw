@@ -66,6 +66,15 @@ C. Deep staleness review
    - Walk every wiki page (not just the ones touched by today's entries).
    - Apply the staleness rules from step 7 of the regular curation flow across the whole wiki.
 
+D. Intervention cleanup
+   - Query pending interventions:
+     sqlite3 /workspace/project/store/messages.db "SELECT id, timestamp, content, metadata FROM memory_stream WHERE group_folder = '${folder}' AND type = 'intervention' AND json_extract(metadata, '\$.status') = 'pending'"
+   - For each pending intervention, scan recent observation entries (same group_folder, timestamp >= the intervention's timestamp) to see if the owner already responded with a clear answer.
+   - If the owner responded, mark the intervention resolved:
+     sqlite3 /workspace/project/store/messages.db "UPDATE memory_stream SET metadata = json_set(metadata, '\$.status', 'resolved', '\$.resolution', 'owner response here') WHERE id = 'intervention-id'"
+   - If an intervention is older than 48 hours with no response, mark it expired:
+     sqlite3 /workspace/project/store/messages.db "UPDATE memory_stream SET metadata = json_set(metadata, '\$.status', 'expired') WHERE id = 'intervention-id'"
+
 ## Regular wiki curation flow
 
 1. Query uncurated memory entries:
