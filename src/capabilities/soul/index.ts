@@ -15,7 +15,7 @@ import {
 } from '../../config.js';
 import { logger } from '../../logger.js';
 import { createTask, getTaskById, updateTask } from '../../db.js';
-import { memoryStreamMigration } from './migrations.js';
+import { experimentMigration, memoryStreamMigration } from './migrations.js';
 import { addMemory, getUncurated } from './memory-stream.js';
 import { heuristicScore } from './heuristic-score.js';
 import { ensureWikiForGroup } from './wiki-scaffold.js';
@@ -28,6 +28,7 @@ import {
   buildMorningPlanPrompt,
 } from './planning-prompts.js';
 import { canSendProactive, readBudget } from './proactive-budget.js';
+import { reviewGuardrails, writeExperimentState } from './experiment-store.js';
 import { generateAgentDescription } from './agent-description.js';
 import {
   encodeEd25519PublicKeyMultibase,
@@ -80,7 +81,10 @@ async function startSoulIdentityServer(ctx: CapabilityContext): Promise<void> {
   const description = process.env.SOUL_DESCRIPTION ?? env.SOUL_DESCRIPTION;
   const traitsRaw = process.env.SOUL_TRAITS ?? env.SOUL_TRAITS;
   const traits = traitsRaw
-    ? traitsRaw.split(',').map((t) => t.trim()).filter(Boolean)
+    ? traitsRaw
+        .split(',')
+        .map((t) => t.trim())
+        .filter(Boolean)
     : undefined;
 
   const keyDir = path.join(os.homedir(), '.config', 'nanoclaw', 'soul');
@@ -111,7 +115,11 @@ async function startSoulIdentityServer(ctx: CapabilityContext): Promise<void> {
     verificationMethodId,
   });
   logger.info(
-    { port, did: `did:wba:${domain}:agent:${agentName}`, skills: skills.length },
+    {
+      port,
+      did: `did:wba:${domain}:agent:${agentName}`,
+      skills: skills.length,
+    },
     'Soul identity server started',
   );
 }
@@ -315,7 +323,7 @@ export const soulCapability: Capability = {
     return value === 'true';
   },
 
-  migrations: [memoryStreamMigration],
+  migrations: [memoryStreamMigration, experimentMigration],
 
   init: async (ctx) => {
     db = ctx.db;
@@ -334,7 +342,10 @@ export const soulCapability: Capability = {
       try {
         ensureClaudeMdSection(ctx.groupsDir, MAIN_GROUP_FOLDER);
       } catch (err) {
-        logger.error({ err }, 'Failed to ensure soul section in main CLAUDE.md');
+        logger.error(
+          { err },
+          'Failed to ensure soul section in main CLAUDE.md',
+        );
       }
     }
 
@@ -352,7 +363,10 @@ export const soulCapability: Capability = {
       logger.error({ err }, 'Failed to start soul identity server');
     }
 
-    logger.info({ scaffolded: scaffoldedGroups.size }, 'Soul capability initialized');
+    logger.info(
+      { scaffolded: scaffoldedGroups.size },
+      'Soul capability initialized',
+    );
   },
 
   teardown: async () => {
@@ -377,18 +391,60 @@ export const soulCapability: Capability = {
         return getUncurated(db, MAIN_GROUP_FOLDER, 1).length > 0;
       }
 
-      // Check-in: skip if proactive budget is exhausted or it's quiet hours.
-      // Cheap host-side gate — avoids spinning a container that would just
-      // exit immediately on its own budget check.
+      // Check-in: refresh experiment-state.json so the container reads a
+      // current Thompson draw + backoff, then run the (self-rate-limited)
+      // guardrail review. Skip the run itself if proactive budget is
+      // exhausted or it's quiet hours.
       if (task.id === `soul-check-in-${MAIN_GROUP_FOLDER}`) {
         if (!groupsDir) return true;
         const now = new Date();
-        return canSendProactive(readBudget(groupsDir, MAIN_GROUP_FOLDER, now), now);
+        if (db) {
+          try {
+            writeExperimentState(db, groupsDir, MAIN_GROUP_FOLDER, now);
+            const review = reviewGuardrails(db, MAIN_GROUP_FOLDER, now);
+            if (review.driftAlerts.length > 0) {
+              logger.warn(
+                { alerts: review.driftAlerts },
+                'Soul guardrail drift alerts',
+              );
+            }
+            if (review.rolledBack) {
+              logger.warn(
+                {
+                  trailing: review.trailingEfficacy,
+                  baseline: review.baselineEfficacy,
+                },
+                'Soul guardrail rolled back backoff state',
+              );
+            }
+          } catch (err) {
+            logger.error(
+              { err },
+              'Failed to refresh experiment state / review guardrails',
+            );
+          }
+        }
+        return canSendProactive(
+          readBudget(groupsDir, MAIN_GROUP_FOLDER, now),
+          now,
+        );
       }
 
-      // Morning plan: skip if today's plan is already written.
+      // Morning plan: refresh experiment-state.json so the container reads
+      // a current Thompson timing draw + backoff. Then skip if today's plan
+      // is already written.
       if (task.id === `soul-morning-plan-${MAIN_GROUP_FOLDER}`) {
         if (!groupsDir) return true;
+        if (db) {
+          try {
+            writeExperimentState(db, groupsDir, MAIN_GROUP_FOLDER, new Date());
+          } catch (err) {
+            logger.error(
+              { err },
+              'Failed to refresh experiment state for morning plan',
+            );
+          }
+        }
         const planPath = path.join(
           groupsDir,
           MAIN_GROUP_FOLDER,

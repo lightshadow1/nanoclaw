@@ -11,11 +11,25 @@ import { heuristicScore } from './heuristic-score.js';
 import { addMemory, getUncurated } from './memory-stream.js';
 import {
   canSendProactive,
+  inWithdrawalPeriod,
   PROACTIVE_MAX_MESSAGES,
   PROACTIVE_MIN_GAP_MS,
   readBudget,
+  WITHDRAWAL_CYCLE_WEEKS,
   type ProactiveBudget,
 } from './proactive-budget.js';
+import {
+  computePosteriors,
+  DRIFT_ALERT_DELTA,
+  EPISODE_DECAY_DAYS,
+  efficacyRate,
+  getRecentEpisodes,
+  MIN_OUTREACH_MULTIPLIER,
+  readBackoffState,
+  reviewGuardrails,
+  ROLLBACK_REVIEW_DAYS,
+  writeExperimentState,
+} from './experiment-store.js';
 import { ensureWikiForGroup } from './wiki-scaffold.js';
 import {
   encodeEd25519PublicKeyMultibase,
@@ -29,11 +43,27 @@ import {
   discoverCapabilities,
   generateAgentDescription,
 } from './agent-description.js';
+import { startIdentityServer, stopIdentityServer } from './identity-server.js';
 import {
-  startIdentityServer,
-  stopIdentityServer,
-} from './identity-server.js';
+  armForHour,
+  posteriorFor,
+  sampleBeta,
+  thompsonRanking,
+  TIMING_ARM_PRIORS,
+  TIMING_ARMS,
+  type BetaPosterior,
+  type TimingArm,
+} from './timing-bandit.js';
 import { soulCapability } from './index.js';
+
+// Tiny seeded LCG for deterministic bandit tests. Numerical Recipes constants.
+function seededRng(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    return state / 0x100000000;
+  };
+}
 
 let tmpDir: string;
 
@@ -49,7 +79,9 @@ afterEach(() => {
 
 describe('heuristicScore', () => {
   it('baseline message scores 3', () => {
-    expect(heuristicScore({ content: 'hello there', isAddressed: false })).toBe(3);
+    expect(heuristicScore({ content: 'hello there', isAddressed: false })).toBe(
+      3,
+    );
   });
 
   it('mundane acknowledgments score 1', () => {
@@ -59,12 +91,18 @@ describe('heuristicScore', () => {
   });
 
   it('keyword matches add 3', () => {
-    expect(heuristicScore({ content: 'remember to lock up', isAddressed: false })).toBe(6);
-    expect(heuristicScore({ content: 'this is urgent', isAddressed: false })).toBe(6);
+    expect(
+      heuristicScore({ content: 'remember to lock up', isAddressed: false }),
+    ).toBe(6);
+    expect(
+      heuristicScore({ content: 'this is urgent', isAddressed: false }),
+    ).toBe(6);
   });
 
   it('addressed messages add 2', () => {
-    expect(heuristicScore({ content: 'hello there', isAddressed: true })).toBe(5);
+    expect(heuristicScore({ content: 'hello there', isAddressed: true })).toBe(
+      5,
+    );
   });
 
   it('long messages add 1', () => {
@@ -74,13 +112,19 @@ describe('heuristicScore', () => {
 
   it('URLs add 2', () => {
     expect(
-      heuristicScore({ content: 'check https://example.com', isAddressed: false }),
+      heuristicScore({
+        content: 'check https://example.com',
+        isAddressed: false,
+      }),
     ).toBe(5);
   });
 
   it('combines bonuses and clamps to 10', () => {
     const score = heuristicScore({
-      content: 'remember urgent deadline always cancel ' + 'a'.repeat(250) + ' https://x.com',
+      content:
+        'remember urgent deadline always cancel ' +
+        'a'.repeat(250) +
+        ' https://x.com',
       isAddressed: true,
     });
     expect(score).toBe(10);
@@ -175,7 +219,9 @@ describe('memory stream', () => {
   it('migration rollback drops the table', () => {
     rollbackCapability(getDb(), soulCapability);
     const tables = getDb()
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_stream'")
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_stream'",
+      )
       .all();
     expect(tables).toHaveLength(0);
   });
@@ -259,7 +305,9 @@ describe('soulCapability hook', () => {
       source: 'whatsapp',
     });
 
-    const rows = getDb().prepare('SELECT COUNT(*) as n FROM memory_stream').get() as {
+    const rows = getDb()
+      .prepare('SELECT COUNT(*) as n FROM memory_stream')
+      .get() as {
       n: number;
     };
     expect(rows.n).toBe(0);
@@ -337,7 +385,9 @@ describe('soulCapability hook', () => {
       groupFolder: 'fresh',
     });
 
-    expect(fs.existsSync(path.join(tmpDir, 'fresh', 'soul', 'wiki', '_index.md'))).toBe(true);
+    expect(
+      fs.existsSync(path.join(tmpDir, 'fresh', 'soul', 'wiki', '_index.md')),
+    ).toBe(true);
 
     await soulCapability.teardown!();
   });
@@ -365,7 +415,9 @@ describe('soulCapability hook', () => {
       source: 'whatsapp',
     });
 
-    const rows = getDb().prepare('SELECT COUNT(*) as n FROM memory_stream').get() as {
+    const rows = getDb()
+      .prepare('SELECT COUNT(*) as n FROM memory_stream')
+      .get() as {
       n: number;
     };
     expect(rows.n).toBe(0);
@@ -465,7 +517,9 @@ describe('ensureSoulTasks', () => {
     });
 
     const count = getDb()
-      .prepare("SELECT COUNT(*) as n FROM scheduled_tasks WHERE id LIKE 'soul-%'")
+      .prepare(
+        "SELECT COUNT(*) as n FROM scheduled_tasks WHERE id LIKE 'soul-%'",
+      )
       .get() as { n: number };
     expect(count.n).toBe(4);
 
@@ -584,7 +638,11 @@ describe('soulCapability beforeTaskRun gate', () => {
 
   function writeBudgetFile(
     folder: string,
-    payload: { date: string; messages_sent: number; last_message_at: string | null },
+    payload: {
+      date: string;
+      messages_sent: number;
+      last_message_at: string | null;
+    },
   ): void {
     const soulDir = path.join(tmpDir, folder, 'soul');
     fs.mkdirSync(soulDir, { recursive: true });
@@ -682,7 +740,7 @@ describe('soulCapability beforeTaskRun gate', () => {
     }
   });
 
-  it('skips morning plan when today\'s plan already exists', async () => {
+  it("skips morning plan when today's plan already exists", async () => {
     await soulCapability.init(ctx());
     writePlan('main', todayLocal());
     const allow = await soulCapability.hooks!.beforeTaskRun!(morningPlanTask());
@@ -800,7 +858,10 @@ describe('ensureClaudeMdSection', () => {
     await soulCapability.teardown!();
     await soulCapability.init(ctx);
 
-    const contents = fs.readFileSync(path.join(tmpDir, 'main', 'CLAUDE.md'), 'utf-8');
+    const contents = fs.readFileSync(
+      path.join(tmpDir, 'main', 'CLAUDE.md'),
+      'utf-8',
+    );
     const matches = contents.match(/<!-- soul-section -->/g) ?? [];
     expect(matches).toHaveLength(1);
     // Closing marker also appears exactly once.
@@ -953,7 +1014,9 @@ describe('encodeEd25519PublicKeyMultibase', () => {
     // 0xed 0x01 and base58btc-encoded yields "z6Mk...".
     const bytes = new Uint8Array(32);
     for (let i = 0; i < 32; i++) bytes[i] = i;
-    expect(encodeEd25519PublicKeyMultibase(bytes).startsWith('z6Mk')).toBe(true);
+    expect(encodeEd25519PublicKeyMultibase(bytes).startsWith('z6Mk')).toBe(
+      true,
+    );
   });
 
   it('is deterministic for the same input', () => {
@@ -981,7 +1044,9 @@ describe('encodeEd25519PublicKeyMultibase', () => {
     // a regression where the prefix is silently dropped should fail here.
     const bytes = new Uint8Array(32);
     for (let i = 0; i < 32; i++) bytes[i] = i;
-    expect(encodeEd25519PublicKeyMultibase(bytes)).not.toBe(encodeMultibase(bytes));
+    expect(encodeEd25519PublicKeyMultibase(bytes)).not.toBe(
+      encodeMultibase(bytes),
+    );
   });
 });
 
@@ -1004,9 +1069,15 @@ describe('identity keys', () => {
   it('generateKeypair is idempotent', () => {
     const keyDir = path.join(tmpDir, 'keys');
     generateKeypair(keyDir);
-    const before = fs.readFileSync(path.join(keyDir, 'private-key.pem'), 'utf-8');
+    const before = fs.readFileSync(
+      path.join(keyDir, 'private-key.pem'),
+      'utf-8',
+    );
     generateKeypair(keyDir);
-    const after = fs.readFileSync(path.join(keyDir, 'private-key.pem'), 'utf-8');
+    const after = fs.readFileSync(
+      path.join(keyDir, 'private-key.pem'),
+      'utf-8',
+    );
     expect(after).toBe(before);
   });
 
@@ -1035,13 +1106,21 @@ describe('generateDIDDocument', () => {
     }) as Record<string, unknown>;
     const did = 'did:wba:example.ts.net:agent:Andy';
     expect(doc.id).toBe(did);
-    const vm = (doc.verificationMethod as Array<{ id: string; type: string; controller: string; publicKeyMultibase: string }>);
+    const vm = doc.verificationMethod as Array<{
+      id: string;
+      type: string;
+      controller: string;
+      publicKeyMultibase: string;
+    }>;
     expect(vm[0].id).toBe(`${did}#key-1`);
     expect(vm[0].type).toBe('Ed25519VerificationKey2020');
     expect(vm[0].controller).toBe(did);
     expect(vm[0].publicKeyMultibase).toBe('z6Mk-test');
     expect(doc.authentication).toEqual([`${did}#key-1`]);
-    const services = doc.service as Array<{ id: string; serviceEndpoint: string }>;
+    const services = doc.service as Array<{
+      id: string;
+      serviceEndpoint: string;
+    }>;
     expect(services.find((s) => s.id === '#a2a')!.serviceEndpoint).toBe(
       'https://example.ts.net/a2a',
     );
@@ -1085,7 +1164,9 @@ describe('signDocument', () => {
     const first = signDocument({ name: 'A' }, privateKey, 'vm-1');
     const second = signDocument(first, privateKey, 'vm-1');
     expect(second['anp:signature'].proofValue).toBeTruthy();
-    expect(Object.keys(second).filter((k) => k === 'anp:signature')).toHaveLength(1);
+    expect(
+      Object.keys(second).filter((k) => k === 'anp:signature'),
+    ).toHaveLength(1);
   });
 });
 
@@ -1140,8 +1221,14 @@ describe('generateAgentDescription', () => {
     expect(desc.identifier).toBe('did:wba:example.ts.net:agent:Andy');
     expect((desc.owner as { name: string }).name).toBe('Will');
     expect(desc['anp:lastSeen']).toBe('2026-05-02T12:00:00.000Z');
-    expect(desc['anp:verificationLevels']).toEqual(['cryptographic', 'owner-verified']);
-    const onChain = desc['anp:onChainIdentity'] as { chain: null | string; agentId: null | string };
+    expect(desc['anp:verificationLevels']).toEqual([
+      'cryptographic',
+      'owner-verified',
+    ]);
+    const onChain = desc['anp:onChainIdentity'] as {
+      chain: null | string;
+      agentId: null | string;
+    };
     expect(onChain.chain).toBeNull();
     expect(onChain.agentId).toBeNull();
     const caps = desc['anp:capabilities'] as Array<{ name: string }>;
@@ -1182,16 +1269,34 @@ describe('identity server', () => {
     return 18000 + Math.floor(Math.random() * 1000);
   }
 
-  async function fetchJson(p: string): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
+  async function fetchJson(
+    p: string,
+  ): Promise<{
+    status: number;
+    headers: http.IncomingHttpHeaders;
+    body: string;
+  }> {
     return new Promise((resolve, reject) => {
       http
-        .request({ hostname: '127.0.0.1', port, path: p, method: p === '/a2a' ? 'POST' : 'GET' }, (res) => {
-          let body = '';
-          res.on('data', (c) => (body += c));
-          res.on('end', () =>
-            resolve({ status: res.statusCode ?? 0, headers: res.headers, body }),
-          );
-        })
+        .request(
+          {
+            hostname: '127.0.0.1',
+            port,
+            path: p,
+            method: p === '/a2a' ? 'POST' : 'GET',
+          },
+          (res) => {
+            let body = '';
+            res.on('data', (c) => (body += c));
+            res.on('end', () =>
+              resolve({
+                status: res.statusCode ?? 0,
+                headers: res.headers,
+                body,
+              }),
+            );
+          },
+        )
         .on('error', reject)
         .end();
     });
@@ -1220,7 +1325,9 @@ describe('identity server', () => {
       privateKey,
       verificationMethodId: 'did:wba:example.ts.net:agent:Andy#key-1',
     });
-    return new Promise<void>((resolve) => server.once('listening', () => resolve()));
+    return new Promise<void>((resolve) =>
+      server.once('listening', () => resolve()),
+    );
   });
 
   afterEach(async () => {
@@ -1428,7 +1535,9 @@ describe('canSendProactive', () => {
   });
 
   it('returns false when last message is within the minimum gap', () => {
-    const tooSoon = new Date(activeHour.getTime() - (PROACTIVE_MIN_GAP_MS - 60_000));
+    const tooSoon = new Date(
+      activeHour.getTime() - (PROACTIVE_MIN_GAP_MS - 60_000),
+    );
     expect(
       canSendProactive(
         {
@@ -1442,7 +1551,9 @@ describe('canSendProactive', () => {
   });
 
   it('returns true when the gap since last message has elapsed', () => {
-    const longAgo = new Date(activeHour.getTime() - (PROACTIVE_MIN_GAP_MS + 60_000));
+    const longAgo = new Date(
+      activeHour.getTime() - (PROACTIVE_MIN_GAP_MS + 60_000),
+    );
     expect(
       canSendProactive(
         {
@@ -1480,5 +1591,561 @@ describe('canSendProactive', () => {
         activeHour,
       ),
     ).toBe(false);
+  });
+});
+
+describe('armForHour', () => {
+  it('maps boundary hours to the correct arms', () => {
+    expect(armForHour(7)).toBe('morning');
+    expect(armForHour(11)).toBe('morning');
+    expect(armForHour(12)).toBe('afternoon');
+    expect(armForHour(16)).toBe('afternoon');
+    expect(armForHour(17)).toBe('evening');
+    expect(armForHour(21)).toBe('evening');
+  });
+
+  it('returns null inside quiet hours and other invalid inputs', () => {
+    expect(armForHour(22)).toBe(null);
+    expect(armForHour(23)).toBe(null);
+    expect(armForHour(0)).toBe(null);
+    expect(armForHour(3)).toBe(null);
+    expect(armForHour(6)).toBe(null);
+    expect(armForHour(-1)).toBe(null);
+    expect(armForHour(24)).toBe(null);
+    expect(armForHour(7.5)).toBe(null);
+  });
+});
+
+describe('posteriorFor', () => {
+  it('adds successes and failures to the prior', () => {
+    const p = posteriorFor('morning', 4, 1);
+    expect(p.alpha).toBe(TIMING_ARM_PRIORS.morning.alpha + 4);
+    expect(p.beta).toBe(TIMING_ARM_PRIORS.morning.beta + 1);
+  });
+
+  it('returns the prior unchanged with zero counts', () => {
+    for (const arm of TIMING_ARMS) {
+      expect(posteriorFor(arm, 0, 0)).toEqual(TIMING_ARM_PRIORS[arm]);
+    }
+  });
+});
+
+describe('sampleBeta', () => {
+  it('is deterministic given a fixed RNG and lies in [0, 1]', () => {
+    const draw1 = sampleBeta({ alpha: 3, beta: 2 }, seededRng(42));
+    const draw2 = sampleBeta({ alpha: 3, beta: 2 }, seededRng(42));
+    expect(draw1).toBe(draw2);
+    expect(draw1).toBeGreaterThanOrEqual(0);
+    expect(draw1).toBeLessThanOrEqual(1);
+  });
+
+  it('has empirical mean ≈ alpha/(alpha+beta) over many draws', () => {
+    const p: BetaPosterior = { alpha: 4, beta: 6 };
+    const rng = seededRng(123);
+    const N = 5000;
+    let sum = 0;
+    for (let i = 0; i < N; i++) sum += sampleBeta(p, rng);
+    const mean = sum / N;
+    // Expected = 0.4. Std of beta(4,6) ≈ 0.148; SE over 5k draws ≈ 0.0021.
+    // 0.03 tolerance is well outside noise but catches gross bias.
+    expect(Math.abs(mean - 0.4)).toBeLessThan(0.03);
+  });
+});
+
+describe('thompsonRanking', () => {
+  it('returns all three arms', () => {
+    const ranking = thompsonRanking(
+      {
+        morning: TIMING_ARM_PRIORS.morning,
+        afternoon: TIMING_ARM_PRIORS.afternoon,
+        evening: TIMING_ARM_PRIORS.evening,
+      },
+      seededRng(7),
+    );
+    expect(ranking.length).toBe(3);
+    expect(new Set(ranking)).toEqual(
+      new Set<TimingArm>(['morning', 'afternoon', 'evening']),
+    );
+  });
+
+  it('is deterministic given a fixed RNG', () => {
+    const posteriors = {
+      morning: { alpha: 5, beta: 3 },
+      afternoon: { alpha: 2, beta: 4 },
+      evening: { alpha: 6, beta: 2 },
+    };
+    const r1 = thompsonRanking(posteriors, seededRng(99));
+    const r2 = thompsonRanking(posteriors, seededRng(99));
+    expect(r1).toEqual(r2);
+  });
+
+  it('puts a dominant arm first in the large majority of draws', () => {
+    // Evening is overwhelming; morning/afternoon barely-prior.
+    const posteriors = {
+      morning: { alpha: 2, beta: 8 },
+      afternoon: { alpha: 2, beta: 8 },
+      evening: { alpha: 20, beta: 2 },
+    };
+    const rng = seededRng(2026);
+    let eveningWins = 0;
+    const trials = 500;
+    for (let i = 0; i < trials; i++) {
+      if (thompsonRanking(posteriors, rng)[0] === 'evening') eveningWins++;
+    }
+    expect(eveningWins / trials).toBeGreaterThan(0.9);
+  });
+});
+
+// --- Phase 4.5 experiment store ---
+
+interface InsertEpisodeOpts {
+  groupFolder?: string;
+  timingArm?: TimingArm;
+  sentAt?: string;
+  outcome?: 'replied' | 'ignored' | 'withdrawn';
+  sentiment?: 'positive' | 'neutral' | 'negative' | null;
+  target?: string;
+  planItemId?: string;
+}
+
+function insertEpisode(opts: InsertEpisodeOpts = {}): void {
+  const sentAt = opts.sentAt ?? '2026-05-20T10:00:00.000Z';
+  getDb()
+    .prepare(
+      `INSERT INTO experiment_episodes
+         (id, group_folder, plan_item_id, target, timing_arm, sent_at,
+          message_excerpt, outcome, sentiment, proximal_window_min, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      crypto.randomUUID(),
+      opts.groupFolder ?? 'main',
+      opts.planItemId ?? null,
+      opts.target ?? 'Alice',
+      opts.timingArm ?? 'morning',
+      sentAt,
+      'hello world',
+      opts.outcome ?? 'replied',
+      opts.sentiment ?? 'positive',
+      90,
+      sentAt,
+    );
+}
+
+function insertTuning(opts: {
+  version: number;
+  stateJson: string;
+  baselineEfficacy: number | null;
+  createdAt: string;
+  active?: 0 | 1;
+}): void {
+  getDb()
+    .prepare(
+      `INSERT INTO experiment_tuning
+         (id, group_folder, version, state_json, baseline_efficacy, created_at, active)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      crypto.randomUUID(),
+      'main',
+      opts.version,
+      opts.stateJson,
+      opts.baselineEfficacy,
+      opts.createdAt,
+      opts.active ?? 1,
+    );
+}
+
+describe('experiment-store: getRecentEpisodes', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  it('returns only episodes within the window, newest first', () => {
+    const now = new Date('2026-05-20T12:00:00Z');
+    insertEpisode({ sentAt: '2026-05-19T12:00:00.000Z' }); // 1 day ago
+    insertEpisode({ sentAt: '2026-04-15T12:00:00.000Z' }); // 35 days ago — out
+    insertEpisode({ sentAt: '2026-05-20T11:00:00.000Z' }); // 1 hour ago
+
+    const eps = getRecentEpisodes(getDb(), 'main', 30, now);
+    expect(eps.length).toBe(2);
+    expect(new Date(eps[0].sentAt).getTime()).toBeGreaterThan(
+      new Date(eps[1].sentAt).getTime(),
+    );
+  });
+
+  it('partitions by group_folder', () => {
+    const now = new Date('2026-05-20T12:00:00Z');
+    insertEpisode({ groupFolder: 'main', sentAt: '2026-05-19T12:00:00.000Z' });
+    insertEpisode({ groupFolder: 'other', sentAt: '2026-05-19T12:00:00.000Z' });
+
+    expect(getRecentEpisodes(getDb(), 'main', 30, now).length).toBe(1);
+    expect(getRecentEpisodes(getDb(), 'other', 30, now).length).toBe(1);
+  });
+});
+
+describe('experiment-store: computePosteriors', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  it('reflects only episodes inside EPISODE_DECAY_DAYS', () => {
+    const now = new Date('2026-05-20T12:00:00Z');
+    // Inside window: 1 success on evening, 1 failure on evening
+    insertEpisode({
+      timingArm: 'evening',
+      outcome: 'replied',
+      sentiment: 'positive',
+      sentAt: '2026-05-19T18:00:00.000Z',
+    });
+    insertEpisode({
+      timingArm: 'evening',
+      outcome: 'ignored',
+      sentiment: null,
+      sentAt: '2026-05-18T18:00:00.000Z',
+    });
+    // Outside window: should NOT affect counts
+    insertEpisode({
+      timingArm: 'evening',
+      outcome: 'replied',
+      sentiment: 'positive',
+      sentAt: '2026-04-01T18:00:00.000Z',
+    });
+
+    const post = computePosteriors(getDb(), 'main', now);
+    // Evening prior is { alpha: 3, beta: 2 } → +1 success, +1 failure → {4, 3}
+    expect(post.evening.alpha).toBe(4);
+    expect(post.evening.beta).toBe(3);
+    // Untouched arms still equal their priors
+    expect(post.morning).toEqual({ alpha: 3, beta: 2 });
+    expect(post.afternoon).toEqual({ alpha: 2, beta: 3 });
+  });
+
+  it('treats withdrawn episodes as neither success nor failure', () => {
+    const now = new Date('2026-05-20T12:00:00Z');
+    insertEpisode({
+      timingArm: 'morning',
+      outcome: 'withdrawn',
+      sentiment: null,
+      sentAt: '2026-05-19T08:00:00.000Z',
+    });
+    const post = computePosteriors(getDb(), 'main', now);
+    expect(post.morning).toEqual({ alpha: 3, beta: 2 }); // unchanged
+  });
+});
+
+describe('experiment-store: efficacyRate', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  it('counts replied+positive/neutral as success and excludes withdrawn', () => {
+    const now = new Date('2026-05-20T12:00:00Z');
+    const day = '2026-05-19T10:00:00.000Z';
+    insertEpisode({ outcome: 'replied', sentiment: 'positive', sentAt: day });
+    insertEpisode({ outcome: 'replied', sentiment: 'neutral', sentAt: day });
+    insertEpisode({ outcome: 'replied', sentiment: 'negative', sentAt: day });
+    insertEpisode({ outcome: 'ignored', sentiment: null, sentAt: day });
+    insertEpisode({ outcome: 'withdrawn', sentiment: null, sentAt: day });
+
+    // 2 success / (2 success + 2 failure) = 0.5; withdrawn excluded
+    expect(efficacyRate(getDb(), 'main', 7, now)).toBe(0.5);
+  });
+
+  it('returns null when there are no scored episodes', () => {
+    expect(efficacyRate(getDb(), 'main', 7)).toBe(null);
+  });
+});
+
+describe('experiment-store: readBackoffState clamping', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  it('clamps a 0.0 multiplier up to MIN_OUTREACH_MULTIPLIER', () => {
+    insertTuning({
+      version: 1,
+      stateJson: JSON.stringify({
+        targets: { Alice: { outreach_multiplier: 0.0 } },
+      }),
+      baselineEfficacy: 0.5,
+      createdAt: new Date().toISOString(),
+    });
+    const state = readBackoffState(getDb(), 'main');
+    expect(state.targets.Alice.outreach_multiplier).toBe(
+      MIN_OUTREACH_MULTIPLIER,
+    );
+  });
+
+  it('clamps a >1.0 multiplier down to 1.0', () => {
+    insertTuning({
+      version: 1,
+      stateJson: JSON.stringify({
+        targets: { Alice: { outreach_multiplier: 1.5 } },
+      }),
+      baselineEfficacy: 0.5,
+      createdAt: new Date().toISOString(),
+    });
+    expect(
+      readBackoffState(getDb(), 'main').targets.Alice.outreach_multiplier,
+    ).toBe(1.0);
+  });
+
+  it('returns empty targets when no tuning row exists', () => {
+    expect(readBackoffState(getDb(), 'main')).toEqual({ targets: {} });
+  });
+
+  it('leaves in-range multipliers untouched', () => {
+    insertTuning({
+      version: 1,
+      stateJson: JSON.stringify({
+        targets: { Bob: { outreach_multiplier: 0.6 } },
+      }),
+      baselineEfficacy: 0.5,
+      createdAt: new Date().toISOString(),
+    });
+    expect(
+      readBackoffState(getDb(), 'main').targets.Bob.outreach_multiplier,
+    ).toBe(0.6);
+  });
+});
+
+describe('experiment-store: reviewGuardrails', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  it('seeds a baseline row on the first ever review', () => {
+    const now = new Date('2026-05-20T12:00:00Z');
+    const r = reviewGuardrails(getDb(), 'main', now);
+    expect(r.seeded).toBe(true);
+    expect(r.skipped).toBe(false);
+    expect(r.rolledBack).toBe(false);
+    expect(
+      getDb()
+        .prepare(
+          `SELECT COUNT(*) as n FROM experiment_tuning WHERE group_folder = 'main'`,
+        )
+        .get(),
+    ).toEqual({ n: 1 });
+  });
+
+  it('is a no-op (skipped) within the rate-limit window', () => {
+    const t0 = new Date('2026-05-20T12:00:00Z');
+    insertTuning({
+      version: 1,
+      stateJson: JSON.stringify({ targets: {} }),
+      baselineEfficacy: 0.6,
+      createdAt: t0.toISOString(),
+    });
+    // 2 days later — well within the 7-day window
+    const t1 = new Date(t0.getTime() + 2 * 86400000);
+    const r = reviewGuardrails(getDb(), 'main', t1);
+    expect(r.skipped).toBe(true);
+    expect(r.rolledBack).toBe(false);
+    // Rate-limited skip writes no new row — only the original remains
+    expect(
+      getDb()
+        .prepare(
+          `SELECT COUNT(*) as n FROM experiment_tuning WHERE group_folder = 'main'`,
+        )
+        .get(),
+    ).toEqual({ n: 1 });
+  });
+
+  it('rolls back to prior state when trailing efficacy regressed', () => {
+    const t0 = new Date('2026-05-01T12:00:00Z');
+    // Older "good" baseline (version 1, no longer active)
+    insertTuning({
+      version: 1,
+      stateJson: JSON.stringify({
+        targets: { Alice: { outreach_multiplier: 1.0 } },
+      }),
+      baselineEfficacy: 0.5,
+      createdAt: new Date(t0.getTime() - 14 * 86400000).toISOString(),
+      active: 0,
+    });
+    // Current active baseline with elevated efficacy
+    insertTuning({
+      version: 2,
+      stateJson: JSON.stringify({
+        targets: { Alice: { outreach_multiplier: 0.5 } },
+      }),
+      baselineEfficacy: 0.8,
+      createdAt: t0.toISOString(),
+      active: 1,
+    });
+
+    // Episodes within 7d of "now" → 1 success, 3 failures → trailing 0.25 < 0.8 baseline
+    const now = new Date(t0.getTime() + (ROLLBACK_REVIEW_DAYS + 1) * 86400000);
+    insertEpisode({
+      outcome: 'replied',
+      sentiment: 'positive',
+      sentAt: new Date(now.getTime() - 86400000).toISOString(),
+    });
+    insertEpisode({
+      outcome: 'ignored',
+      sentiment: null,
+      sentAt: new Date(now.getTime() - 86400000).toISOString(),
+    });
+    insertEpisode({
+      outcome: 'ignored',
+      sentiment: null,
+      sentAt: new Date(now.getTime() - 86400000).toISOString(),
+    });
+    insertEpisode({
+      outcome: 'replied',
+      sentiment: 'negative',
+      sentAt: new Date(now.getTime() - 86400000).toISOString(),
+    });
+
+    const r = reviewGuardrails(getDb(), 'main', now);
+    expect(r.rolledBack).toBe(true);
+    expect(r.skipped).toBe(false);
+    expect(r.driftAlerts.length).toBeGreaterThan(0); // |0.25 - 0.8| ≥ DRIFT_ALERT_DELTA
+
+    // New active row should restore version 1's state_json
+    const active = getDb()
+      .prepare(
+        `SELECT state_json FROM experiment_tuning WHERE group_folder = 'main' AND active = 1`,
+      )
+      .get() as { state_json: string };
+    expect(
+      JSON.parse(active.state_json).targets.Alice.outreach_multiplier,
+    ).toBe(1.0);
+  });
+
+  it('snapshots a healthy baseline (no rollback) when efficacy holds up', () => {
+    const t0 = new Date('2026-05-01T12:00:00Z');
+    insertTuning({
+      version: 1,
+      stateJson: JSON.stringify({ targets: {} }),
+      baselineEfficacy: 0.4,
+      createdAt: t0.toISOString(),
+    });
+    // 2 successes, 0 failures → 1.0 ≥ 0.4
+    const now = new Date(t0.getTime() + (ROLLBACK_REVIEW_DAYS + 1) * 86400000);
+    insertEpisode({
+      outcome: 'replied',
+      sentiment: 'positive',
+      sentAt: new Date(now.getTime() - 86400000).toISOString(),
+    });
+    insertEpisode({
+      outcome: 'replied',
+      sentiment: 'neutral',
+      sentAt: new Date(now.getTime() - 86400000).toISOString(),
+    });
+
+    const r = reviewGuardrails(getDb(), 'main', now);
+    expect(r.rolledBack).toBe(false);
+    expect(r.skipped).toBe(false);
+    expect(r.driftAlerts.length).toBeGreaterThan(0); // 1.0 vs 0.4 still crosses DRIFT_ALERT_DELTA
+  });
+});
+
+describe('experiment-store: writeExperimentState', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  it('writes valid JSON with all required keys and consistent withdrawal flag', () => {
+    const now = new Date('2026-05-20T12:00:00Z');
+    writeExperimentState(getDb(), tmpDir, 'main', now, seededRng(1));
+    const statePath = path.join(
+      tmpDir,
+      'main',
+      'soul',
+      'experiment-state.json',
+    );
+    expect(fs.existsSync(statePath)).toBe(true);
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
+
+    expect(state.generated_at).toBe(now.toISOString());
+    expect(state.withdrawal_week).toBe(inWithdrawalPeriod(now));
+    expect(state.timing).toBeDefined();
+    expect(state.timing.posteriors.morning.alpha).toBe(3);
+    expect(state.timing.posteriors.morning.beta).toBe(2);
+    expect(state.timing.posteriors.morning.n).toBe(0);
+    expect(state.timing.posteriors.morning.mean).toBeCloseTo(3 / 5);
+    expect(Array.isArray(state.timing.thompson_ranking)).toBe(true);
+    expect(state.timing.thompson_ranking.length).toBe(3);
+    expect(state.recent_episodes).toEqual([]);
+    expect(state.backoff).toEqual({});
+    expect(state.efficacy_trailing_7d).toBe(null);
+  });
+
+  it('reflects recent episodes and trailing efficacy after data lands', () => {
+    const now = new Date('2026-05-20T12:00:00Z');
+    insertEpisode({
+      target: 'Alice',
+      timingArm: 'evening',
+      outcome: 'replied',
+      sentiment: 'positive',
+      sentAt: '2026-05-19T19:00:00.000Z',
+    });
+    insertEpisode({
+      target: 'Alice',
+      timingArm: 'evening',
+      outcome: 'ignored',
+      sentiment: null,
+      sentAt: '2026-05-18T19:00:00.000Z',
+    });
+    writeExperimentState(getDb(), tmpDir, 'main', now, seededRng(2));
+    const state = JSON.parse(
+      fs.readFileSync(
+        path.join(tmpDir, 'main', 'soul', 'experiment-state.json'),
+        'utf-8',
+      ),
+    );
+    expect(state.recent_episodes.length).toBe(2);
+    expect(state.recent_episodes[0].sent_at).toBe('2026-05-19T19:00:00.000Z'); // newest first
+    expect(state.timing.posteriors.evening.n).toBe(2);
+    expect(state.efficacy_trailing_7d).toBe(0.5);
+  });
+});
+
+describe('inWithdrawalPeriod', () => {
+  it('is deterministic for a fixed date', () => {
+    const d = new Date('2026-05-20T12:00:00Z');
+    expect(inWithdrawalPeriod(d)).toBe(inWithdrawalPeriod(d));
+  });
+
+  it('returns true for exactly one ISO week in WITHDRAWAL_CYCLE_WEEKS', () => {
+    // Walk 8 consecutive ISO weeks. Use Wednesdays to stay safely inside each week.
+    const start = new Date('2026-01-07T12:00:00Z'); // Wed of ISO week 2, 2026
+    let withdrawalCount = 0;
+    for (let i = 0; i < WITHDRAWAL_CYCLE_WEEKS; i++) {
+      const d = new Date(start.getTime() + i * 7 * 86400000);
+      if (inWithdrawalPeriod(d)) withdrawalCount++;
+    }
+    expect(withdrawalCount).toBe(1);
+  });
+});
+
+describe('planning-prompts: Phase 4.5 additions', () => {
+  it('buildMorningPlanPrompt references experiment-state.json and backoff rules', async () => {
+    const { buildMorningPlanPrompt } = await import('./planning-prompts.js');
+    const prompt = buildMorningPlanPrompt('main');
+    expect(prompt).toContain('experiment-state.json');
+    expect(prompt).toContain('thompson_ranking');
+    expect(prompt).toContain('withdrawal_week');
+    expect(prompt).toContain('outreach_multiplier');
+    expect(prompt).toContain(String(MIN_OUTREACH_MULTIPLIER));
+  });
+
+  it('buildCheckInPrompt contains the Step 0 evaluation and experiment_episodes insert', async () => {
+    const { buildCheckInPrompt } = await import('./planning-prompts.js');
+    const prompt = buildCheckInPrompt('main');
+    expect(prompt).toContain('Step 0');
+    expect(prompt).toContain('experiment_episodes');
+    expect(prompt).toContain('proximal');
+    expect(prompt).toContain('withdrawal_week');
+    expect(prompt).toContain('"sent"'); // the interim status
+  });
+
+  // Touch the constants so unused-import lint doesn't pull them later.
+  it('exports the phase-4.5 tuning constants used in tests', () => {
+    expect(DRIFT_ALERT_DELTA).toBeGreaterThan(0);
+    expect(EPISODE_DECAY_DAYS).toBeGreaterThan(0);
   });
 });

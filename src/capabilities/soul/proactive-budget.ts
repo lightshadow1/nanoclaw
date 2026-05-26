@@ -33,6 +33,12 @@ export const PROACTIVE_MIN_GAP_MS = 2 * 60 * 60 * 1000;
 export const PROACTIVE_QUIET_START = 22; // hour, inclusive
 export const PROACTIVE_QUIET_END = 7; // hour, exclusive
 
+// Phase 4.5 withdrawal periods (ABAB design — scoring inaction).
+// One ISO week in WITHDRAWAL_CYCLE_WEEKS is a withdrawal week: the morning
+// plan emits zero outreach items, the check-in skips proactive sends.
+// ISO-week-derived so every component agrees with no stored state.
+export const WITHDRAWAL_CYCLE_WEEKS = 8;
+
 function todayString(now: Date): string {
   // Local-date YYYY-MM-DD — the budget rolls over by the soul's wall clock,
   // not UTC, so "max 3/day" matches the owner's lived day.
@@ -54,7 +60,12 @@ export function readBudget(
   folder: string,
   now: Date = new Date(),
 ): ProactiveBudget {
-  const budgetPath = path.join(groupsDir, folder, 'soul', 'proactive-budget.json');
+  const budgetPath = path.join(
+    groupsDir,
+    folder,
+    'soul',
+    'proactive-budget.json',
+  );
   const today = todayString(now);
   const fresh: ProactiveBudget = {
     date: today,
@@ -65,7 +76,9 @@ export function readBudget(
   if (!fs.existsSync(budgetPath)) return fresh;
 
   try {
-    const raw = JSON.parse(fs.readFileSync(budgetPath, 'utf-8')) as Partial<ProactiveBudget>;
+    const raw = JSON.parse(
+      fs.readFileSync(budgetPath, 'utf-8'),
+    ) as Partial<ProactiveBudget>;
     if (
       typeof raw.date !== 'string' ||
       typeof raw.messages_sent !== 'number' ||
@@ -112,4 +125,28 @@ export function canSendProactive(
   }
 
   return true;
+}
+
+// Standard ISO 8601 week number. Weeks start Monday; week 1 contains the
+// first Thursday of the year.
+function isoWeekNumber(d: Date): number {
+  const target = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = (target.getUTCDay() + 6) % 7; // Mon=0 .. Sun=6
+  target.setUTCDate(target.getUTCDate() - dayNum + 3); // Thursday of target's week
+  const firstThursday = new Date(Date.UTC(target.getUTCFullYear(), 0, 4));
+  const firstThursdayDayNum = (firstThursday.getUTCDay() + 6) % 7;
+  firstThursday.setUTCDate(
+    firstThursday.getUTCDate() - firstThursdayDayNum + 3,
+  );
+  return (
+    1 +
+    Math.round((target.getTime() - firstThursday.getTime()) / (7 * 86400000))
+  );
+}
+
+// True during a withdrawal week. Deterministic from the ISO week number, so
+// every component agrees without any stored state. Exactly one in every
+// WITHDRAWAL_CYCLE_WEEKS consecutive ISO weeks returns true.
+export function inWithdrawalPeriod(now: Date = new Date()): boolean {
+  return isoWeekNumber(now) % WITHDRAWAL_CYCLE_WEEKS === 0;
 }

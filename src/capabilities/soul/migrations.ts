@@ -30,3 +30,49 @@ export const memoryStreamMigration: MigrationBundle = {
     `);
   },
 };
+
+// Phase 4.5: experimentation + feedback. Two tables:
+//   - experiment_episodes: immutable per-message outcome log
+//   - experiment_tuning:   versioned backoff state (rollback-able)
+export const experimentMigration: MigrationBundle = {
+  version: '1.1.0',
+  up: (db) => {
+    db.exec(`
+      CREATE TABLE experiment_episodes (
+        id TEXT PRIMARY KEY,
+        group_folder TEXT NOT NULL,
+        plan_item_id TEXT,
+        target TEXT,
+        timing_arm TEXT NOT NULL,
+        sent_at TEXT NOT NULL,
+        message_excerpt TEXT,
+        outcome TEXT NOT NULL,
+        sentiment TEXT,
+        proximal_window_min INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_episodes_group_sent
+        ON experiment_episodes (group_folder, sent_at);
+
+      CREATE TABLE experiment_tuning (
+        id TEXT PRIMARY KEY,
+        group_folder TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        state_json TEXT NOT NULL,
+        baseline_efficacy REAL,
+        created_at TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE INDEX idx_tuning_group_active
+        ON experiment_tuning (group_folder, active);
+    `);
+  },
+  down: (db) => {
+    db.exec(`
+      DROP INDEX IF EXISTS idx_tuning_group_active;
+      DROP TABLE IF EXISTS experiment_tuning;
+      DROP INDEX IF EXISTS idx_episodes_group_sent;
+      DROP TABLE IF EXISTS experiment_episodes;
+    `);
+  },
+};
