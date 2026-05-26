@@ -29,6 +29,9 @@ groups/global/*
 .idea/
 .vscode/
 
+# Claude Code per-machine overrides (env, allowlisted commands, etc.)
+.claude/settings.local.json
+
 # Skills system (local per-installation state)
 .nanoclaw/
 
