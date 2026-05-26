@@ -63,23 +63,25 @@ The container buildkit caches the build context aggressively. `--no-cache` alone
 
 The staging server runs `dist/index.js` out of the checked-out repo, with state (`.env`, `groups/`, `store/messages.db`, WhatsApp/Telegram auth, `logs/`) co-located. Deploys must preserve `WorkingDirectory` — only swap the `dist/` build artifact. The specific staging host is configured per-machine outside this repo (SSH alias or env var) so it isn't committed.
 
-Standard flow (from local dev machine, after the change is on `origin/staging`; replace `$STAGING` with your SSH alias / `user@host`):
+Repo lives at `~/git/nanoclaw` on staging (matches systemd `WorkingDirectory`). Standard flow (from local dev machine, after the change is on `origin/staging`; replace `$STAGING` with your SSH alias / `user@host`):
 
 ```bash
 # 1. Pull on remote
-ssh "$STAGING" 'cd ~/nanoclaw && git pull --ff-only origin staging'
+ssh "$STAGING" 'cd ~/git/nanoclaw && git pull --ff-only origin staging'
 
 # 2. Build in an isolated worktree (does NOT touch the running app's state)
-ssh "$STAGING" 'cd ~/nanoclaw && git worktree prune && git worktree add /tmp/nanoclaw-build origin/staging && ln -s ~/nanoclaw/node_modules /tmp/nanoclaw-build/node_modules && cd /tmp/nanoclaw-build && ~/.nvm/versions/node/*/bin/tsc -p .'
+#    NVM is not auto-loaded in non-login ssh shells, so the bare `tsc -p .`
+#    spawn fails to find `node`. Set PATH inline to the active node version.
+ssh "$STAGING" 'export PATH=$HOME/.nvm/versions/node/$(ls ~/.nvm/versions/node | tail -1)/bin:$PATH && cd ~/git/nanoclaw && git worktree prune && git worktree add /tmp/nanoclaw-build origin/staging && ln -s ~/git/nanoclaw/node_modules /tmp/nanoclaw-build/node_modules && cd /tmp/nanoclaw-build && tsc -p .'
 
 # 3. Swap dist (keep prior dist as rollback)
-ssh "$STAGING" 'cd ~/nanoclaw && mv dist dist.old.$(date +%s) && cp -a /tmp/nanoclaw-build/dist .'
+ssh "$STAGING" 'cd ~/git/nanoclaw && mv dist dist.old.$(date +%s) && cp -a /tmp/nanoclaw-build/dist .'
 
 # 4. Restart and verify
 ssh "$STAGING" 'systemctl --user restart nanoclaw && systemctl --user is-active nanoclaw'
 
 # 5. Cleanup
-ssh "$STAGING" 'rm /tmp/nanoclaw-build/node_modules && cd ~/nanoclaw && git worktree remove --force /tmp/nanoclaw-build'
+ssh "$STAGING" 'rm /tmp/nanoclaw-build/node_modules && cd ~/git/nanoclaw && git worktree remove --force /tmp/nanoclaw-build'
 ```
 
 Gotchas:
@@ -107,7 +109,7 @@ Memory Stream (SQLite, raw/immutable) → Wiki (markdown files, continuously cur
 | Phase 2: Wiki Curation | Done | `WIKI_CURATION_PROMPT.md` | `curator-prompts.ts`, tasks: `soul-wiki-curation-main`, `soul-evening-journal-main` |
 | Phase 3: Identity | Done | `IDENTITY_PROMPT.md` | `identity.ts`, `identity-server.ts`, `agent-description.ts` |
 | Phase 4: Planning + Initiative | Done | `PLANNING_PROMPT.md` | `planning-prompts.ts`, `proactive-budget.ts`, tasks: `soul-morning-plan-main`, `soul-check-in-main` |
-| Phase 4.5: Experimentation + Feedback | **Next** | `EXPERIMENTATION_PROMPT.md` | `timing-bandit.ts` (new), `experiment-store.ts` (new); tables: `experiment_episodes`, `experiment_tuning` |
+| Phase 4.5: Experimentation + Feedback | Done | `EXPERIMENTATION_PROMPT.md` | `timing-bandit.ts`, `experiment-store.ts`; migration `1.1.0` (tables: `experiment_episodes`, `experiment_tuning`); state file: `soul/experiment-state.json` |
 | Phase 5: Claw Pod (A2A) | Not started | Not yet created | `/a2a` endpoint (currently 501) |
 
 ### Soul Files
@@ -119,12 +121,14 @@ src/capabilities/soul/
   heuristic-score.ts    # heuristicScore() → 1-10
   wiki-scaffold.ts      # ensureWikiForGroup() — creates starter wiki pages
   curator-prompts.ts    # Static prompts for wiki curation + evening journal tasks
-  migrations.ts         # memory_stream table with curated column
+  migrations.ts         # memory_stream + experiment_episodes + experiment_tuning tables
   identity.ts           # Ed25519 key management, DID document generation
   identity-server.ts    # HTTP server: /.well-known/did.json, agent-description.json
   agent-description.ts  # JSON-LD Agent Description generation
-  planning-prompts.ts   # Static prompts for morning plan + check-in tasks
-  proactive-budget.ts   # Host-side gate: readBudget(), canSendProactive()
+  planning-prompts.ts   # Static prompts for morning plan + check-in tasks (Step 0 evaluation)
+  proactive-budget.ts   # Host-side gate: readBudget(), canSendProactive(), inWithdrawalPeriod()
+  timing-bandit.ts      # Beta-Bernoulli arms, Marsaglia–Tsang Gamma sampler, Thompson ranking
+  experiment-store.ts   # Episodes/posteriors/efficacy, backoff-state clamp, writeExperimentState, reviewGuardrails
   soul.test.ts          # Unit tests
 ```
 
@@ -144,8 +148,8 @@ src/capabilities/soul/
 |---------|----------|---------|
 | `soul-wiki-curation-main` | Every 2 hours (interval) | Curate uncurated memory entries into wiki pages |
 | `soul-evening-journal-main` | 10 PM daily (cron) | Deep curation + plan reconciliation + staleness review |
-| `soul-morning-plan-main` | 6 AM daily (cron) | Generate daily-plan.json from wiki + pending interventions (gated: skip if today's plan already written) |
-| `soul-check-in-main` | Every 2 hours (interval) | Execute plan items, send proactive messages (gated: skip if budget exhausted or quiet hours) |
+| `soul-morning-plan-main` | 6 AM daily (cron) | Generate daily-plan.json from wiki + pending interventions + Thompson timing + backoff (gated: skip if today's plan already written; host refreshes `experiment-state.json` first) |
+| `soul-check-in-main` | Every 2 hours (interval) | Step 0: evaluate `sent` plan items past the proximal window → insert episode row → flip to `done`. Step 1+: send proactive messages (gated: skip if budget exhausted, quiet hours, or withdrawal week; host refreshes `experiment-state.json` and runs self-rate-limited `reviewGuardrails` first) |
 
 ### Parent Spec
 
