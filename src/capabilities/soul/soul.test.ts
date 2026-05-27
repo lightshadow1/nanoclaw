@@ -27,6 +27,7 @@ import {
   MIN_OUTREACH_MULTIPLIER,
   readBackoffState,
   reviewGuardrails,
+  ROLLBACK_REGRESSION_THRESHOLD,
   ROLLBACK_REVIEW_DAYS,
   writeExperimentState,
 } from './experiment-store.js';
@@ -2040,6 +2041,107 @@ describe('experiment-store: reviewGuardrails', () => {
     expect(r.rolledBack).toBe(false);
     expect(r.skipped).toBe(false);
     expect(r.driftAlerts.length).toBeGreaterThan(0); // 1.0 vs 0.4 still crosses DRIFT_ALERT_DELTA
+  });
+
+  it('does not roll back on a small efficacy dip within ROLLBACK_REGRESSION_THRESHOLD', () => {
+    // The whole point of the threshold: noise-sized dips at this sample
+    // size (~3 sends/day) should NOT chain-rollback. Under the pre-threshold
+    // strict < comparison this test would have failed.
+    const t0 = new Date('2026-05-01T12:00:00Z');
+    insertTuning({
+      version: 1,
+      stateJson: JSON.stringify({
+        targets: { Alice: { outreach_multiplier: 1.0 } },
+      }),
+      baselineEfficacy: 0.6,
+      createdAt: new Date(t0.getTime() - 14 * 86400000).toISOString(),
+      active: 0,
+    });
+    insertTuning({
+      version: 2,
+      stateJson: JSON.stringify({
+        targets: { Alice: { outreach_multiplier: 0.5 } },
+      }),
+      baselineEfficacy: 0.8,
+      createdAt: t0.toISOString(),
+      active: 1,
+    });
+
+    const now = new Date(t0.getTime() + (ROLLBACK_REVIEW_DAYS + 1) * 86400000);
+    // 3 success + 1 failure → trailing = 0.75; dip = 0.05, clearly inside
+    // the 0.10 threshold.
+    const sentAt = new Date(now.getTime() - 86400000).toISOString();
+    for (let i = 0; i < 3; i++) {
+      insertEpisode({ outcome: 'replied', sentiment: 'positive', sentAt });
+    }
+    insertEpisode({ outcome: 'ignored', sentiment: null, sentAt });
+
+    const r = reviewGuardrails(getDb(), 'main', now);
+    expect(r.rolledBack).toBe(false);
+    expect(r.skipped).toBe(false);
+    expect(r.trailingEfficacy).toBeCloseTo(0.75);
+
+    // The active state stays at version 2's Alice multiplier (0.5) — it was
+    // NOT reverted to version 1's 1.0. (A new healthy-snapshot row gets
+    // appended, but it copies the active state_json forward.)
+    const active = getDb()
+      .prepare(
+        `SELECT state_json FROM experiment_tuning WHERE group_folder = 'main' AND active = 1`,
+      )
+      .get() as { state_json: string };
+    expect(
+      JSON.parse(active.state_json).targets.Alice.outreach_multiplier,
+    ).toBe(0.5);
+
+    // Sanity check that the constant is what we think it is — if anyone
+    // raises the threshold past 0.05 this test stops proving anything.
+    expect(ROLLBACK_REGRESSION_THRESHOLD).toBeGreaterThanOrEqual(0.05);
+  });
+
+  it('rolls back when the efficacy dip clearly exceeds ROLLBACK_REGRESSION_THRESHOLD', () => {
+    const t0 = new Date('2026-05-01T12:00:00Z');
+    insertTuning({
+      version: 1,
+      stateJson: JSON.stringify({
+        targets: { Alice: { outreach_multiplier: 1.0 } },
+      }),
+      baselineEfficacy: 0.6,
+      createdAt: new Date(t0.getTime() - 14 * 86400000).toISOString(),
+      active: 0,
+    });
+    insertTuning({
+      version: 2,
+      stateJson: JSON.stringify({
+        targets: { Alice: { outreach_multiplier: 0.5 } },
+      }),
+      baselineEfficacy: 0.8,
+      createdAt: t0.toISOString(),
+      active: 1,
+    });
+
+    const now = new Date(t0.getTime() + (ROLLBACK_REVIEW_DAYS + 1) * 86400000);
+    // 6 success + 4 failure → trailing = 0.6; dip = 0.2, comfortably past
+    // the 0.10 threshold. This pins the threshold from the other side.
+    const sentAt = new Date(now.getTime() - 86400000).toISOString();
+    for (let i = 0; i < 6; i++) {
+      insertEpisode({ outcome: 'replied', sentiment: 'positive', sentAt });
+    }
+    for (let i = 0; i < 4; i++) {
+      insertEpisode({ outcome: 'ignored', sentiment: null, sentAt });
+    }
+
+    const r = reviewGuardrails(getDb(), 'main', now);
+    expect(r.rolledBack).toBe(true);
+    expect(r.trailingEfficacy).toBeCloseTo(0.6);
+
+    const active = getDb()
+      .prepare(
+        `SELECT state_json FROM experiment_tuning WHERE group_folder = 'main' AND active = 1`,
+      )
+      .get() as { state_json: string };
+    expect(
+      JSON.parse(active.state_json).targets.Alice.outreach_multiplier,
+    ).toBe(1.0); // restored from version 1
   });
 });
 

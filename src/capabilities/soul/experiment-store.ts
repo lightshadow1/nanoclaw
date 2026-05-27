@@ -24,6 +24,14 @@ export const ROLLBACK_REVIEW_DAYS = 7;
 export const DRIFT_ALERT_DELTA = 0.25;
 export const RECENT_EPISODES_IN_STATE = 20;
 
+// Minimum efficacy drop (trailing < baseline - threshold) that triggers a
+// rollback. With ~3 sends/day the trailing-7d rate bounces 0.10–0.20 from
+// noise alone; a strict < comparison would fire constantly and stomp on
+// legitimate backoff decisions before they can prove themselves. A dip
+// inside this band is treated as healthy and the baseline is re-snapshotted
+// as usual. Worth tuning during soak.
+export const ROLLBACK_REGRESSION_THRESHOLD = 0.1;
+
 export type Outcome = 'replied' | 'ignored' | 'withdrawn';
 export type Sentiment = 'positive' | 'neutral' | 'negative';
 
@@ -348,10 +356,13 @@ export function reviewGuardrails(
     );
   }
 
+  // Rollback only when the trailing rate dropped by MORE than the threshold.
+  // Tiny dips are noise at this sample size; treating them as regression
+  // would chain-rollback indefinitely.
   const regressed =
     trailing != null &&
     active.baseline_efficacy != null &&
-    trailing < active.baseline_efficacy;
+    trailing < active.baseline_efficacy - ROLLBACK_REGRESSION_THRESHOLD;
 
   if (regressed) {
     const prior = getPreviousTuningRow(db, folder, active.version);
