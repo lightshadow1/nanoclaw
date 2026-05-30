@@ -74,6 +74,11 @@ D. Intervention cleanup
      sqlite3 /workspace/project/store/messages.db "UPDATE memory_stream SET metadata = json_set(metadata, '\$.status', 'resolved', '\$.resolution', 'owner response here') WHERE id = 'intervention-id'"
    - If an intervention is older than 48 hours with no response, mark it expired:
      sqlite3 /workspace/project/store/messages.db "UPDATE memory_stream SET metadata = json_set(metadata, '\$.status', 'expired') WHERE id = 'intervention-id'"
+   - SPECIAL CASE — \`spawn_soul\` intervention type: when reconciling, you MUST set both \`status\` AND \`approved\` based on the owner's reply.
+     - Affirmative reply (e.g. "yes, spawn it" or any clear approval): set status='resolved' AND approved=1. The host will spawn the soul on the next morning-plan pass.
+     - Negative reply: set status='resolved' AND approved=0.
+     - Ambiguous: leave pending or mark expired per the rules above.
+     Example: sqlite3 /workspace/project/store/messages.db "UPDATE memory_stream SET metadata = json_set(metadata, '\$.status', 'resolved', '\$.approved', 1, '\$.resolution', 'owner approved spawn') WHERE id = 'intervention-id'"
 
 ## Regular wiki curation flow
 

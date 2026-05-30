@@ -15,7 +15,11 @@ import {
 } from '../../config.js';
 import { logger } from '../../logger.js';
 import { createTask, getTaskById, updateTask } from '../../db.js';
-import { experimentMigration, memoryStreamMigration } from './migrations.js';
+import {
+  experimentMigration,
+  memoryStreamMigration,
+  soulsMigration,
+} from './migrations.js';
 import { addMemory, getUncurated } from './memory-stream.js';
 import { heuristicScore } from './heuristic-score.js';
 import { ensureWikiForGroup } from './wiki-scaffold.js';
@@ -29,14 +33,45 @@ import {
 } from './planning-prompts.js';
 import { canSendProactive, readBudget } from './proactive-budget.js';
 import { reviewGuardrails, writeExperimentState } from './experiment-store.js';
-import { generateAgentDescription } from './agent-description.js';
+import {
+  discoverCapabilities,
+  generateAgentDescription,
+} from './agent-description.js';
 import {
   encodeEd25519PublicKeyMultibase,
   generateDIDDocument,
   generateKeypair,
   loadKeypair,
+  soulKeyDir,
 } from './identity.js';
 import { startIdentityServer, stopIdentityServer } from './identity-server.js';
+// Phase 5: soul-to-soul protocol + multi-soul host wiring.
+import { buildEnvelope } from './protocol/envelope.js';
+import {
+  handleRequest,
+  LOOPBACK_DEFAULT_TIER,
+  type SoulContext,
+} from './protocol/handler.js';
+import { signMessage, verifyMessage } from './protocol/signing.js';
+import { LoopbackTransport } from './protocol/transport-loopback.js';
+import type { SignedRequestHandler } from './protocol/transport.js';
+import type { SignedMessage } from './protocol/types.js';
+import {
+  buildSignedAgentCard,
+  capabilitiesForCard,
+} from './protocol/agent-card.js';
+import {
+  type ActiveSoul,
+  clearRegistry,
+  listAllSouls,
+  loadActiveSouls,
+  resolvePublicKeyByDid,
+} from './soul-registry.js';
+import { routeUncuratedObservationsToSpawnedSouls } from './soul-router.js';
+import {
+  processPendingSpawnApprovals,
+  type LifecycleContext,
+} from './soul-lifecycle.js';
 
 // Module-level handles so the synchronous hook can reach them
 // without re-resolving on every dispatch. Mirrors src/db.ts's pattern.
@@ -44,6 +79,13 @@ let db: Database.Database | null = null;
 let groupsDir: string | null = null;
 let identityServer: http.Server | null = null;
 const scaffoldedGroups = new Set<string>();
+
+// Phase 5 module state. Single LoopbackTransport shared across souls;
+// lifecycleCtx is what spawn/archive/resurrect close over (also used by
+// host-side hooks like processPendingSpawnApprovals).
+let loopbackTransport: LoopbackTransport | null = null;
+let lifecycleCtx: LifecycleContext | null = null;
+let mainSoulDid: string | null = null;
 
 function discoverSkills(projectRoot: string): string[] {
   const skillsDir = path.join(projectRoot, '.claude', 'skills');
@@ -121,6 +163,161 @@ async function startSoulIdentityServer(ctx: CapabilityContext): Promise<void> {
       skills: skills.length,
     },
     'Soul identity server started',
+  );
+}
+
+// --- Phase 5 helpers --------------------------------------------------------
+
+function getSoulDomain(): string {
+  const env = readEnvFile(['SOUL_DOMAIN']);
+  return process.env.SOUL_DOMAIN ?? env.SOUL_DOMAIN ?? 'localhost';
+}
+
+function publicKeyRawFromKeyObject(
+  pub: ReturnType<typeof loadKeypair>['publicKey'],
+): Uint8Array {
+  // Last 32 bytes of the Ed25519 SPKI DER are the raw public key.
+  const der = pub.export({ format: 'der', type: 'spki' });
+  return Uint8Array.from(der.subarray(der.length - 32));
+}
+
+function buildSignedAgentCardFor(
+  soul: ActiveSoul,
+  projectRoot: string,
+  envVals: { owner: string; description?: string; traits?: string[] },
+): unknown {
+  // Main soul advertises channels + skills; spawned souls don't have
+  // direct channel access (spokesperson model — they speak through main).
+  const isMain = soul.folder === MAIN_GROUP_FOLDER;
+  const caps = capabilitiesForCard(
+    discoverCapabilities({
+      channelNames: isMain ? CHANNELS : [],
+      skillNames: isMain ? discoverSkills(projectRoot) : [],
+      hasScheduler: true,
+    }),
+  );
+  return buildSignedAgentCard(
+    {
+      did: soul.did,
+      agentName: soul.agentName,
+      owner: envVals.owner,
+      description: envVals.description,
+      traits: envVals.traits,
+      capabilities: caps,
+      publicKeyRaw: publicKeyRawFromKeyObject(soul.publicKey),
+      verificationMethodId: `${soul.did}#key-1`,
+    },
+    soul.privateKey,
+  );
+}
+
+function makeSoulHandlerFactory(
+  projectRoot: string,
+  cardEnv: { owner: string; description?: string; traits?: string[] },
+): (soul: ActiveSoul) => SignedRequestHandler {
+  return (soul: ActiveSoul) =>
+    async (req: SignedMessage): Promise<SignedMessage> => {
+      // Verify before dispatch. Per protocol §3.3 even loopback messages
+      // are signed — the receiver doesn't trust the sender's identity by
+      // transport alone.
+      const verify = verifyMessage(req, {
+        resolvePublicKey: resolvePublicKeyByDid,
+        expectedTo: soul.did,
+      });
+      if (!verify.ok) {
+        const errEnv = buildEnvelope({
+          from: soul.did,
+          to: req.envelope.from,
+          verb: req.envelope.verb,
+          body: { error: { code: 'verify_failed', message: verify.reason } },
+        });
+        return signMessage(errEnv, soul.privateKey, `${soul.did}#key-1`);
+      }
+      const sc: SoulContext = {
+        did: soul.did,
+        keyId: `${soul.did}#key-1`,
+        privateKey: soul.privateKey,
+        folder: soul.folder,
+        agentName: soul.agentName,
+        groupsDir: groupsDir!,
+        db: db!,
+        getAgentCard: () => buildSignedAgentCardFor(soul, projectRoot, cardEnv),
+      };
+      return handleRequest(req, LOOPBACK_DEFAULT_TIER, sc);
+    };
+}
+
+function initSoulProtocol(ctx: CapabilityContext, mainJid: string): void {
+  const env = readEnvFile([
+    'SOUL_OWNER',
+    'SOUL_NAME',
+    'SOUL_DESCRIPTION',
+    'SOUL_TRAITS',
+  ]);
+  const owner = process.env.SOUL_OWNER ?? env.SOUL_OWNER ?? 'self';
+  const agentName = process.env.SOUL_NAME ?? env.SOUL_NAME ?? ASSISTANT_NAME;
+  const description = process.env.SOUL_DESCRIPTION ?? env.SOUL_DESCRIPTION;
+  const traitsRaw = process.env.SOUL_TRAITS ?? env.SOUL_TRAITS;
+  const traits = traitsRaw
+    ? traitsRaw
+        .split(',')
+        .map((t) => t.trim())
+        .filter(Boolean)
+    : undefined;
+  const homedir = os.homedir();
+  const domain = getSoulDomain();
+
+  // Main keypair: always exists by Phase 5. Phase 3 created it only when
+  // SOUL_DOMAIN was set; generateKeypair is idempotent so the call here
+  // doesn't disturb existing installs.
+  const mainKeyDir = soulKeyDir(homedir, null);
+  generateKeypair(mainKeyDir);
+  const mainKp = loadKeypair(mainKeyDir);
+
+  const mainSoul: ActiveSoul = {
+    folder: MAIN_GROUP_FOLDER,
+    agentName,
+    did: `did:wba:${domain}:agent:${MAIN_GROUP_FOLDER}`,
+    privateKey: mainKp.privateKey,
+    publicKey: mainKp.publicKey,
+    channelJid: mainJid,
+    state: 'active',
+  };
+  mainSoulDid = mainSoul.did;
+
+  loopbackTransport = new LoopbackTransport();
+  const transport = loopbackTransport;
+  const handlerFactory = makeSoulHandlerFactory(ctx.projectRoot, {
+    owner,
+    description,
+    traits,
+  });
+
+  lifecycleCtx = {
+    db: ctx.db,
+    homedir,
+    groupsDir: ctx.groupsDir,
+    domain,
+    mainFolder: MAIN_GROUP_FOLDER,
+    transport,
+    buildSoulHandler: handlerFactory,
+  };
+
+  // Populate registry from DB + register every soul with the transport.
+  loadActiveSouls(ctx.db, homedir, mainSoul);
+  for (const s of listAllSouls()) {
+    try {
+      transport.registerSoul(s.did, handlerFactory(s));
+    } catch (err) {
+      logger.error(
+        { folder: s.folder, err },
+        'Failed to register soul with loopback transport',
+      );
+    }
+  }
+  logger.info(
+    { transports: transport.registeredCount(), mainDid: mainSoul.did },
+    'Phase 5 soul protocol initialized',
   );
 }
 
@@ -323,7 +520,7 @@ export const soulCapability: Capability = {
     return value === 'true';
   },
 
-  migrations: [memoryStreamMigration, experimentMigration],
+  migrations: [memoryStreamMigration, experimentMigration, soulsMigration],
 
   init: async (ctx) => {
     db = ctx.db;
@@ -363,6 +560,21 @@ export const soulCapability: Capability = {
       logger.error({ err }, 'Failed to start soul identity server');
     }
 
+    // Phase 5: wire the loopback transport + registry. Gated on a
+    // registered main group — without it there's no main soul to host.
+    const mainGroupEntry = Object.entries(ctx.registeredGroups()).find(
+      ([, g]) => g.folder === MAIN_GROUP_FOLDER,
+    );
+    if (mainGroupEntry) {
+      try {
+        initSoulProtocol(ctx, mainGroupEntry[0]);
+      } catch (err) {
+        // Protocol init failure must not break message capture or
+        // curation. Souls fall back to Phase 4 behaviour.
+        logger.error({ err }, 'Phase 5 soul protocol init failed');
+      }
+    }
+
     logger.info(
       { scaffolded: scaffoldedGroups.size },
       'Soul capability initialized',
@@ -378,6 +590,11 @@ export const soulCapability: Capability = {
       }
       identityServer = null;
     }
+    // Phase 5: drop registry + transport state so a re-init starts clean.
+    clearRegistry();
+    loopbackTransport = null;
+    lifecycleCtx = null;
+    mainSoulDid = null;
     db = null;
     groupsDir = null;
     scaffoldedGroups.clear();
@@ -385,9 +602,16 @@ export const soulCapability: Capability = {
 
   hooks: {
     beforeTaskRun: (task) => {
-      // Wiki curation: skip if nothing uncurated.
+      // Wiki curation: route uncurated main observations to spawned souls
+      // first (host-side, deterministic), then skip the LLM run if there's
+      // nothing left for main itself to curate.
       if (task.id === `soul-wiki-curation-${MAIN_GROUP_FOLDER}`) {
         if (!db) return true; // fail open if soul never initialized
+        try {
+          routeUncuratedObservationsToSpawnedSouls(db, MAIN_GROUP_FOLDER);
+        } catch (err) {
+          logger.error({ err }, 'soul-router pass failed; continuing curation');
+        }
         return getUncurated(db, MAIN_GROUP_FOLDER, 1).length > 0;
       }
 
@@ -431,8 +655,10 @@ export const soulCapability: Capability = {
       }
 
       // Morning plan: refresh experiment-state.json so the container reads
-      // a current Thompson timing draw + backoff. Then skip if today's plan
-      // is already written.
+      // a current Thompson timing draw + backoff. Also process any
+      // resolved+approved spawn_soul interventions so newly-spawned souls
+      // are visible to today's plan. Then skip if today's plan is already
+      // written.
       if (task.id === `soul-morning-plan-${MAIN_GROUP_FOLDER}`) {
         if (!groupsDir) return true;
         if (db) {
@@ -443,6 +669,25 @@ export const soulCapability: Capability = {
               { err },
               'Failed to refresh experiment state for morning plan',
             );
+          }
+        }
+        if (lifecycleCtx) {
+          try {
+            const res = processPendingSpawnApprovals(lifecycleCtx);
+            if (res.spawned.length > 0) {
+              logger.info(
+                { spawned: res.spawned },
+                'Spawned souls from approved interventions',
+              );
+            }
+            if (res.errors.length > 0) {
+              logger.warn(
+                { errors: res.errors },
+                'Some spawn_soul approvals failed',
+              );
+            }
+          } catch (err) {
+            logger.error({ err }, 'processPendingSpawnApprovals failed');
           }
         }
         const planPath = path.join(

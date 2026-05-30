@@ -34,8 +34,10 @@ export function buildMorningPlanPrompt(folder: string): string {
 4. Check yesterday's archived plan (if it exists):
    ls /workspace/group/soul/plan-history/ | tail -1
    Read that file if found.
-5. Check for pending interventions:
-   sqlite3 /workspace/project/store/messages.db "SELECT id, content, metadata FROM memory_stream WHERE group_folder = '${folder}' AND type = 'intervention' AND json_extract(metadata, '$.status') = 'pending' ORDER BY timestamp DESC LIMIT 10"
+5. Check for pending interventions across ALL active souls (main + spawned):
+   sqlite3 /workspace/project/store/messages.db "SELECT id, content, metadata, group_folder FROM memory_stream WHERE (group_folder = '${folder}' OR group_folder IN (SELECT folder FROM souls WHERE state = 'active')) AND type = 'intervention' AND json_extract(metadata, '\$.status') = 'pending' ORDER BY timestamp DESC LIMIT 15"
+   Interventions originating from a spawned soul carry a different group_folder than '${folder}' — attribute them to their soul of origin when you surface them. The shared proactive budget still caps the day at the main channel's limit (no multiplication per soul).
+   One special intervention type to know about: \`spawn_soul\` — surfaces a proposal to spawn a dedicated soul for a topic. Carries proposed_folder / proposed_agent_name / proposed_topic_keywords. The owner's reply (resolved + approved=true) triggers host-side spawnSoul on the next morning-plan pass; this prompt only surfaces it.
 6. Read your experiment state: /workspace/group/soul/experiment-state.json
    This is refreshed by the host before each run and carries:
    - \`timing.thompson_ranking\` — arms in preference order (best first) for today

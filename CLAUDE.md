@@ -110,7 +110,7 @@ Memory Stream (SQLite, raw/immutable) → Wiki (markdown files, continuously cur
 | Phase 3: Identity | Done | `IDENTITY_PROMPT.md` | `identity.ts`, `identity-server.ts`, `agent-description.ts` |
 | Phase 4: Planning + Initiative | Done | `PLANNING_PROMPT.md` | `planning-prompts.ts`, `proactive-budget.ts`, tasks: `soul-morning-plan-main`, `soul-check-in-main` |
 | Phase 4.5: Experimentation + Feedback | Done | `EXPERIMENTATION_PROMPT.md` | `timing-bandit.ts`, `experiment-store.ts`; migration `1.1.0` (tables: `experiment_episodes`, `experiment_tuning`); state file: `soul/experiment-state.json` |
-| Phase 5: Claw Pod (A2A) | Not started | Not yet created | `/a2a` endpoint (currently 501) |
+| Phase 5: Soul Protocol (transport-agnostic) | Done | `SOUL_PROTOCOL_PROMPT.md` | `protocol/` (envelope/signing/handler/transport-loopback/agent-card), `soul-registry.ts`, `soul-lifecycle.ts`, `soul-router.ts`; migration `1.2.0` (table: `souls`); per-soul keys at `~/.config/nanoclaw/soul/{folder}/`; in-process LoopbackTransport (IPC/network deferred) |
 
 ### Soul Files
 
@@ -121,7 +121,7 @@ src/capabilities/soul/
   heuristic-score.ts    # heuristicScore() → 1-10
   wiki-scaffold.ts      # ensureWikiForGroup() — creates starter wiki pages
   curator-prompts.ts    # Static prompts for wiki curation + evening journal tasks
-  migrations.ts         # memory_stream + experiment_episodes + experiment_tuning tables
+  migrations.ts         # memory_stream + experiment_episodes + experiment_tuning + souls tables
   identity.ts           # Ed25519 key management, DID document generation
   identity-server.ts    # HTTP server: /.well-known/did.json, agent-description.json
   agent-description.ts  # JSON-LD Agent Description generation
@@ -129,6 +129,18 @@ src/capabilities/soul/
   proactive-budget.ts   # Host-side gate: readBudget(), canSendProactive(), inWithdrawalPeriod()
   timing-bandit.ts      # Beta-Bernoulli arms, Marsaglia–Tsang Gamma sampler, Thompson ranking
   experiment-store.ts   # Episodes/posteriors/efficacy, backoff-state clamp, writeExperimentState, reviewGuardrails
+  soul-registry.ts      # Runtime ActiveSoul registry; loadActiveSouls, resolvePublicKeyByDid
+  soul-lifecycle.ts     # spawnSoul / markDormant / markActive / archive / resurrect / processPendingSpawnApprovals
+  soul-router.ts        # Keyword-based routing of uncurated main observations into spawned souls
+  protocol/
+    canonical.ts        # Recursive-key-sort JSON canonicalization (shared with identity.ts)
+    types.ts            # Verb, MessageEnvelope, SignedMessage, verb body unions + guards
+    envelope.ts         # buildEnvelope, canonicalEnvelopeBytes
+    signing.ts          # signMessage, verifyMessage, REPLAY_TTL_SEC nonce cache
+    transport.ts        # Transport interface
+    transport-loopback.ts # LoopbackTransport (multi-soul, in-process)
+    handler.ts          # handleRequest dispatch over the four verbs, CallerTier
+    agent-card.ts       # v1.2 signed AgentCard
   soul.test.ts          # Unit tests
 ```
 
@@ -153,8 +165,14 @@ src/capabilities/soul/
 
 ### Parent Spec
 
-`SOUL_IDENTITY_PROMPT.md` is the master design document covering Phases 0–5. Individual coding prompts (`WIKI_CURATION_PROMPT.md`, `IDENTITY_PROMPT.md`, `PLANNING_PROMPT.md`) are implementation specs derived from it. `EXPERIMENTATION_PROMPT.md` (Phase 4.5) is an insertion not in the original numbering — it closes the feedback loop Phase 4 left open before Phase 5's peer-networking work, on the principle that a soul that hasn't evaluated its own proactivity has nothing to offer peers.
+`SOUL_IDENTITY_PROMPT.md` is the master design document covering the original Phases 0–5. Individual coding prompts (`WIKI_CURATION_PROMPT.md`, `IDENTITY_PROMPT.md`, `PLANNING_PROMPT.md`) are implementation specs derived from it. Two prompts insert outside the original numbering: `EXPERIMENTATION_PROMPT.md` (Phase 4.5) closes the feedback loop Phase 4 left open, and `SOUL_PROTOCOL_PROMPT.md` (Phase 5, recontextualized) replaces the original "Claw Pod (A2A)" framing with a smaller, transport-agnostic spec — same A2A v1.2 + signed AgentCards + RFC 9421 messages, with v1 implementing only the in-process (loopback) transport. Networked peer-pods become a future-work item, not a load-bearing phase.
 
-### Future: Claw Pod
+### Phase 5 framing notes
 
-Multiple NanoClaw instances connect via did:wba identity. Each has its own soul, wiki, keys. They discover each other via Tailscale DNS or peer list and exchange messages via the `/a2a` endpoint, authenticated by DID signatures. This builds on Phase 3's identity server.
+The original numbering called this "Claw Pod (A2A)" and assumed networked peer-to-peer between different NanoClaw instances as the primary motivation. That framing was retired because the multi-claw use case isn't apparent at this maturity level — a single soul covers most owner needs, and the peer-pod cold-start problem dominates any benefit.
+
+The recontextualized Phase 5 motivates the same protocol stack from a different angle: NanoClaw already supports multiple souls inside one process (`ctx.registeredGroups()`), and the natural next capability is **spawn-on-demand souls** — project souls, topic souls, person-scoped souls — most of them channel-less, speaking through the main soul as **spokesperson** on the single owner channel. The protocol is transport-agnostic: same A2A v1.2 + signed cards + RFC 9421 over an in-process transport in v1, with IPC and networked HTTPS as drop-in transports later. Loopback delivers the use case (intra-process multi-soul coordination); the network transport waits for an external use case to appear.
+
+### Future: Networked Soul Pod
+
+Networked peer-pods between owners on different machines remain a possibility, not a numbered phase. The transport-agnostic protocol means the work to enable them is a single swap (loopback transport → HTTPS transport over Tailscale Funnel). Discovery, public peer lists, ERC-8004 reputation, and AGNTCY directory integration stay deferred indefinitely — they activate if a real cross-owner use case appears, which Phase 4–4.5 soak will tell us.

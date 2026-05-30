@@ -76,3 +76,38 @@ export const experimentMigration: MigrationBundle = {
     `);
   },
 };
+
+// Phase 5: multi-soul host. One row per spawned (non-main) soul.
+// The main soul lives in MAIN_GROUP_FOLDER config and is NOT a row here —
+// keeping it implicit avoids any chicken-and-egg on startup.
+//
+// folder is PRIMARY KEY (must match the on-disk groups/{folder}/ path).
+// state ∈ {'active', 'dormant', 'archived'}; index supports the registry
+// load path which only ever asks for non-archived.
+export const soulsMigration: MigrationBundle = {
+  version: '1.2.0',
+  up: (db) => {
+    db.exec(`
+      CREATE TABLE souls (
+        folder TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        channel_jid TEXT,
+        agent_name TEXT NOT NULL,
+        description TEXT,
+        state TEXT NOT NULL,
+        spawned_at TEXT NOT NULL,
+        state_changed_at TEXT NOT NULL,
+        did TEXT NOT NULL,
+        parent_folder TEXT,
+        spawn_reason TEXT
+      );
+      CREATE INDEX idx_souls_state ON souls(state);
+    `);
+  },
+  down: (db) => {
+    db.exec(`
+      DROP INDEX IF EXISTS idx_souls_state;
+      DROP TABLE IF EXISTS souls;
+    `);
+  },
+};

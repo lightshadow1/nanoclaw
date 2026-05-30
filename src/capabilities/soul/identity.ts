@@ -2,6 +2,8 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { canonicalize } from './protocol/canonical.js';
+
 export interface LoadedKeypair {
   privateKey: crypto.KeyObject;
   publicKey: crypto.KeyObject;
@@ -22,7 +24,9 @@ export function encodeMultibase(bytes: Uint8Array): string {
   return 'z' + base58btcEncode(bytes);
 }
 
-export function encodeEd25519PublicKeyMultibase(rawPublicKey: Uint8Array): string {
+export function encodeEd25519PublicKeyMultibase(
+  rawPublicKey: Uint8Array,
+): string {
   if (rawPublicKey.length !== 32) {
     throw new Error(
       `Ed25519 public key must be 32 bytes, got ${rawPublicKey.length}`,
@@ -61,6 +65,25 @@ function base58btcEncode(bytes: Uint8Array): string {
   return result;
 }
 
+// Path resolution for a soul's keypair directory.
+//
+// Phase 3 stored a single keypair at `~/.config/nanoclaw/soul/` for the main
+// soul. Phase 5 introduces spawned souls; each gets its own subdir. Main is
+// represented as `folder = null` and keeps the legacy path so existing keys
+// require no migration. Spawned souls go in `{base}/{folder}/`.
+//
+// Folder names must be alphanumeric + hyphens (the same constraint enforced
+// at spawn time) — anything that could traverse out of the base dir is
+// rejected here as a defense-in-depth check.
+export function soulKeyDir(homedir: string, folder: string | null): string {
+  const base = path.join(homedir, '.config', 'nanoclaw', 'soul');
+  if (folder === null) return base;
+  if (!/^[a-z0-9-]+$/i.test(folder) || folder === '..' || folder === '.') {
+    throw new Error(`Invalid soul folder name: ${folder}`);
+  }
+  return path.join(base, folder);
+}
+
 export function generateKeypair(keyDir: string): void {
   const privatePath = path.join(keyDir, 'private-key.pem');
   const publicPath = path.join(keyDir, 'public-key.pem');
@@ -68,7 +91,10 @@ export function generateKeypair(keyDir: string): void {
 
   fs.mkdirSync(keyDir, { recursive: true, mode: 0o700 });
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
-  const privatePem = privateKey.export({ format: 'pem', type: 'pkcs8' }) as string;
+  const privatePem = privateKey.export({
+    format: 'pem',
+    type: 'pkcs8',
+  }) as string;
   const publicPem = publicKey.export({ format: 'pem', type: 'spki' }) as string;
 
   fs.writeFileSync(privatePath, privatePem, { mode: 0o600 });
@@ -84,8 +110,12 @@ export function loadKeypair(keyDir: string): LoadedKeypair {
     );
   }
 
-  const privateKey = crypto.createPrivateKey(fs.readFileSync(privatePath, 'utf-8'));
-  const publicKey = crypto.createPublicKey(fs.readFileSync(publicPath, 'utf-8'));
+  const privateKey = crypto.createPrivateKey(
+    fs.readFileSync(privatePath, 'utf-8'),
+  );
+  const publicKey = crypto.createPublicKey(
+    fs.readFileSync(publicPath, 'utf-8'),
+  );
 
   // The last 32 bytes of an Ed25519 SPKI DER-encoded key is the raw public key.
   const spkiDer = publicKey.export({ format: 'der', type: 'spki' });
@@ -133,18 +163,6 @@ export function generateDIDDocument(opts: DIDDocumentInput): object {
   };
 }
 
-function canonicalize(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return '[' + value.map(canonicalize).join(',') + ']';
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
-  return (
-    '{' +
-    keys.map((k) => JSON.stringify(k) + ':' + canonicalize(obj[k])).join(',') +
-    '}'
-  );
-}
-
 export interface SignedDocument {
   [key: string]: unknown;
   'anp:signature': {
@@ -161,9 +179,16 @@ export function signDocument(
   verificationMethodId: string,
   now: Date = new Date(),
 ): SignedDocument {
-  const { 'anp:signature': _ignore, ...unsigned } = document as Record<string, unknown>;
+  const { 'anp:signature': _ignore, ...unsigned } = document as Record<
+    string,
+    unknown
+  >;
   const canonical = canonicalize(unsigned);
-  const signature = crypto.sign(null, Buffer.from(canonical, 'utf-8'), privateKey);
+  const signature = crypto.sign(
+    null,
+    Buffer.from(canonical, 'utf-8'),
+    privateKey,
+  );
   return {
     ...unsigned,
     'anp:signature': {

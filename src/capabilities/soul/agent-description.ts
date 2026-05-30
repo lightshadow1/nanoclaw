@@ -1,6 +1,13 @@
+// Trust tier required to invoke a verb that touches this capability.
+// v1 records the field; enforcement engages when an IPC or network
+// transport assigns callers a tier below `trusted` (loopback callers are
+// always `trusted` so no v1 verb is actually denied in production).
+export type CapabilityTier = 'public' | 'trusted' | 'inner_circle';
+
 export interface DiscoveredCapability {
   name: string;
   description: string;
+  tier: CapabilityTier;
 }
 
 export interface CapabilityDiscoveryInput {
@@ -24,28 +31,41 @@ export function discoverCapabilities(
 
   for (const channel of opts.channelNames) {
     const desc =
-      CHANNEL_DESCRIPTIONS[channel] ?? `Can send and receive ${channel} messages`;
-    out.push({ name: `${channel}-messaging`, description: desc });
+      CHANNEL_DESCRIPTIONS[channel] ??
+      `Can send and receive ${channel} messages`;
+    out.push({
+      name: `${channel}-messaging`,
+      description: desc,
+      tier: 'trusted',
+    });
   }
 
   out.push({
     name: 'web-browsing',
     description:
       'Can browse the web, extract content, fill forms, take screenshots',
+    tier: 'trusted',
   });
   out.push({
     name: 'file-management',
-    description: 'Can read, write, and organize files within sandboxed workspace',
+    description:
+      'Can read, write, and organize files within sandboxed workspace',
+    tier: 'trusted',
   });
+  // shell-execution is the most powerful capability — even a sibling soul
+  // should not invoke it. inner_circle keeps the tier hint structurally
+  // accurate even though enforcement only engages with future transports.
   out.push({
     name: 'shell-execution',
     description: 'Can run bash commands inside an isolated container sandbox',
+    tier: 'inner_circle',
   });
 
   if (opts.hasScheduler) {
     out.push({
       name: 'scheduling',
       description: 'Can create and manage recurring or one-time tasks',
+      tier: 'trusted',
     });
   }
 
@@ -53,6 +73,7 @@ export function discoverCapabilities(
     out.push({
       name: `skill:${skill}`,
       description: `Skill bundled with this agent: ${skill}`,
+      tier: 'trusted',
     });
   }
 
@@ -96,11 +117,14 @@ export function generateAgentDescription(opts: AgentDescriptionInput): object {
       '@type': 'Person',
       name: opts.owner,
     },
-    ...(opts.traits && opts.traits.length > 0 ? { 'anp:traits': opts.traits } : {}),
+    ...(opts.traits && opts.traits.length > 0
+      ? { 'anp:traits': opts.traits }
+      : {}),
     'anp:capabilities': capabilities.map((c) => ({
       '@type': 'anp:Capability',
       name: c.name,
       description: c.description,
+      'anp:tier': c.tier,
     })),
     'anp:protocols': [
       {

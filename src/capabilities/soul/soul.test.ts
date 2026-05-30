@@ -39,7 +39,65 @@ import {
   generateKeypair,
   loadKeypair,
   signDocument,
+  soulKeyDir,
 } from './identity.js';
+import { canonicalize } from './protocol/canonical.js';
+import { buildEnvelope, canonicalEnvelopeBytes } from './protocol/envelope.js';
+import {
+  _resetReplayCacheForTests,
+  REPLAY_TTL_SEC,
+  signMessage,
+  verifyMessage,
+} from './protocol/signing.js';
+import {
+  isGetAgentCardRequest,
+  isProposeInterventionRequest,
+  isQueryStateRequest,
+  isQueryWikiRequest,
+} from './protocol/types.js';
+import type { SignedMessage } from './protocol/types.js';
+import { LoopbackTransport } from './protocol/transport-loopback.js';
+import type { SignedRequestHandler } from './protocol/transport.js';
+import {
+  folderFromDid,
+  handleRequest,
+  LOOPBACK_DEFAULT_TIER,
+  REQUIRED_TIER,
+  type SoulContext,
+} from './protocol/handler.js';
+import {
+  AGENT_CARD_SCHEMA_VERSION,
+  buildAgentCard,
+  buildSignedAgentCard,
+  capabilitiesForCard,
+} from './protocol/agent-card.js';
+import {
+  _clearRegistryForTests,
+  getSoul,
+  listActiveSouls,
+  loadActiveSouls,
+  registerInMemory,
+  resolvePublicKeyByDid,
+  unregisterFromMemory,
+  updateSoulStateInMemory,
+  type ActiveSoul,
+} from './soul-registry.js';
+import {
+  archive,
+  DORMANT_THRESHOLD_DAYS,
+  markActive,
+  markDormant,
+  processPendingSpawnApprovals,
+  resurrect,
+  spawnSoul,
+  SPAWN_REASON_MAX_LEN,
+  type LifecycleContext,
+} from './soul-lifecycle.js';
+import {
+  extractKeywords,
+  routeUncuratedObservationsToSpawnedSouls,
+} from './soul-router.js';
+import { getTaskById as getTaskByIdFn } from '../../db.js';
 import {
   discoverCapabilities,
   generateAgentDescription,
@@ -1270,9 +1328,7 @@ describe('identity server', () => {
     return 18000 + Math.floor(Math.random() * 1000);
   }
 
-  async function fetchJson(
-    p: string,
-  ): Promise<{
+  async function fetchJson(p: string): Promise<{
     status: number;
     headers: http.IncomingHttpHeaders;
     body: string;
@@ -2249,5 +2305,2366 @@ describe('planning-prompts: Phase 4.5 additions', () => {
   it('exports the phase-4.5 tuning constants used in tests', () => {
     expect(DRIFT_ALERT_DELTA).toBeGreaterThan(0);
     expect(EPISODE_DECAY_DAYS).toBeGreaterThan(0);
+  });
+});
+
+// --- Phase 5 souls migration ---
+
+describe('soulKeyDir (Phase 5)', () => {
+  it('returns the legacy base path for the main soul (folder = null)', () => {
+    const dir = soulKeyDir('/home/will', null);
+    expect(dir).toBe('/home/will/.config/nanoclaw/soul');
+  });
+
+  it('returns distinct per-soul subdirs for spawned souls', () => {
+    const a = soulKeyDir('/home/will', 'project-rust');
+    const b = soulKeyDir('/home/will', 'project-scout');
+    expect(a).toBe('/home/will/.config/nanoclaw/soul/project-rust');
+    expect(b).toBe('/home/will/.config/nanoclaw/soul/project-scout');
+    expect(a).not.toBe(b);
+    // Each is under the main keyDir but distinct from it.
+    const main = soulKeyDir('/home/will', null);
+    expect(a.startsWith(main + '/')).toBe(true);
+    expect(a).not.toBe(main);
+  });
+
+  it('rejects path-traversal and reserved folder names', () => {
+    expect(() => soulKeyDir('/home/will', '..')).toThrow(/Invalid soul folder/);
+    expect(() => soulKeyDir('/home/will', '.')).toThrow(/Invalid soul folder/);
+    expect(() => soulKeyDir('/home/will', '../escape')).toThrow(
+      /Invalid soul folder/,
+    );
+    expect(() => soulKeyDir('/home/will', 'has spaces')).toThrow(
+      /Invalid soul folder/,
+    );
+    expect(() => soulKeyDir('/home/will', 'has/slash')).toThrow(
+      /Invalid soul folder/,
+    );
+    expect(() => soulKeyDir('/home/will', '')).toThrow(/Invalid soul folder/);
+  });
+
+  it('preserves main keypair independence from spawned soul keypairs', () => {
+    // Generate a keypair for "main" and a separate one for a spawned soul.
+    // The two must be different keys despite sharing a common ancestor dir.
+    const homedir = path.join(tmpDir, 'home');
+    const mainDir = soulKeyDir(homedir, null);
+    const spawnedDir = soulKeyDir(homedir, 'project-rust');
+    generateKeypair(mainDir);
+    generateKeypair(spawnedDir);
+    const main = loadKeypair(mainDir);
+    const spawned = loadKeypair(spawnedDir);
+    expect(
+      Buffer.from(main.publicKeyRaw).equals(Buffer.from(spawned.publicKeyRaw)),
+    ).toBe(false);
+  });
+});
+
+describe('soulsMigration (Phase 5)', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  it('creates the souls table with the expected columns', () => {
+    const cols = getDb().prepare(`PRAGMA table_info(souls)`).all() as Array<{
+      name: string;
+      notnull: number;
+      pk: number;
+    }>;
+    const byName = Object.fromEntries(cols.map((c) => [c.name, c]));
+
+    expect(byName.folder?.pk).toBe(1); // PRIMARY KEY
+    expect(byName.owner?.notnull).toBe(1);
+    expect(byName.agent_name?.notnull).toBe(1);
+    expect(byName.state?.notnull).toBe(1);
+    expect(byName.spawned_at?.notnull).toBe(1);
+    expect(byName.state_changed_at?.notnull).toBe(1);
+    expect(byName.did?.notnull).toBe(1);
+    // Nullable columns
+    expect(byName.channel_jid?.notnull).toBe(0);
+    expect(byName.description?.notnull).toBe(0);
+    expect(byName.parent_folder?.notnull).toBe(0);
+    expect(byName.spawn_reason?.notnull).toBe(0);
+  });
+
+  it('creates idx_souls_state', () => {
+    const indexes = getDb().prepare(`PRAGMA index_list(souls)`).all() as Array<{
+      name: string;
+    }>;
+    expect(indexes.some((i) => i.name === 'idx_souls_state')).toBe(true);
+  });
+
+  it('accepts a row and partitions by state', () => {
+    const stmt = getDb().prepare(
+      `INSERT INTO souls (folder, owner, agent_name, state,
+                          spawned_at, state_changed_at, did, parent_folder, spawn_reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const now = '2026-05-27T00:00:00Z';
+    stmt.run(
+      'project-rust',
+      'will',
+      'Rust Soul',
+      'active',
+      now,
+      now,
+      'did:wba:host:agent:project-rust',
+      'main',
+      'learning rust',
+    );
+    stmt.run(
+      'project-old',
+      'will',
+      'Old Soul',
+      'archived',
+      now,
+      now,
+      'did:wba:host:agent:project-old',
+      'main',
+      'wrapped up',
+    );
+
+    const active = getDb()
+      .prepare(`SELECT folder FROM souls WHERE state = 'active'`)
+      .all() as Array<{ folder: string }>;
+    expect(active).toEqual([{ folder: 'project-rust' }]);
+  });
+
+  it('rejects duplicate folder names (PRIMARY KEY)', () => {
+    const stmt = getDb().prepare(
+      `INSERT INTO souls (folder, owner, agent_name, state,
+                          spawned_at, state_changed_at, did)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const now = '2026-05-27T00:00:00Z';
+    stmt.run(
+      'proj-x',
+      'will',
+      'X',
+      'active',
+      now,
+      now,
+      'did:wba:host:agent:proj-x',
+    );
+    expect(() =>
+      stmt.run(
+        'proj-x',
+        'will',
+        'X again',
+        'active',
+        now,
+        now,
+        'did:wba:host:agent:proj-x',
+      ),
+    ).toThrow();
+  });
+
+  it('round-trips cleanly via down() then up()', () => {
+    rollbackCapability(getDb(), soulCapability);
+    const dropped = getDb()
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name='souls'`,
+      )
+      .all() as Array<{ name: string }>;
+    expect(dropped.length).toBe(0);
+    runMigrations(getDb(), soulCapability);
+    const recreated = getDb()
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name='souls'`,
+      )
+      .all() as Array<{ name: string }>;
+    expect(recreated.length).toBe(1);
+  });
+});
+
+// --- Phase 5 protocol: canonical + envelope + signing ---
+
+describe('canonicalize (shared with identity.ts)', () => {
+  it('sorts object keys recursively', () => {
+    const a = canonicalize({ b: 1, a: { y: 2, x: 1 } });
+    const b = canonicalize({ a: { x: 1, y: 2 }, b: 1 });
+    expect(a).toBe(b);
+    expect(a).toBe('{"a":{"x":1,"y":2},"b":1}');
+  });
+
+  it('preserves array order', () => {
+    expect(canonicalize([3, 1, 2])).toBe('[3,1,2]');
+  });
+
+  it('handles primitives and null', () => {
+    expect(canonicalize(null)).toBe('null');
+    expect(canonicalize(42)).toBe('42');
+    expect(canonicalize('hi')).toBe('"hi"');
+    expect(canonicalize(true)).toBe('true');
+  });
+});
+
+describe('buildEnvelope', () => {
+  it('fills required fields and generates a UUID id by default', () => {
+    const env = buildEnvelope({
+      from: 'did:wba:host:agent:main',
+      to: 'did:wba:host:agent:rust',
+      verb: 'query_state',
+      body: { what: 'plan' },
+      now: new Date('2026-05-28T12:00:00Z'),
+    });
+    expect(env.from).toBe('did:wba:host:agent:main');
+    expect(env.to).toBe('did:wba:host:agent:rust');
+    expect(env.verb).toBe('query_state');
+    expect(env.body).toEqual({ what: 'plan' });
+    expect(env.ts).toBe('2026-05-28T12:00:00.000Z');
+    expect(env.id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it('honours an explicit id override (for test determinism)', () => {
+    const env = buildEnvelope({
+      from: 'a',
+      to: 'b',
+      verb: 'get_agent_card',
+      body: null,
+      id: 'pinned-id-1',
+    });
+    expect(env.id).toBe('pinned-id-1');
+  });
+
+  it('canonicalEnvelopeBytes is insertion-order independent', () => {
+    const env1 = buildEnvelope({
+      from: 'a',
+      to: 'b',
+      verb: 'query_wiki',
+      body: { page: 'people', other: 'x' },
+      id: 'x',
+      now: new Date('2026-05-28T00:00:00Z'),
+    });
+    // Same structural content, JSON.parse-trip rebuilds keys in arbitrary order
+    const reparsed = JSON.parse(JSON.stringify(env1));
+    expect(
+      canonicalEnvelopeBytes(env1).equals(canonicalEnvelopeBytes(reparsed)),
+    ).toBe(true);
+  });
+});
+
+describe('signMessage + verifyMessage', () => {
+  let mainPriv: crypto.KeyObject;
+  let mainPub: crypto.KeyObject;
+  let attackerPriv: crypto.KeyObject;
+  let attackerPub: crypto.KeyObject;
+
+  beforeEach(() => {
+    _resetReplayCacheForTests();
+    const mainKp = crypto.generateKeyPairSync('ed25519');
+    mainPriv = mainKp.privateKey;
+    mainPub = mainKp.publicKey;
+    const attackerKp = crypto.generateKeyPairSync('ed25519');
+    attackerPriv = attackerKp.privateKey;
+    attackerPub = attackerKp.publicKey;
+  });
+
+  function makeEnvelope(overrides: Partial<{ id: string; to: string }> = {}) {
+    return buildEnvelope({
+      from: 'did:wba:host:agent:main',
+      to: overrides.to ?? 'did:wba:host:agent:rust',
+      verb: 'get_agent_card',
+      body: {},
+      id: overrides.id ?? 'pinned-id-' + Math.random(),
+      now: new Date('2026-05-28T12:00:00Z'),
+    });
+  }
+
+  it('verifies a correctly signed message', () => {
+    const env = makeEnvelope();
+    const signed = signMessage(env, mainPriv, 'did:wba:host:agent:main#key-1');
+    const res = verifyMessage(signed, {
+      resolvePublicKey: () => mainPub,
+      expectedTo: env.to,
+    });
+    expect(res.ok).toBe(true);
+  });
+
+  it('rejects when the envelope was mutated after signing', () => {
+    const env = makeEnvelope();
+    const signed = signMessage(env, mainPriv, 'did:wba:host:agent:main#key-1');
+    const tampered: SignedMessage = {
+      ...signed,
+      envelope: { ...signed.envelope, verb: 'query_wiki' },
+    };
+    const res = verifyMessage(tampered, {
+      resolvePublicKey: () => mainPub,
+      expectedTo: env.to,
+    });
+    expect(res).toEqual({ ok: false, reason: 'invalid_signature' });
+  });
+
+  it('rejects when the signature was made with a different key', () => {
+    const env = makeEnvelope();
+    const signed = signMessage(
+      env,
+      attackerPriv,
+      'did:wba:host:agent:main#key-1',
+    );
+    const res = verifyMessage(signed, {
+      resolvePublicKey: () => mainPub, // claims to be main, but actually attacker signed
+      expectedTo: env.to,
+    });
+    expect(res).toEqual({ ok: false, reason: 'invalid_signature' });
+  });
+
+  it('rejects when the keyId resolves to no public key', () => {
+    const env = makeEnvelope();
+    const signed = signMessage(env, mainPriv, 'did:wba:host:agent:ghost#key-1');
+    const res = verifyMessage(signed, {
+      resolvePublicKey: () => null,
+      expectedTo: env.to,
+    });
+    expect(res).toEqual({ ok: false, reason: 'unknown_key' });
+  });
+
+  it('rejects when envelope.to does not match expectedTo', () => {
+    const env = makeEnvelope({ to: 'did:wba:host:agent:elsewhere' });
+    const signed = signMessage(env, mainPriv, 'did:wba:host:agent:main#key-1');
+    const res = verifyMessage(signed, {
+      resolvePublicKey: () => mainPub,
+      expectedTo: 'did:wba:host:agent:rust',
+    });
+    expect(res).toEqual({ ok: false, reason: 'envelope_to_mismatch' });
+  });
+
+  it('rejects a replay within REPLAY_TTL_SEC', () => {
+    const env = makeEnvelope({ id: 'replay-test-id' });
+    const signed = signMessage(env, mainPriv, 'did:wba:host:agent:main#key-1');
+    const t0 = new Date('2026-05-28T12:00:00Z');
+
+    const first = verifyMessage(signed, {
+      resolvePublicKey: () => mainPub,
+      expectedTo: env.to,
+      now: t0,
+    });
+    expect(first).toEqual({ ok: true });
+
+    const replay = verifyMessage(signed, {
+      resolvePublicKey: () => mainPub,
+      expectedTo: env.to,
+      now: new Date(t0.getTime() + 30 * 1000), // 30s later, still inside TTL
+    });
+    expect(replay).toEqual({ ok: false, reason: 'replay' });
+  });
+
+  it('forgets stale nonces after REPLAY_TTL_SEC so the cache cannot grow forever', () => {
+    const env = makeEnvelope({ id: 'old-id' });
+    const signed = signMessage(env, mainPriv, 'did:wba:host:agent:main#key-1');
+    const t0 = new Date('2026-05-28T12:00:00Z');
+
+    verifyMessage(signed, {
+      resolvePublicKey: () => mainPub,
+      expectedTo: env.to,
+      now: t0,
+    });
+
+    // A *different* later message triggers the sweep, freeing old-id's slot.
+    const later = buildEnvelope({
+      from: env.from,
+      to: env.to,
+      verb: env.verb,
+      body: env.body,
+      id: 'sweeper',
+      now: new Date(t0.getTime() + (REPLAY_TTL_SEC + 5) * 1000),
+    });
+    const laterSigned = signMessage(
+      later,
+      mainPriv,
+      'did:wba:host:agent:main#key-1',
+    );
+    verifyMessage(laterSigned, {
+      resolvePublicKey: () => mainPub,
+      expectedTo: env.to,
+      now: new Date(t0.getTime() + (REPLAY_TTL_SEC + 5) * 1000),
+    });
+
+    // old-id should now be evictable — replaying it works again.
+    const replayOk = verifyMessage(signed, {
+      resolvePublicKey: () => mainPub,
+      expectedTo: env.to,
+      now: new Date(t0.getTime() + (REPLAY_TTL_SEC + 10) * 1000),
+    });
+    expect(replayOk).toEqual({ ok: true });
+  });
+
+  it('rejects a structurally malformed SignedMessage', () => {
+    const broken = { envelope: { id: 'x' } } as unknown as SignedMessage;
+    const res = verifyMessage(broken, {
+      resolvePublicKey: () => mainPub,
+      expectedTo: 'whatever',
+    });
+    expect(res).toEqual({ ok: false, reason: 'malformed' });
+  });
+
+  // Touch the constants/imports so unused-import lint doesn't pull them.
+  it('exports REPLAY_TTL_SEC at a sensible value', () => {
+    expect(REPLAY_TTL_SEC).toBeGreaterThanOrEqual(30);
+    expect(REPLAY_TTL_SEC).toBeLessThanOrEqual(600);
+    // Touch attackerPub to keep TS happy about an unused beforeEach assignment
+    expect(attackerPub).toBeDefined();
+  });
+});
+
+// --- Phase 5 verb body guards (types.ts) ---
+
+describe('verb request guards', () => {
+  describe('isGetAgentCardRequest', () => {
+    it('accepts the empty object', () => {
+      expect(isGetAgentCardRequest({})).toBe(true);
+    });
+
+    it('accepts unknown extra keys (forward-compat)', () => {
+      expect(isGetAgentCardRequest({ version: 'v2' })).toBe(true);
+    });
+
+    it('rejects non-objects', () => {
+      expect(isGetAgentCardRequest(null)).toBe(false);
+      expect(isGetAgentCardRequest(undefined)).toBe(false);
+      expect(isGetAgentCardRequest('hi')).toBe(false);
+      expect(isGetAgentCardRequest([1, 2])).toBe(false);
+    });
+  });
+
+  describe('isQueryWikiRequest', () => {
+    it('accepts a request with a non-empty page name', () => {
+      expect(isQueryWikiRequest({ page: 'people' })).toBe(true);
+    });
+
+    it('rejects missing or empty page', () => {
+      expect(isQueryWikiRequest({})).toBe(false);
+      expect(isQueryWikiRequest({ page: '' })).toBe(false);
+      expect(isQueryWikiRequest({ page: 123 })).toBe(false);
+      expect(isQueryWikiRequest(null)).toBe(false);
+    });
+  });
+
+  describe('isProposeInterventionRequest', () => {
+    it('accepts the minimum required shape', () => {
+      expect(
+        isProposeInterventionRequest({
+          intervention_type: 'approval_needed',
+          question: 'Should I send this?',
+        }),
+      ).toBe(true);
+    });
+
+    it('accepts all optional fields when correctly typed', () => {
+      expect(
+        isProposeInterventionRequest({
+          intervention_type: 'approval_needed',
+          question: 'q?',
+          context: 'because X',
+          options: ['yes', 'no'],
+          priority: 'high',
+          metadata: { source_soul: 'project-rust' },
+        }),
+      ).toBe(true);
+    });
+
+    it('rejects missing intervention_type or question', () => {
+      expect(isProposeInterventionRequest({ question: 'no type field' })).toBe(
+        false,
+      );
+      expect(isProposeInterventionRequest({ intervention_type: 'x' })).toBe(
+        false,
+      );
+      expect(
+        isProposeInterventionRequest({
+          intervention_type: '',
+          question: 'empty type',
+        }),
+      ).toBe(false);
+    });
+
+    it('rejects malformed optional fields', () => {
+      expect(
+        isProposeInterventionRequest({
+          intervention_type: 'x',
+          question: 'q',
+          options: 'should be an array',
+        }),
+      ).toBe(false);
+      expect(
+        isProposeInterventionRequest({
+          intervention_type: 'x',
+          question: 'q',
+          options: ['ok', 42], // mixed types
+        }),
+      ).toBe(false);
+      expect(
+        isProposeInterventionRequest({
+          intervention_type: 'x',
+          question: 'q',
+          priority: 'urgent', // not in the union
+        }),
+      ).toBe(false);
+      expect(
+        isProposeInterventionRequest({
+          intervention_type: 'x',
+          question: 'q',
+          metadata: ['not', 'an', 'object'],
+        }),
+      ).toBe(false);
+    });
+  });
+
+  describe('isQueryStateRequest', () => {
+    it('accepts each declared slice', () => {
+      for (const slice of ['plan_summary', 'recent_episodes', 'backoff']) {
+        expect(isQueryStateRequest({ slice })).toBe(true);
+      }
+    });
+
+    it('rejects an unknown slice or missing field', () => {
+      expect(isQueryStateRequest({ slice: 'wiki' })).toBe(false);
+      expect(isQueryStateRequest({})).toBe(false);
+      expect(isQueryStateRequest({ slice: null })).toBe(false);
+      expect(isQueryStateRequest('plan_summary')).toBe(false);
+    });
+  });
+});
+
+// --- Phase 5 LoopbackTransport ---
+
+describe('LoopbackTransport', () => {
+  // Reusable fake signed message — the transport never inspects body or
+  // signature, it only routes by targetDid.
+  function fakeSigned(toDid: string, payload: unknown = null): SignedMessage {
+    return {
+      envelope: {
+        id: 'env-' + Math.random().toString(36).slice(2),
+        from: 'did:wba:host:agent:main',
+        to: toDid,
+        verb: 'get_agent_card',
+        ts: '2026-05-29T00:00:00.000Z',
+        body: payload,
+      },
+      signature: { alg: 'Ed25519', keyId: 'k1', proof: 'aGk' },
+    };
+  }
+
+  it('routes send() to the matching registered handler and returns its response', async () => {
+    const t = new LoopbackTransport();
+    t.registerSoul('did:wba:host:agent:rust', async (req) => ({
+      ...req,
+      envelope: { ...req.envelope, body: { echoed: req.envelope.body } },
+    }));
+    const req = fakeSigned('did:wba:host:agent:rust', { hello: 'rust' });
+    const res = await t.send('did:wba:host:agent:rust', req);
+    expect((res.envelope.body as { echoed: unknown }).echoed).toEqual({
+      hello: 'rust',
+    });
+  });
+
+  it('throws when sending to an unregistered DID', async () => {
+    const t = new LoopbackTransport();
+    await expect(
+      t.send('did:wba:host:agent:ghost', fakeSigned('x')),
+    ).rejects.toThrow(/no handler/);
+  });
+
+  it('unregisterSoul removes the handler', async () => {
+    const t = new LoopbackTransport();
+    t.registerSoul('did:wba:host:agent:rust', async (req) => req);
+    expect(t.registeredCount()).toBe(1);
+    t.unregisterSoul('did:wba:host:agent:rust');
+    expect(t.registeredCount()).toBe(0);
+    await expect(
+      t.send('did:wba:host:agent:rust', fakeSigned('did:wba:host:agent:rust')),
+    ).rejects.toThrow(/no handler/);
+  });
+
+  it('rejects duplicate DID registration loudly (caught at spawn, not silent overwrite)', () => {
+    const t = new LoopbackTransport();
+    t.registerSoul('did:wba:host:agent:rust', async (req) => req);
+    expect(() =>
+      t.registerSoul('did:wba:host:agent:rust', async (req) => req),
+    ).toThrow(/already registered/);
+  });
+
+  it('keeps concurrent sends isolated per target', async () => {
+    const t = new LoopbackTransport();
+    // Two handlers tag the response with their own DID so we can verify
+    // routing wasn't cross-wired by some shared mutable state.
+    t.registerSoul('did:wba:host:agent:a', async (req) => ({
+      ...req,
+      envelope: { ...req.envelope, body: { from_handler: 'A' } },
+    }));
+    t.registerSoul('did:wba:host:agent:b', async (req) => {
+      // Tiny delay so the two promises interleave.
+      await new Promise((r) => setTimeout(r, 5));
+      return {
+        ...req,
+        envelope: { ...req.envelope, body: { from_handler: 'B' } },
+      };
+    });
+
+    const [rA, rB] = await Promise.all([
+      t.send('did:wba:host:agent:a', fakeSigned('did:wba:host:agent:a')),
+      t.send('did:wba:host:agent:b', fakeSigned('did:wba:host:agent:b')),
+    ]);
+    expect((rA.envelope.body as { from_handler: string }).from_handler).toBe(
+      'A',
+    );
+    expect((rB.envelope.body as { from_handler: string }).from_handler).toBe(
+      'B',
+    );
+  });
+
+  it('onRequest throws — loopback uses registerSoul instead', () => {
+    const t = new LoopbackTransport();
+    expect(() => t.onRequest(async (req) => req)).toThrow(/registerSoul/);
+  });
+});
+
+// --- Phase 5 protocol handler (the four verbs) ---
+
+describe('folderFromDid', () => {
+  it('parses the folder slug out of a well-formed DID', () => {
+    expect(folderFromDid('did:wba:host:agent:project-rust')).toBe(
+      'project-rust',
+    );
+    expect(folderFromDid('did:wba:other:agent:main')).toBe('main');
+  });
+
+  it('returns null when the suffix does not match', () => {
+    expect(folderFromDid('did:wba:host:nonsense')).toBe(null);
+    expect(folderFromDid('not-a-did')).toBe(null);
+    expect(folderFromDid('did:wba:host:agent:has spaces')).toBe(null);
+  });
+});
+
+describe('handleRequest (protocol verbs)', () => {
+  let mainKp: { privateKey: crypto.KeyObject; publicKey: crypto.KeyObject };
+  let receiverDid: string;
+  let receiverFolder: string;
+  let receiverCtx: SoulContext;
+
+  beforeEach(() => {
+    _resetReplayCacheForTests();
+    runMigrations(getDb(), soulCapability);
+    mainKp = crypto.generateKeyPairSync('ed25519');
+    receiverDid = 'did:wba:host:agent:main';
+    receiverFolder = 'main';
+    fs.mkdirSync(path.join(tmpDir, receiverFolder, 'soul', 'wiki'), {
+      recursive: true,
+    });
+    receiverCtx = {
+      did: receiverDid,
+      keyId: `${receiverDid}#key-1`,
+      privateKey: mainKp.privateKey,
+      folder: receiverFolder,
+      agentName: 'Andy',
+      groupsDir: tmpDir,
+      db: getDb(),
+    };
+  });
+
+  // Build a request signed by the caller. The handler doesn't verify
+  // (that's the transport's job before dispatch) but we still sign so the
+  // response's `to` field round-trips correctly.
+  function buildRequest(
+    callerDid: string,
+    callerKp: { privateKey: crypto.KeyObject },
+    verb: import('./protocol/types.js').Verb,
+    body: unknown,
+  ): SignedMessage {
+    const env = buildEnvelope({
+      from: callerDid,
+      to: receiverDid,
+      verb,
+      body,
+      now: new Date('2026-05-29T12:00:00Z'),
+    });
+    return signMessage(env, callerKp.privateKey, `${callerDid}#key-1`);
+  }
+
+  it('REQUIRED_TIER covers every verb', () => {
+    expect(REQUIRED_TIER.get_agent_card).toBeDefined();
+    expect(REQUIRED_TIER.query_wiki).toBeDefined();
+    expect(REQUIRED_TIER.propose_intervention).toBeDefined();
+    expect(REQUIRED_TIER.query_state).toBeDefined();
+  });
+
+  it('LOOPBACK_DEFAULT_TIER is `trusted` per spec §17', () => {
+    expect(LOOPBACK_DEFAULT_TIER).toBe('trusted');
+  });
+
+  it('get_agent_card returns a placeholder card when no provider is wired', async () => {
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    const req = buildRequest(
+      'did:wba:host:agent:rust',
+      callerKp,
+      'get_agent_card',
+      {},
+    );
+    const res = await handleRequest(req, 'public', receiverCtx);
+    const body = res.envelope.body as {
+      card: { did: string; agentName: string; placeholder: boolean };
+    };
+    expect(body.card.did).toBe(receiverDid);
+    expect(body.card.agentName).toBe('Andy');
+    expect(body.card.placeholder).toBe(true);
+    // Response is from receiver, addressed back to caller.
+    expect(res.envelope.from).toBe(receiverDid);
+    expect(res.envelope.to).toBe('did:wba:host:agent:rust');
+    expect(res.signature.keyId).toBe(`${receiverDid}#key-1`);
+  });
+
+  it('get_agent_card delegates to a provider when present', async () => {
+    receiverCtx.getAgentCard = () => ({ custom: 'card-from-step-7' });
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    const req = buildRequest(
+      'did:wba:host:agent:rust',
+      callerKp,
+      'get_agent_card',
+      {},
+    );
+    const res = await handleRequest(req, 'public', receiverCtx);
+    expect(res.envelope.body).toEqual({ card: { custom: 'card-from-step-7' } });
+  });
+
+  it('query_wiki reads a valid page', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, receiverFolder, 'soul', 'wiki', 'people.md'),
+      '# People\n\nAlice prefers brevity.\n',
+      'utf-8',
+    );
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    const req = buildRequest(
+      'did:wba:host:agent:rust',
+      callerKp,
+      'query_wiki',
+      { page: 'people' },
+    );
+    const res = await handleRequest(req, 'trusted', receiverCtx);
+    const body = res.envelope.body as {
+      content: string;
+      lastModifiedMs: number | null;
+    };
+    expect(body.content).toContain('Alice prefers brevity');
+    expect(typeof body.lastModifiedMs).toBe('number');
+  });
+
+  it('query_wiki returns empty for an unknown page (not_found semantics)', async () => {
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    const req = buildRequest(
+      'did:wba:host:agent:rust',
+      callerKp,
+      'query_wiki',
+      { page: 'absent' },
+    );
+    const res = await handleRequest(req, 'trusted', receiverCtx);
+    expect(res.envelope.body).toEqual({ content: '', lastModifiedMs: null });
+  });
+
+  it('query_wiki refuses path-traversal and absolute paths via the slug validator', async () => {
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    for (const bad of [
+      '../escape',
+      '/etc/passwd',
+      'has/slash',
+      'with.dots',
+      '',
+    ]) {
+      const req = buildRequest(
+        'did:wba:host:agent:rust',
+        callerKp,
+        'query_wiki',
+        { page: bad },
+      );
+      const res = await handleRequest(req, 'trusted', receiverCtx);
+      const body = res.envelope.body as { error?: { code: string } };
+      expect(body.error?.code).toBe('bad_request');
+    }
+  });
+
+  it('propose_intervention inserts a properly-tagged row into memory_stream', async () => {
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    const req = buildRequest(
+      'did:wba:host:agent:project-rust',
+      callerKp,
+      'propose_intervention',
+      {
+        intervention_type: 'spawn_followup',
+        question: 'Will committed to 3h/week and missed last week. Surface?',
+        context: 'detected in project-rust memory_stream',
+        priority: 'medium',
+      },
+    );
+    const res = await handleRequest(req, 'trusted', receiverCtx);
+    const body = res.envelope.body as {
+      accepted: boolean;
+      interventionId: string;
+    };
+    expect(body.accepted).toBe(true);
+    expect(body.interventionId).toMatch(/^[0-9a-f-]{36}$/);
+
+    const rows = getUncurated(getDb(), receiverFolder);
+    const inserted = rows.find((r) => r.id === body.interventionId);
+    expect(inserted).toBeDefined();
+    expect(inserted!.type).toBe('intervention');
+    expect(inserted!.source).toBe('spawned-soul');
+    const metadata = JSON.parse(inserted!.metadata!);
+    expect(metadata.intervention_type).toBe('spawn_followup');
+    expect(metadata.status).toBe('pending');
+    expect(metadata.origin_folder).toBe('project-rust');
+    expect(metadata.origin_did).toBe('did:wba:host:agent:project-rust');
+  });
+
+  it('propose_intervention rejects a malformed payload as bad_request', async () => {
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    const req = buildRequest(
+      'did:wba:host:agent:rust',
+      callerKp,
+      'propose_intervention',
+      { intervention_type: 'x' }, // missing question
+    );
+    const res = await handleRequest(req, 'trusted', receiverCtx);
+    expect((res.envelope.body as { error: { code: string } }).error.code).toBe(
+      'bad_request',
+    );
+  });
+
+  it('query_state returns plan_summary even when no plan file exists', async () => {
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    const req = buildRequest(
+      'did:wba:host:agent:rust',
+      callerKp,
+      'query_state',
+      { slice: 'plan_summary' },
+    );
+    const res = await handleRequest(req, 'trusted', receiverCtx);
+    expect(res.envelope.body).toEqual({
+      slice: 'plan_summary',
+      date: null,
+      itemCount: 0,
+      notes: null,
+    });
+  });
+
+  it('query_state plan_summary reads an existing plan and returns count + notes', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, receiverFolder, 'soul', 'daily-plan.json'),
+      JSON.stringify({
+        date: '2026-05-29',
+        items: [{ id: 'a' }, { id: 'b' }, { id: 'c' }],
+        notes: 'busy day',
+      }),
+      'utf-8',
+    );
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    const req = buildRequest(
+      'did:wba:host:agent:rust',
+      callerKp,
+      'query_state',
+      { slice: 'plan_summary' },
+    );
+    const res = await handleRequest(req, 'trusted', receiverCtx);
+    expect(res.envelope.body).toEqual({
+      slice: 'plan_summary',
+      date: '2026-05-29',
+      itemCount: 3,
+      notes: 'busy day',
+    });
+  });
+
+  it('query_state recent_episodes returns sanitized episode rows', async () => {
+    getDb()
+      .prepare(
+        `INSERT INTO experiment_episodes
+           (id, group_folder, plan_item_id, target, timing_arm, sent_at,
+            message_excerpt, outcome, sentiment, proximal_window_min, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        crypto.randomUUID(),
+        receiverFolder,
+        null,
+        'Alice',
+        'evening',
+        new Date(Date.now() - 86_400_000).toISOString(),
+        'hi',
+        'replied',
+        'positive',
+        90,
+        new Date().toISOString(),
+      );
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    const req = buildRequest(
+      'did:wba:host:agent:rust',
+      callerKp,
+      'query_state',
+      { slice: 'recent_episodes' },
+    );
+    const res = await handleRequest(req, 'trusted', receiverCtx);
+    const body = res.envelope.body as {
+      slice: 'recent_episodes';
+      episodes: Array<Record<string, unknown>>;
+    };
+    expect(body.slice).toBe('recent_episodes');
+    expect(body.episodes.length).toBe(1);
+    // Only the contract fields are exposed.
+    expect(Object.keys(body.episodes[0]).sort()).toEqual(
+      ['outcome', 'sent_at', 'sentiment', 'target', 'timing_arm'].sort(),
+    );
+  });
+
+  it('query_state backoff strips internal fields like `since`', async () => {
+    getDb()
+      .prepare(
+        `INSERT INTO experiment_tuning
+           (id, group_folder, version, state_json, baseline_efficacy, created_at, active)
+         VALUES (?, ?, ?, ?, ?, ?, 1)`,
+      )
+      .run(
+        crypto.randomUUID(),
+        receiverFolder,
+        1,
+        JSON.stringify({
+          targets: {
+            Alice: { outreach_multiplier: 0.5, since: '2026-04-01T00:00:00Z' },
+          },
+        }),
+        0.5,
+        new Date().toISOString(),
+      );
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    const req = buildRequest(
+      'did:wba:host:agent:rust',
+      callerKp,
+      'query_state',
+      { slice: 'backoff' },
+    );
+    const res = await handleRequest(req, 'trusted', receiverCtx);
+    const body = res.envelope.body as {
+      slice: 'backoff';
+      targets: Record<string, Record<string, unknown>>;
+    };
+    expect(body.targets.Alice).toEqual({ outreach_multiplier: 0.5 });
+    // `since` must not be in the public response.
+    expect('since' in body.targets.Alice).toBe(false);
+  });
+
+  it('returns forbidden when caller tier is below the verb requirement (403-style)', async () => {
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    const req = buildRequest(
+      'did:wba:host:agent:rust',
+      callerKp,
+      'query_state',
+      { slice: 'plan_summary' },
+    );
+    // 'public' is below the 'trusted' requirement for query_state.
+    const res = await handleRequest(req, 'public', receiverCtx);
+    const body = res.envelope.body as {
+      error: { code: string; message: string };
+    };
+    expect(body.error.code).toBe('forbidden');
+    expect(body.error.message).toContain('trusted');
+  });
+
+  it('response envelope is signed by the receiver and addressed back to the caller', async () => {
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    const callerDid = 'did:wba:host:agent:rust';
+    const req = buildRequest(
+      callerKp ? callerDid : '',
+      callerKp,
+      'get_agent_card',
+      {},
+    );
+    const res = await handleRequest(req, 'public', receiverCtx);
+
+    // Verify the response signature using the receiver's public key.
+    const verifyRes = verifyMessage(res, {
+      resolvePublicKey: () => mainKp.publicKey,
+      expectedTo: callerDid,
+    });
+    expect(verifyRes).toEqual({ ok: true });
+  });
+});
+
+// --- Phase 5 agent-card (v1.2 signed AgentCard) ---
+
+describe('discoverCapabilities tier assignment (Phase 5 addition)', () => {
+  it('tags shell-execution as inner_circle and the rest as trusted', () => {
+    const caps = discoverCapabilities({
+      channelNames: ['whatsapp'],
+      skillNames: ['add-soul'],
+      hasScheduler: true,
+    });
+    const byName = Object.fromEntries(caps.map((c) => [c.name, c]));
+    expect(byName['shell-execution'].tier).toBe('inner_circle');
+    expect(byName['web-browsing'].tier).toBe('trusted');
+    expect(byName['file-management'].tier).toBe('trusted');
+    expect(byName['whatsapp-messaging'].tier).toBe('trusted');
+    expect(byName['scheduling'].tier).toBe('trusted');
+    expect(byName['skill:add-soul'].tier).toBe('trusted');
+  });
+
+  it('generateAgentDescription propagates tier as anp:tier on each capability', () => {
+    const desc = generateAgentDescription({
+      domain: 'host',
+      agentName: 'Andy',
+      owner: 'Will',
+      channelNames: [],
+      skillNames: [],
+      hasScheduler: false,
+    }) as { 'anp:capabilities': Array<{ name: string; 'anp:tier': string }> };
+    for (const c of desc['anp:capabilities']) {
+      expect(typeof c['anp:tier']).toBe('string');
+    }
+    const shell = desc['anp:capabilities'].find(
+      (c) => c.name === 'shell-execution',
+    );
+    expect(shell?.['anp:tier']).toBe('inner_circle');
+  });
+});
+
+describe('buildAgentCard / buildSignedAgentCard', () => {
+  let kp: { privateKey: crypto.KeyObject; publicKey: crypto.KeyObject };
+  let publicKeyRaw: Uint8Array;
+
+  beforeEach(() => {
+    const keyDir = path.join(tmpDir, 'agent-card-keys');
+    generateKeypair(keyDir);
+    const loaded = loadKeypair(keyDir);
+    kp = { privateKey: loaded.privateKey, publicKey: loaded.publicKey };
+    publicKeyRaw = loaded.publicKeyRaw;
+  });
+
+  it('builds an unsigned card with the expected v1.2 shape', () => {
+    const card = buildAgentCard({
+      did: 'did:wba:host:agent:main',
+      agentName: 'Andy',
+      owner: 'Will',
+      capabilities: [
+        { name: 'web-browsing', description: 'browse', tier: 'trusted' },
+      ],
+      publicKeyRaw,
+      verificationMethodId: 'did:wba:host:agent:main#key-1',
+      now: new Date('2026-05-29T00:00:00Z'),
+    });
+    expect(card.schemaVersion).toBe(AGENT_CARD_SCHEMA_VERSION);
+    expect(card.did).toBe('did:wba:host:agent:main');
+    expect(card.name).toBe('Andy');
+    expect(card.owner).toBe('Will');
+    expect(card.endpoints).toEqual({ a2a: 'loopback' });
+    expect((card.publicKey as { keyId: string }).keyId).toBe(
+      'did:wba:host:agent:main#key-1',
+    );
+    expect(
+      (card.publicKey as { publicKeyMultibase: string }).publicKeyMultibase,
+    ).toMatch(/^z6Mk/);
+    expect(card.createdAt).toBe('2026-05-29T00:00:00.000Z');
+    // Description defaults from owner when omitted.
+    expect((card.description as string).includes('Will')).toBe(true);
+  });
+
+  it('honours an explicit endpoint, description, and traits', () => {
+    const card = buildAgentCard({
+      did: 'did:wba:host:agent:main',
+      agentName: 'Andy',
+      owner: 'Will',
+      description: 'custom desc',
+      traits: ['warm', 'terse'],
+      capabilities: [],
+      publicKeyRaw,
+      verificationMethodId: 'did:wba:host:agent:main#key-1',
+      endpoint: 'https://host.tail.example/a2a',
+    });
+    expect(card.description).toBe('custom desc');
+    expect(card.traits).toEqual(['warm', 'terse']);
+    expect(card.endpoints).toEqual({ a2a: 'https://host.tail.example/a2a' });
+  });
+
+  it('omits traits when none provided (no empty array key in the signed payload)', () => {
+    const card = buildAgentCard({
+      did: 'did:wba:host:agent:main',
+      agentName: 'Andy',
+      owner: 'Will',
+      capabilities: [],
+      publicKeyRaw,
+      verificationMethodId: 'did:wba:host:agent:main#key-1',
+    });
+    expect('traits' in card).toBe(false);
+  });
+
+  it('signed card has a verifiable Ed25519 proof (re-canonicalize + verify)', () => {
+    const signed = buildSignedAgentCard(
+      {
+        did: 'did:wba:host:agent:main',
+        agentName: 'Andy',
+        owner: 'Will',
+        capabilities: [
+          { name: 'web-browsing', description: 'browse', tier: 'trusted' },
+        ],
+        publicKeyRaw,
+        verificationMethodId: 'did:wba:host:agent:main#key-1',
+        now: new Date('2026-05-29T00:00:00Z'),
+      },
+      kp.privateKey,
+    );
+
+    // Strip the signature and re-canonicalize, then verify the proof bytes
+    // against the receiver's public key — the same path a peer soul would
+    // take to validate an inbound AgentCard.
+    const { 'anp:signature': sig, ...unsigned } = signed as Record<
+      string,
+      unknown
+    >;
+    const sigObj = sig as { proofValue: string; verificationMethod: string };
+    expect(sigObj.verificationMethod).toBe('did:wba:host:agent:main#key-1');
+
+    const proof = Buffer.from(sigObj.proofValue, 'base64url');
+    const canonical = canonicalize(unsigned);
+    const ok = crypto.verify(
+      null,
+      Buffer.from(canonical, 'utf-8'),
+      kp.publicKey,
+      proof,
+    );
+    expect(ok).toBe(true);
+  });
+
+  it('signed card from one soul does NOT verify against a different soul key', () => {
+    const otherKp = crypto.generateKeyPairSync('ed25519');
+    const signed = buildSignedAgentCard(
+      {
+        did: 'did:wba:host:agent:main',
+        agentName: 'Andy',
+        owner: 'Will',
+        capabilities: [],
+        publicKeyRaw,
+        verificationMethodId: 'did:wba:host:agent:main#key-1',
+      },
+      kp.privateKey,
+    );
+    const { 'anp:signature': sig, ...unsigned } = signed as Record<
+      string,
+      unknown
+    >;
+    const sigObj = sig as { proofValue: string };
+    const proof = Buffer.from(sigObj.proofValue, 'base64url');
+    const canonical = canonicalize(unsigned);
+    const ok = crypto.verify(
+      null,
+      Buffer.from(canonical, 'utf-8'),
+      otherKp.publicKey,
+      proof,
+    );
+    expect(ok).toBe(false);
+  });
+});
+
+describe('capabilitiesForCard adapter', () => {
+  it('strips DiscoveredCapability down to the AgentCard contract', () => {
+    const discovered = discoverCapabilities({
+      channelNames: ['whatsapp'],
+      skillNames: [],
+      hasScheduler: false,
+    });
+    const cardCaps = capabilitiesForCard(discovered);
+    expect(cardCaps.length).toBe(discovered.length);
+    for (const c of cardCaps) {
+      expect(Object.keys(c).sort()).toEqual(
+        ['description', 'name', 'tier'].sort(),
+      );
+    }
+  });
+});
+
+describe('handleRequest get_agent_card with a signed-card provider (integration)', () => {
+  it('returns the signed AgentCard from the wired provider', async () => {
+    runMigrations(getDb(), soulCapability);
+    _resetReplayCacheForTests();
+    const mainKp = crypto.generateKeyPairSync('ed25519');
+    const keyDir = path.join(tmpDir, 'integration-keys');
+    generateKeypair(keyDir);
+    const loaded = loadKeypair(keyDir);
+    const receiverDid = 'did:wba:host:agent:main';
+
+    const signedCard = buildSignedAgentCard(
+      {
+        did: receiverDid,
+        agentName: 'Andy',
+        owner: 'Will',
+        capabilities: [
+          { name: 'web-browsing', description: 'browse', tier: 'trusted' },
+        ],
+        publicKeyRaw: loaded.publicKeyRaw,
+        verificationMethodId: `${receiverDid}#key-1`,
+      },
+      loaded.privateKey,
+    );
+
+    fs.mkdirSync(path.join(tmpDir, 'main', 'soul', 'wiki'), {
+      recursive: true,
+    });
+    const receiverCtx: SoulContext = {
+      did: receiverDid,
+      keyId: `${receiverDid}#key-1`,
+      privateKey: mainKp.privateKey,
+      folder: 'main',
+      agentName: 'Andy',
+      groupsDir: tmpDir,
+      db: getDb(),
+      getAgentCard: () => signedCard,
+    };
+
+    const callerDid = 'did:wba:host:agent:rust';
+    const env = buildEnvelope({
+      from: callerDid,
+      to: receiverDid,
+      verb: 'get_agent_card',
+      body: {},
+    });
+    const callerKp = crypto.generateKeyPairSync('ed25519');
+    const req = signMessage(env, callerKp.privateKey, `${callerDid}#key-1`);
+
+    const res = await handleRequest(req, 'public', receiverCtx);
+    const body = res.envelope.body as { card: typeof signedCard };
+    expect(body.card.schemaVersion).toBe(AGENT_CARD_SCHEMA_VERSION);
+    expect(body.card.did).toBe(receiverDid);
+    expect('anp:signature' in body.card).toBe(true);
+  });
+});
+
+// --- Phase 5 soul-registry ---
+
+describe('soul-registry', () => {
+  // Build a test ActiveSoul backed by a real keypair on disk under tmpDir.
+  function makeSoul(
+    folder: string,
+    state: ActiveSoul['state'] = 'active',
+  ): ActiveSoul {
+    // Use a path that matches soulKeyDir's expectations — main's keypair
+    // lives at <homedir>/.config/nanoclaw/soul, spawned souls at
+    // <homedir>/.config/nanoclaw/soul/{folder}.
+    const keyDir =
+      folder === 'main'
+        ? path.join(tmpDir, '.config', 'nanoclaw', 'soul')
+        : path.join(tmpDir, '.config', 'nanoclaw', 'soul', folder);
+    generateKeypair(keyDir);
+    const loaded = loadKeypair(keyDir);
+    return {
+      folder,
+      agentName: folder === 'main' ? 'Andy' : `${folder} soul`,
+      did: `did:wba:host:agent:${folder}`,
+      privateKey: loaded.privateKey,
+      publicKey: loaded.publicKey,
+      channelJid: folder === 'main' ? 'main@chat' : null,
+      state,
+    };
+  }
+
+  function insertSoulRow(
+    folder: string,
+    state: ActiveSoul['state'] = 'active',
+  ): void {
+    const now = '2026-05-29T00:00:00Z';
+    getDb()
+      .prepare(
+        `INSERT INTO souls (folder, owner, channel_jid, agent_name, state,
+                            spawned_at, state_changed_at, did, parent_folder, spawn_reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        folder,
+        'will',
+        null,
+        `${folder} soul`,
+        state,
+        now,
+        now,
+        `did:wba:host:agent:${folder}`,
+        'main',
+        'test',
+      );
+  }
+
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+    _clearRegistryForTests();
+  });
+
+  it('loadActiveSouls registers main even with no `souls` rows', () => {
+    const main = makeSoul('main');
+    const map = loadActiveSouls(getDb(), tmpDir, main);
+    expect(map.size).toBe(1);
+    expect(getSoul('main')).toEqual(main);
+  });
+
+  it('loadActiveSouls includes active and dormant rows, excludes archived', () => {
+    insertSoulRow('project-rust', 'active');
+    insertSoulRow('project-old', 'dormant');
+    insertSoulRow('project-gone', 'archived');
+    // Keypairs need to exist on disk for the loader; make them.
+    makeSoul('project-rust', 'active');
+    makeSoul('project-old', 'dormant');
+    // project-gone is archived — we don't need its key.
+
+    const main = makeSoul('main');
+    loadActiveSouls(getDb(), tmpDir, main);
+
+    expect(getSoul('main')).not.toBeNull();
+    expect(getSoul('project-rust')?.state).toBe('active');
+    expect(getSoul('project-old')?.state).toBe('dormant');
+    expect(getSoul('project-gone')).toBeNull();
+  });
+
+  it('loadActiveSouls skips rows whose keypair is missing on disk', () => {
+    insertSoulRow('project-orphan', 'active');
+    // Deliberately do NOT call makeSoul for project-orphan — its key dir
+    // does not exist, so loadKeypair throws.
+    const main = makeSoul('main');
+    loadActiveSouls(getDb(), tmpDir, main);
+    expect(getSoul('project-orphan')).toBeNull();
+    // Main is still loaded — one bad row doesn't tank the boot.
+    expect(getSoul('main')).not.toBeNull();
+  });
+
+  it('getSoul returns null for an unknown folder', () => {
+    loadActiveSouls(getDb(), tmpDir, makeSoul('main'));
+    expect(getSoul('does-not-exist')).toBeNull();
+  });
+
+  it('listActiveSouls returns only state=active souls', () => {
+    insertSoulRow('rust', 'active');
+    insertSoulRow('quiet', 'dormant');
+    makeSoul('rust', 'active');
+    makeSoul('quiet', 'dormant');
+    loadActiveSouls(getDb(), tmpDir, makeSoul('main'));
+
+    const active = listActiveSouls();
+    const folders = active.map((s) => s.folder).sort();
+    expect(folders).toEqual(['main', 'rust']);
+    // Dormant excluded.
+    expect(folders).not.toContain('quiet');
+  });
+
+  it('resolvePublicKeyByDid returns the matching public key', () => {
+    const main = makeSoul('main');
+    loadActiveSouls(getDb(), tmpDir, main);
+    const pub = resolvePublicKeyByDid('did:wba:host:agent:main');
+    expect(pub).toBe(main.publicKey);
+  });
+
+  it('resolvePublicKeyByDid returns null for an unknown DID', () => {
+    loadActiveSouls(getDb(), tmpDir, makeSoul('main'));
+    expect(resolvePublicKeyByDid('did:wba:host:agent:ghost')).toBeNull();
+  });
+
+  it('round-trip: registerInMemory → listed → unregisterFromMemory → omitted → re-register', () => {
+    loadActiveSouls(getDb(), tmpDir, makeSoul('main'));
+
+    const rust = makeSoul('rust', 'active');
+    registerInMemory(rust);
+    expect(getSoul('rust')).toEqual(rust);
+    expect(
+      listActiveSouls()
+        .map((s) => s.folder)
+        .sort(),
+    ).toEqual(['main', 'rust']);
+
+    // Archive: unregister, registry omits it.
+    unregisterFromMemory('rust');
+    expect(getSoul('rust')).toBeNull();
+    expect(listActiveSouls().map((s) => s.folder)).toEqual(['main']);
+
+    // Resurrect: re-register, back in the list.
+    registerInMemory(rust);
+    expect(getSoul('rust')).toEqual(rust);
+    expect(
+      listActiveSouls()
+        .map((s) => s.folder)
+        .sort(),
+    ).toEqual(['main', 'rust']);
+  });
+
+  it('registerInMemory throws on duplicate folder (caught at lifecycle layer)', () => {
+    loadActiveSouls(getDb(), tmpDir, makeSoul('main'));
+    expect(() => registerInMemory(makeSoul('main'))).toThrow(
+      /already in registry/,
+    );
+  });
+
+  it('updateSoulStateInMemory flips state and listActiveSouls reflects it', () => {
+    insertSoulRow('rust', 'active');
+    makeSoul('rust', 'active');
+    loadActiveSouls(getDb(), tmpDir, makeSoul('main'));
+    expect(
+      listActiveSouls()
+        .map((s) => s.folder)
+        .sort(),
+    ).toEqual(['main', 'rust']);
+
+    updateSoulStateInMemory('rust', 'dormant');
+    expect(getSoul('rust')?.state).toBe('dormant');
+    expect(listActiveSouls().map((s) => s.folder)).toEqual(['main']);
+
+    updateSoulStateInMemory('rust', 'active');
+    expect(
+      listActiveSouls()
+        .map((s) => s.folder)
+        .sort(),
+    ).toEqual(['main', 'rust']);
+  });
+
+  it('updateSoulStateInMemory throws when the folder is not in the registry', () => {
+    loadActiveSouls(getDb(), tmpDir, makeSoul('main'));
+    expect(() => updateSoulStateInMemory('absent', 'dormant')).toThrow(
+      /not in registry/,
+    );
+  });
+});
+
+// --- Phase 5 soul-lifecycle ---
+
+describe('soul-lifecycle', () => {
+  let lifecycleCtx: LifecycleContext;
+  let transport: LoopbackTransport;
+  let mainSoul: ActiveSoul;
+
+  function buildMainSoul(): ActiveSoul {
+    const keyDir = path.join(tmpDir, '.config', 'nanoclaw', 'soul');
+    generateKeypair(keyDir);
+    const loaded = loadKeypair(keyDir);
+    return {
+      folder: 'main',
+      agentName: 'Andy',
+      did: 'did:wba:host:agent:main',
+      privateKey: loaded.privateKey,
+      publicKey: loaded.publicKey,
+      channelJid: 'main@chat',
+      state: 'active',
+    };
+  }
+
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+    _clearRegistryForTests();
+    fs.mkdirSync(path.join(tmpDir, 'main', 'soul', 'wiki'), {
+      recursive: true,
+    });
+    transport = new LoopbackTransport();
+    mainSoul = buildMainSoul();
+    // Stub handler factory — echoes envelopes back. Tests don't exercise
+    // the real verify+handle stack here; that's covered by handler tests.
+    const buildSoulHandler =
+      (_soul: ActiveSoul) => async (req: SignedMessage) =>
+        req;
+    lifecycleCtx = {
+      db: getDb(),
+      homedir: tmpDir,
+      groupsDir: tmpDir,
+      domain: 'host',
+      mainFolder: 'main',
+      transport,
+      buildSoulHandler,
+    };
+    loadActiveSouls(getDb(), tmpDir, mainSoul);
+    transport.registerSoul(mainSoul.did, buildSoulHandler(mainSoul));
+  });
+
+  it('exports the spec §17 constants', () => {
+    expect(DORMANT_THRESHOLD_DAYS).toBe(30);
+    expect(SPAWN_REASON_MAX_LEN).toBe(500);
+  });
+
+  it('spawnSoul rejects reserved folder names (main)', () => {
+    expect(() =>
+      spawnSoul(lifecycleCtx, {
+        folder: 'main',
+        agentName: 'X',
+        parentFolder: 'main',
+        spawnReason: 'try to clobber main',
+      }),
+    ).toThrow(/Reserved folder/);
+  });
+
+  it('spawnSoul rejects invalid folder slugs', () => {
+    expect(() =>
+      spawnSoul(lifecycleCtx, {
+        folder: 'has spaces',
+        agentName: 'X',
+        parentFolder: 'main',
+        spawnReason: 'r',
+      }),
+    ).toThrow(/Invalid folder slug/);
+    expect(() =>
+      spawnSoul(lifecycleCtx, {
+        folder: 'has/slash',
+        agentName: 'X',
+        parentFolder: 'main',
+        spawnReason: 'r',
+      }),
+    ).toThrow(/Invalid folder slug/);
+  });
+
+  it('spawnSoul rejects duplicate folder names', () => {
+    spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust',
+      parentFolder: 'main',
+      spawnReason: 'rust is a project',
+    });
+    expect(() =>
+      spawnSoul(lifecycleCtx, {
+        folder: 'project-rust',
+        agentName: 'Rust Again',
+        parentFolder: 'main',
+        spawnReason: 'second attempt',
+      }),
+    ).toThrow(/Soul already exists/);
+  });
+
+  it('spawnSoul rejects empty or oversized spawn reasons', () => {
+    expect(() =>
+      spawnSoul(lifecycleCtx, {
+        folder: 'a',
+        agentName: 'X',
+        parentFolder: 'main',
+        spawnReason: '',
+      }),
+    ).toThrow(/spawnReason must not be empty/);
+    expect(() =>
+      spawnSoul(lifecycleCtx, {
+        folder: 'b',
+        agentName: 'X',
+        parentFolder: 'main',
+        spawnReason: 'x'.repeat(SPAWN_REASON_MAX_LEN + 1),
+      }),
+    ).toThrow(/SPAWN_REASON_MAX_LEN/);
+  });
+
+  it('spawnSoul creates wiki scaffold, per-soul key dir, souls row, registers in transport + registry, and schedules a curator task', () => {
+    const soul = spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust Soul',
+      parentFolder: 'main',
+      spawnReason: 'learning rust',
+    });
+
+    // Wiki scaffold exists.
+    expect(
+      fs.existsSync(
+        path.join(tmpDir, 'project-rust', 'soul', 'wiki', '_index.md'),
+      ),
+    ).toBe(true);
+
+    // Per-soul key dir is distinct from main's.
+    const mainKeyDir = path.join(tmpDir, '.config', 'nanoclaw', 'soul');
+    const spawnedKeyDir = path.join(
+      tmpDir,
+      '.config',
+      'nanoclaw',
+      'soul',
+      'project-rust',
+    );
+    expect(spawnedKeyDir).not.toBe(mainKeyDir);
+    expect(fs.existsSync(path.join(spawnedKeyDir, 'private-key.pem'))).toBe(
+      true,
+    );
+
+    // DB row.
+    const row = getDb()
+      .prepare(`SELECT * FROM souls WHERE folder = ?`)
+      .get('project-rust') as {
+      folder: string;
+      state: string;
+      did: string;
+      agent_name: string;
+    };
+    expect(row.state).toBe('active');
+    expect(row.did).toBe('did:wba:host:agent:project-rust');
+    expect(row.agent_name).toBe('Rust Soul');
+
+    // Registry + transport know about it.
+    expect(getSoul('project-rust')).not.toBeNull();
+    expect(soul.did).toBe('did:wba:host:agent:project-rust');
+    // Loopback can route to its DID.
+    expect(transport.registeredCount()).toBeGreaterThanOrEqual(2); // main + project-rust
+
+    // Curator task scheduled at the lighter 6h cadence.
+    const task = getTaskByIdFn('soul-wiki-curation-project-rust');
+    expect(task?.schedule_value).toBe(String(6 * 60 * 60 * 1000));
+    expect(task?.status).toBe('active');
+  });
+
+  it('two spawned souls get distinct key directories', () => {
+    spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust',
+      parentFolder: 'main',
+      spawnReason: 'learning rust',
+    });
+    spawnSoul(lifecycleCtx, {
+      folder: 'project-scout',
+      agentName: 'Scout',
+      parentFolder: 'main',
+      spawnReason: 'topic scouting for AI news',
+    });
+    const rustKey = path.join(
+      tmpDir,
+      '.config',
+      'nanoclaw',
+      'soul',
+      'project-rust',
+      'private-key.pem',
+    );
+    const scoutKey = path.join(
+      tmpDir,
+      '.config',
+      'nanoclaw',
+      'soul',
+      'project-scout',
+      'private-key.pem',
+    );
+    expect(fs.readFileSync(rustKey, 'utf-8')).not.toBe(
+      fs.readFileSync(scoutKey, 'utf-8'),
+    );
+  });
+
+  it('seedFromMainTopics copies wiki pages with attribution comment', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main', 'soul', 'wiki', 'people.md'),
+      '# People\n\nAlice likes brevity.\n',
+      'utf-8',
+    );
+    spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust',
+      parentFolder: 'main',
+      spawnReason: 'rust',
+      seedFromMainTopics: ['people'],
+    });
+    const seeded = fs.readFileSync(
+      path.join(tmpDir, 'project-rust', 'soul', 'wiki', 'people.md'),
+      'utf-8',
+    );
+    expect(seeded).toContain('seeded from main wiki');
+    expect(seeded).toContain('Alice likes brevity');
+  });
+
+  it('markDormant updates row + pauses tasks + keeps transport registration', () => {
+    const soul = spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust',
+      parentFolder: 'main',
+      spawnReason: 'rust',
+    });
+    markDormant(lifecycleCtx, 'project-rust');
+
+    const row = getDb()
+      .prepare(`SELECT state FROM souls WHERE folder = 'project-rust'`)
+      .get() as { state: string };
+    expect(row.state).toBe('dormant');
+    expect(getSoul('project-rust')?.state).toBe('dormant');
+
+    const task = getTaskByIdFn('soul-wiki-curation-project-rust');
+    expect(task?.status).toBe('paused');
+
+    // Transport still registered — dormant souls are still queryable.
+    expect(() => transport.registerSoul(soul.did, async (req) => req)).toThrow(
+      /already registered/,
+    );
+  });
+
+  it('markActive resumes a dormant soul', () => {
+    spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust',
+      parentFolder: 'main',
+      spawnReason: 'rust',
+    });
+    markDormant(lifecycleCtx, 'project-rust');
+    markActive(lifecycleCtx, 'project-rust');
+
+    expect(getSoul('project-rust')?.state).toBe('active');
+    expect(getTaskByIdFn('soul-wiki-curation-project-rust')?.status).toBe(
+      'active',
+    );
+  });
+
+  it('markDormant/archive refuse to touch main', () => {
+    expect(() => markDormant(lifecycleCtx, 'main')).toThrow(
+      /Cannot make the main soul dormant/,
+    );
+    expect(() => archive(lifecycleCtx, 'main')).toThrow(
+      /Cannot archive the main soul/,
+    );
+  });
+
+  it('archive removes from registry + transport, pauses tasks, marks row', () => {
+    const soul = spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust',
+      parentFolder: 'main',
+      spawnReason: 'rust',
+    });
+    archive(lifecycleCtx, 'project-rust');
+
+    const row = getDb()
+      .prepare(`SELECT state FROM souls WHERE folder = 'project-rust'`)
+      .get() as { state: string };
+    expect(row.state).toBe('archived');
+    expect(getSoul('project-rust')).toBeNull();
+    expect(getTaskByIdFn('soul-wiki-curation-project-rust')?.status).toBe(
+      'paused',
+    );
+    // Transport now has the DID slot free — registering again works.
+    expect(() =>
+      transport.registerSoul(soul.did, async (req) => req),
+    ).not.toThrow();
+  });
+
+  it('resurrect restores an archived soul to active state', () => {
+    spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust',
+      parentFolder: 'main',
+      spawnReason: 'rust',
+    });
+    archive(lifecycleCtx, 'project-rust');
+
+    const restored = resurrect(lifecycleCtx, 'project-rust');
+    expect(restored.state).toBe('active');
+    expect(getSoul('project-rust')?.state).toBe('active');
+    expect(getTaskByIdFn('soul-wiki-curation-project-rust')?.status).toBe(
+      'active',
+    );
+  });
+
+  it('resurrect refuses if soul is not archived', () => {
+    spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust',
+      parentFolder: 'main',
+      spawnReason: 'rust',
+    });
+    // Currently active — resurrect should refuse (soul already in registry).
+    expect(() => resurrect(lifecycleCtx, 'project-rust')).toThrow(
+      /already active/,
+    );
+  });
+});
+
+// --- Phase 5 soul-router ---
+
+describe('extractKeywords', () => {
+  it('lowercases, splits on non-alnum, drops stopwords + tiny tokens, dedupes', () => {
+    const kw = extractKeywords(
+      'Will is learning Rust, including ownership and the borrow checker.',
+    );
+    expect(kw).toContain('learning');
+    expect(kw).toContain('rust');
+    expect(kw).toContain('ownership');
+    expect(kw).toContain('borrow');
+    expect(kw).toContain('checker');
+    expect(kw).not.toContain('is');
+    expect(kw).not.toContain('and');
+    expect(kw).not.toContain('the');
+  });
+
+  it('returns empty array for empty / stopword-only input', () => {
+    expect(extractKeywords('')).toEqual([]);
+    expect(extractKeywords('the a and or')).toEqual([]);
+  });
+
+  it('drops short tokens (< 4 chars)', () => {
+    const kw = extractKeywords('go is fun');
+    expect(kw).not.toContain('go');
+    expect(kw).not.toContain('is');
+    expect(kw).not.toContain('fun');
+  });
+});
+
+describe('routeUncuratedObservationsToSpawnedSouls', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  function insertSpawnedSoulRow(
+    folder: string,
+    spawnReason: string,
+    state: 'active' | 'dormant' = 'active',
+  ): void {
+    const now = '2026-05-29T00:00:00Z';
+    getDb()
+      .prepare(
+        `INSERT INTO souls (folder, owner, channel_jid, agent_name, state,
+                            spawned_at, state_changed_at, did, parent_folder, spawn_reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        folder,
+        'self',
+        null,
+        `${folder} soul`,
+        state,
+        now,
+        now,
+        `did:wba:host:agent:${folder}`,
+        'main',
+        spawnReason,
+      );
+  }
+
+  it('copies a matching main observation into the spawned soul memory_stream with backlink metadata', () => {
+    insertSpawnedSoulRow(
+      'project-rust',
+      'learning rust, ownership, borrow checker',
+    );
+    const mainRowId = addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-05-29T10:00:00Z',
+      type: 'observation',
+      source: 'whatsapp',
+      content: 'I keep losing fights with the borrow checker.',
+      importance: 5,
+    });
+    const res = routeUncuratedObservationsToSpawnedSouls(getDb(), 'main');
+    expect(res.routed).toBe(1);
+    expect(res.perFolder['project-rust']).toBe(1);
+
+    const rustRows = getUncurated(getDb(), 'project-rust');
+    expect(rustRows.length).toBe(1);
+    expect(rustRows[0].content).toContain('borrow checker');
+    expect(rustRows[0].source).toBe('router');
+    const meta = JSON.parse(rustRows[0].metadata!);
+    expect(meta.source_main_row_id).toBe(mainRowId);
+    expect(meta.source_folder).toBe('main');
+  });
+
+  it('does NOT copy non-matching observations', () => {
+    insertSpawnedSoulRow('project-rust', 'learning rust ownership lifetimes');
+    addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-05-29T10:00:00Z',
+      type: 'observation',
+      source: 'whatsapp',
+      content: 'Pasta for dinner tonight.',
+      importance: 5,
+    });
+    const res = routeUncuratedObservationsToSpawnedSouls(getDb(), 'main');
+    expect(res.routed).toBe(0);
+    expect(getUncurated(getDb(), 'project-rust').length).toBe(0);
+  });
+
+  it('is idempotent — second pass over the same row does not re-route', () => {
+    insertSpawnedSoulRow('project-rust', 'learning rust ownership');
+    addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-05-29T10:00:00Z',
+      type: 'observation',
+      source: 'whatsapp',
+      content: 'Stuck on rust ownership again.',
+      importance: 5,
+    });
+    routeUncuratedObservationsToSpawnedSouls(getDb(), 'main');
+    const second = routeUncuratedObservationsToSpawnedSouls(getDb(), 'main');
+    expect(second.routed).toBe(0);
+    expect(getUncurated(getDb(), 'project-rust').length).toBe(1);
+  });
+
+  it('skips dormant souls', () => {
+    insertSpawnedSoulRow('project-rust', 'learning rust ownership', 'dormant');
+    addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-05-29T10:00:00Z',
+      type: 'observation',
+      source: 'whatsapp',
+      content: 'Stuck on rust ownership.',
+      importance: 5,
+    });
+    const res = routeUncuratedObservationsToSpawnedSouls(getDb(), 'main');
+    expect(res.routed).toBe(0);
+  });
+
+  it('returns {routed:0} early when there are no spawned souls', () => {
+    addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-05-29T10:00:00Z',
+      type: 'observation',
+      source: 'whatsapp',
+      content: 'anything',
+      importance: 5,
+    });
+    const res = routeUncuratedObservationsToSpawnedSouls(getDb(), 'main');
+    expect(res).toEqual({ routed: 0, perFolder: {} });
+  });
+});
+
+// --- Phase 5 spawn_soul intervention processing ---
+
+describe('processPendingSpawnApprovals', () => {
+  let lifecycleCtx: LifecycleContext;
+  let transport: LoopbackTransport;
+
+  function buildMainSoul(): ActiveSoul {
+    const keyDir = path.join(tmpDir, '.config', 'nanoclaw', 'soul');
+    generateKeypair(keyDir);
+    const loaded = loadKeypair(keyDir);
+    return {
+      folder: 'main',
+      agentName: 'Andy',
+      did: 'did:wba:host:agent:main',
+      privateKey: loaded.privateKey,
+      publicKey: loaded.publicKey,
+      channelJid: 'main@chat',
+      state: 'active',
+    };
+  }
+
+  function insertSpawnSoulIntervention(opts: {
+    folder: string;
+    agentName: string;
+    keywords: string[];
+    status: 'pending' | 'resolved';
+    approved?: 0 | 1;
+    actioned?: 0 | 1;
+  }): string {
+    return addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-05-29T10:00:00Z',
+      type: 'intervention',
+      source: 'agent',
+      content: `Spawn ${opts.folder}?`,
+      importance: 8,
+      metadata: {
+        intervention_type: 'spawn_soul',
+        question: `Spawn ${opts.folder}?`,
+        context: `Topic emerged around ${opts.keywords.join(', ')}.`,
+        proposed_folder: opts.folder,
+        proposed_agent_name: opts.agentName,
+        proposed_topic_keywords: opts.keywords,
+        priority: 'medium',
+        status: opts.status,
+        ...(opts.approved !== undefined ? { approved: opts.approved } : {}),
+        ...(opts.actioned !== undefined ? { actioned: opts.actioned } : {}),
+      },
+    });
+  }
+
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+    _clearRegistryForTests();
+    fs.mkdirSync(path.join(tmpDir, 'main', 'soul', 'wiki'), {
+      recursive: true,
+    });
+    transport = new LoopbackTransport();
+    const main = buildMainSoul();
+    loadActiveSouls(getDb(), tmpDir, main);
+    transport.registerSoul(main.did, async (req) => req);
+    lifecycleCtx = {
+      db: getDb(),
+      homedir: tmpDir,
+      groupsDir: tmpDir,
+      domain: 'host',
+      mainFolder: 'main',
+      transport,
+      buildSoulHandler: () => async (req) => req,
+    };
+  });
+
+  it('spawns a soul for each resolved+approved spawn_soul intervention', () => {
+    const id = insertSpawnSoulIntervention({
+      folder: 'project-rust',
+      agentName: 'Rust Soul',
+      keywords: ['rust', 'ownership', 'borrow'],
+      status: 'resolved',
+      approved: 1,
+    });
+    const res = processPendingSpawnApprovals(lifecycleCtx);
+    expect(res.spawned).toEqual(['project-rust']);
+    expect(res.errors).toEqual([]);
+    expect(getSoul('project-rust')).not.toBeNull();
+
+    // Intervention is now marked actioned so a second pass is a no-op.
+    const row = getDb()
+      .prepare(
+        `SELECT json_extract(metadata, '$.actioned') as actioned FROM memory_stream WHERE id = ?`,
+      )
+      .get(id) as { actioned: number | null };
+    expect(row.actioned).toBe(1);
+
+    const second = processPendingSpawnApprovals(lifecycleCtx);
+    expect(second.spawned).toEqual([]);
+  });
+
+  it('skips pending interventions', () => {
+    insertSpawnSoulIntervention({
+      folder: 'project-rust',
+      agentName: 'Rust',
+      keywords: ['rust'],
+      status: 'pending',
+    });
+    const res = processPendingSpawnApprovals(lifecycleCtx);
+    expect(res.spawned).toEqual([]);
+    expect(getSoul('project-rust')).toBeNull();
+  });
+
+  it('skips resolved but unapproved interventions', () => {
+    insertSpawnSoulIntervention({
+      folder: 'project-rust',
+      agentName: 'Rust',
+      keywords: ['rust'],
+      status: 'resolved',
+      approved: 0,
+    });
+    const res = processPendingSpawnApprovals(lifecycleCtx);
+    expect(res.spawned).toEqual([]);
+    expect(getSoul('project-rust')).toBeNull();
+  });
+
+  it('skips already-actioned interventions', () => {
+    insertSpawnSoulIntervention({
+      folder: 'project-rust',
+      agentName: 'Rust',
+      keywords: ['rust'],
+      status: 'resolved',
+      approved: 1,
+      actioned: 1,
+    });
+    const res = processPendingSpawnApprovals(lifecycleCtx);
+    expect(res.spawned).toEqual([]);
+  });
+
+  it('records an error and continues when proposed_folder is missing', () => {
+    const id = addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-05-29T10:00:00Z',
+      type: 'intervention',
+      source: 'agent',
+      content: 'Spawn something?',
+      importance: 8,
+      metadata: {
+        intervention_type: 'spawn_soul',
+        question: 'Spawn?',
+        status: 'resolved',
+        approved: 1,
+        // proposed_folder + proposed_agent_name intentionally omitted
+      },
+    });
+    const res = processPendingSpawnApprovals(lifecycleCtx);
+    expect(res.spawned).toEqual([]);
+    expect(res.errors.length).toBe(1);
+    expect(res.errors[0].interventionId).toBe(id);
+    expect(res.errors[0].error).toMatch(/missing/);
+  });
+});
+
+describe('planning-prompts: Phase 5 additions', () => {
+  it('morning plan queries interventions across active souls', async () => {
+    const { buildMorningPlanPrompt } = await import('./planning-prompts.js');
+    const prompt = buildMorningPlanPrompt('main');
+    expect(prompt).toContain('SELECT folder FROM souls');
+    expect(prompt).toContain("state = 'active'");
+    expect(prompt).toContain('spawn_soul');
+  });
+});
+
+describe('curator-prompts: spawn_soul reconciliation', () => {
+  it('evening journal explains spawn_soul approval semantics', async () => {
+    const { buildEveningJournalPrompt } = await import('./curator-prompts.js');
+    const prompt = buildEveningJournalPrompt('main');
+    expect(prompt).toContain('spawn_soul');
+    expect(prompt).toContain('approved');
+  });
+});
+
+// --- Phase 5 cross-soul integration (full verify + handle + sign loop) ---
+
+describe('cross-soul integration', () => {
+  let lifecycleCtx: LifecycleContext;
+  let transport: LoopbackTransport;
+  let mainSoul: ActiveSoul;
+
+  // Real soul handler: verify → handleRequest → signed response. Mirrors
+  // what makeSoulHandlerFactory wires in index.ts.
+  function makeRealHandler(soul: ActiveSoul): SignedRequestHandler {
+    return async (req: SignedMessage) => {
+      const verify = verifyMessage(req, {
+        resolvePublicKey: resolvePublicKeyByDid,
+        expectedTo: soul.did,
+      });
+      if (!verify.ok) {
+        const errEnv = buildEnvelope({
+          from: soul.did,
+          to: req.envelope.from,
+          verb: req.envelope.verb,
+          body: { error: { code: 'verify_failed', message: verify.reason } },
+        });
+        return signMessage(errEnv, soul.privateKey, `${soul.did}#key-1`);
+      }
+      const sc: SoulContext = {
+        did: soul.did,
+        keyId: `${soul.did}#key-1`,
+        privateKey: soul.privateKey,
+        folder: soul.folder,
+        agentName: soul.agentName,
+        groupsDir: tmpDir,
+        db: getDb(),
+      };
+      return handleRequest(req, LOOPBACK_DEFAULT_TIER, sc);
+    };
+  }
+
+  function buildMain(): ActiveSoul {
+    const keyDir = path.join(tmpDir, '.config', 'nanoclaw', 'soul');
+    generateKeypair(keyDir);
+    const loaded = loadKeypair(keyDir);
+    return {
+      folder: 'main',
+      agentName: 'Andy',
+      did: 'did:wba:host:agent:main',
+      privateKey: loaded.privateKey,
+      publicKey: loaded.publicKey,
+      channelJid: 'main@chat',
+      state: 'active',
+    };
+  }
+
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+    _clearRegistryForTests();
+    _resetReplayCacheForTests();
+    fs.mkdirSync(path.join(tmpDir, 'main', 'soul', 'wiki'), {
+      recursive: true,
+    });
+    transport = new LoopbackTransport();
+    mainSoul = buildMain();
+    loadActiveSouls(getDb(), tmpDir, mainSoul);
+    transport.registerSoul(mainSoul.did, makeRealHandler(mainSoul));
+    lifecycleCtx = {
+      db: getDb(),
+      homedir: tmpDir,
+      groupsDir: tmpDir,
+      domain: 'host',
+      mainFolder: 'main',
+      transport,
+      buildSoulHandler: makeRealHandler,
+    };
+  });
+
+  it('main → spawned soul get_agent_card round-trips with a verifiable signed response', async () => {
+    const rust = spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust Soul',
+      parentFolder: 'main',
+      spawnReason: 'rust learning',
+    });
+
+    // Main sends get_agent_card to rust over the real transport.
+    const env = buildEnvelope({
+      from: mainSoul.did,
+      to: rust.did,
+      verb: 'get_agent_card',
+      body: {},
+    });
+    const signed = signMessage(
+      env,
+      mainSoul.privateKey,
+      `${mainSoul.did}#key-1`,
+    );
+    const res = await transport.send(rust.did, signed);
+
+    // Response addressed back to main, signed by rust.
+    expect(res.envelope.from).toBe(rust.did);
+    expect(res.envelope.to).toBe(mainSoul.did);
+    expect(res.signature.keyId).toBe(`${rust.did}#key-1`);
+
+    // Re-verify the response signature using the registry's resolver — this
+    // closes the loop: the same code path that production uses.
+    const verifyRes = verifyMessage(res, {
+      resolvePublicKey: resolvePublicKeyByDid,
+      expectedTo: mainSoul.did,
+    });
+    expect(verifyRes.ok).toBe(true);
+
+    // Body is rust's placeholder card (no provider wired in this test).
+    const body = res.envelope.body as {
+      card: { did: string; agentName: string };
+    };
+    expect(body.card.did).toBe(rust.did);
+    expect(body.card.agentName).toBe('Rust Soul');
+  });
+
+  it('spawned → main propose_intervention lands in main memory_stream with origin attribution', async () => {
+    const rust = spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust Soul',
+      parentFolder: 'main',
+      spawnReason: 'rust learning',
+    });
+
+    const env = buildEnvelope({
+      from: rust.did,
+      to: mainSoul.did,
+      verb: 'propose_intervention',
+      body: {
+        intervention_type: 'spawn_followup',
+        question: 'Will missed his rust session — surface a check-in?',
+        context: 'auto-detected from project-rust memory_stream',
+        priority: 'medium',
+      },
+    });
+    const signed = signMessage(env, rust.privateKey, `${rust.did}#key-1`);
+
+    const res = await transport.send(mainSoul.did, signed);
+    const body = res.envelope.body as {
+      accepted: boolean;
+      interventionId: string;
+    };
+    expect(body.accepted).toBe(true);
+
+    const inserted = getDb()
+      .prepare(`SELECT type, source, metadata FROM memory_stream WHERE id = ?`)
+      .get(body.interventionId) as {
+      type: string;
+      source: string;
+      metadata: string;
+    };
+    expect(inserted.type).toBe('intervention');
+    expect(inserted.source).toBe('spawned-soul');
+    const meta = JSON.parse(inserted.metadata);
+    expect(meta.origin_folder).toBe('project-rust');
+    expect(meta.origin_did).toBe(rust.did);
+    expect(meta.status).toBe('pending');
+  });
+
+  it('rejects an envelope that was tampered with after signing (real verify path)', async () => {
+    const rust = spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust Soul',
+      parentFolder: 'main',
+      spawnReason: 'rust learning',
+    });
+
+    const env = buildEnvelope({
+      from: mainSoul.did,
+      to: rust.did,
+      verb: 'get_agent_card',
+      body: {},
+    });
+    const signed = signMessage(
+      env,
+      mainSoul.privateKey,
+      `${mainSoul.did}#key-1`,
+    );
+    // Tamper: change the verb after signing.
+    const tampered: SignedMessage = {
+      ...signed,
+      envelope: { ...signed.envelope, verb: 'query_state' },
+    };
+
+    const res = await transport.send(rust.did, tampered);
+    const body = res.envelope.body as { error: { code: string } };
+    expect(body.error.code).toBe('verify_failed');
+  });
+
+  it('end-to-end spawn via intervention: approval → host processes → newly-spawned soul is callable', async () => {
+    // 1. Insert a resolved+approved spawn_soul intervention in main.
+    addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-05-29T10:00:00Z',
+      type: 'intervention',
+      source: 'agent',
+      content: 'Spawn project-scout?',
+      importance: 8,
+      metadata: {
+        intervention_type: 'spawn_soul',
+        question: 'Spawn project-scout?',
+        context: 'AI news scanning topic emerged',
+        proposed_folder: 'project-scout',
+        proposed_agent_name: 'Scout Soul',
+        proposed_topic_keywords: ['scout', 'scanning', 'news'],
+        status: 'resolved',
+        approved: 1,
+      },
+    });
+
+    // 2. Host scans + spawns.
+    const res = processPendingSpawnApprovals(lifecycleCtx);
+    expect(res.spawned).toEqual(['project-scout']);
+
+    // 3. New soul is in registry + transport.
+    const scout = getSoul('project-scout');
+    expect(scout).not.toBeNull();
+
+    // 4. Round-trip a message to the new soul through the real handler.
+    const env = buildEnvelope({
+      from: mainSoul.did,
+      to: scout!.did,
+      verb: 'get_agent_card',
+      body: {},
+    });
+    const signed = signMessage(
+      env,
+      mainSoul.privateKey,
+      `${mainSoul.did}#key-1`,
+    );
+    const reply = await transport.send(scout!.did, signed);
+    expect(reply.envelope.from).toBe(scout!.did);
+    expect(reply.envelope.to).toBe(mainSoul.did);
+    const verifyRes = verifyMessage(reply, {
+      resolvePublicKey: resolvePublicKeyByDid,
+      expectedTo: mainSoul.did,
+    });
+    expect(verifyRes.ok).toBe(true);
+  });
+
+  it('archived soul: calls to its DID fail with "no handler" at the transport boundary', async () => {
+    const rust = spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust',
+      parentFolder: 'main',
+      spawnReason: 'rust',
+    });
+
+    archive(lifecycleCtx, 'project-rust');
+
+    const env = buildEnvelope({
+      from: mainSoul.did,
+      to: rust.did,
+      verb: 'get_agent_card',
+      body: {},
+    });
+    const signed = signMessage(
+      env,
+      mainSoul.privateKey,
+      `${mainSoul.did}#key-1`,
+    );
+    await expect(transport.send(rust.did, signed)).rejects.toThrow(
+      /no handler/,
+    );
+  });
+
+  it("per-channel budget invariant: spawned soul has no own budget file; main's budget is the only cap", () => {
+    // Spawn two souls. Neither should create a proactive-budget.json under
+    // groups/<folder>/soul/ — only main has the channel and the budget.
+    spawnSoul(lifecycleCtx, {
+      folder: 'project-rust',
+      agentName: 'Rust',
+      parentFolder: 'main',
+      spawnReason: 'rust',
+    });
+    spawnSoul(lifecycleCtx, {
+      folder: 'project-scout',
+      agentName: 'Scout',
+      parentFolder: 'main',
+      spawnReason: 'scouting',
+    });
+    expect(
+      fs.existsSync(
+        path.join(tmpDir, 'project-rust', 'soul', 'proactive-budget.json'),
+      ),
+    ).toBe(false);
+    expect(
+      fs.existsSync(
+        path.join(tmpDir, 'project-scout', 'soul', 'proactive-budget.json'),
+      ),
+    ).toBe(false);
   });
 });
