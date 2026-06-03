@@ -39,6 +39,23 @@ export function dispatchMessageSent(msg: SentMessage): void {
   }
 }
 
+// Resolve an optional per-task model override from capabilities. First
+// non-undefined wins; undefined → caller uses the default model.
+export function dispatchTaskModel(
+  task: ScheduledTaskInfo,
+): string | undefined {
+  for (const { name, hooks } of registered) {
+    if (!hooks.taskModel) continue;
+    try {
+      const model = hooks.taskModel(task);
+      if (model) return model;
+    } catch (err) {
+      logger.error({ capability: name, err }, 'Hook error in taskModel');
+    }
+  }
+  return undefined;
+}
+
 export async function dispatchBeforeTaskRun(
   task: ScheduledTaskInfo,
 ): Promise<boolean> {

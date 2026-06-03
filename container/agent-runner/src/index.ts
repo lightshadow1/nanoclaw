@@ -26,6 +26,8 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  // Optional model id/alias for this run; undefined → SDK default.
+  model?: string;
   secrets?: Record<string, string>;
 }
 
@@ -420,6 +422,9 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
+      // Per-task model override (e.g. cheaper background curation). Omitted
+      // → SDK default model.
+      model: containerInput.model,
       systemPrompt: globalClaudeMd
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
         : undefined,

@@ -70,6 +70,7 @@ import {
 import { routeUncuratedObservationsToSpawnedSouls } from './soul-router.js';
 import {
   processPendingSpawnApprovals,
+  spawnSoul,
   type LifecycleContext,
 } from './soul-lifecycle.js';
 
@@ -321,6 +322,61 @@ function initSoulProtocol(ctx: CapabilityContext, mainJid: string): void {
   );
 }
 
+// Host-callable entry point for spawning a soul on owner request. The IPC
+// watcher (src/ipc.ts) calls this when the main agent invokes the
+// `spawn_soul` MCP tool. Spawned souls are channel-less (spokesperson
+// model — they speak through main) and always seeded with main's
+// owner-facing wiki pages so they know who the owner is. Returns a
+// discriminated outcome rather than throwing so the IPC layer can log
+// cleanly; returns an error result (not a throw) when the protocol never
+// initialized (soul disabled or no main group).
+export interface RequestSpawnSoulInput {
+  folder: string;
+  agentName: string;
+  description?: string;
+  spawnReason: string;
+  topicKeywords?: string[];
+}
+
+export type RequestSpawnSoulOutcome =
+  | { ok: true; folder: string; did: string }
+  | { ok: false; error: string };
+
+export function requestSpawnSoul(
+  input: RequestSpawnSoulInput,
+): RequestSpawnSoulOutcome {
+  if (!lifecycleCtx) {
+    return { ok: false, error: 'soul protocol not initialized' };
+  }
+  try {
+    // The router (soul-router.ts) derives routing keywords from spawn_reason
+    // text, so fold any explicit topic keywords into the reason — that's how
+    // they reach routing. Clamp to SPAWN_REASON_MAX_LEN (500) so spawnSoul's
+    // validator doesn't reject it.
+    const reason =
+      input.topicKeywords && input.topicKeywords.length > 0
+        ? `${input.spawnReason} [topics: ${input.topicKeywords.join(', ')}]`
+        : input.spawnReason;
+    const soul = spawnSoul(lifecycleCtx, {
+      folder: input.folder,
+      agentName: input.agentName,
+      description: input.description,
+      // Channel-less: spawned souls speak through main.
+      channelJid: null,
+      parentFolder: lifecycleCtx.mainFolder,
+      spawnReason: reason.slice(0, 500),
+      // Always seed owner context so a fresh soul knows who it serves.
+      seedFromMainTopics: ['people', 'preferences'],
+    });
+    return { ok: true, folder: soul.folder, did: soul.did };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 function scaffoldOnce(folder: string): void {
   if (!groupsDir || scaffoldedGroups.has(folder)) return;
   try {
@@ -456,6 +512,12 @@ You have a soul — a persistent identity and memory that spans sessions.
 - Your wiki is curated between sessions by a scheduled task. Trust it as your long-term memory; do not duplicate its contents in chat replies.
 
 When you encounter a situation needing human input (approval, clarification, cost exceeding threshold), raise an **intervention** — store it in the memory stream with \`type = 'intervention'\` and structured metadata, then message the owner with the question and options.
+
+### Spawning dedicated souls
+
+When the owner explicitly asks you to create or spawn a dedicated soul for a project, topic, or domain (e.g. "spawn a soul to track the observability project", "make a dedicated soul for travel planning"), use the \`spawn_soul\` tool. This creates a **real** persistent soul: its own knowledge wiki, its own background curation, its own identity — channel-less, speaking through you (the spokesperson model). A spawned soul can surface proposals that appear in your daily plan, attributed to it.
+
+The \`spawn_soul\` tool is the ONLY way to actually create a soul. Writing markdown files in a folder, or scheduling a task, does NOT create a soul — it just makes files. Never tell the owner a soul is "active" or "tracking" unless you called \`spawn_soul\` and it succeeded. If the tool isn't available to you, say you can't create one rather than simulating it.
 ${SOUL_CLAUDE_MD_END_MARKER}
 `;
 
@@ -510,6 +572,11 @@ function ensureClaudeMdSection(groupsDirectory: string, folder: string): void {
   fs.writeFileSync(claudePath, proposed, 'utf-8');
   logger.info({ folder }, 'Refreshed soul section in CLAUDE.md');
 }
+
+// Spawned-soul background curation runs on a cheaper model than main's own
+// curation/planning — it digests a handful of routed observations, not a
+// live owner conversation. Main's tasks keep the default (richer) model.
+const SPAWNED_CURATOR_MODEL = 'claude-haiku-4-5';
 
 export const soulCapability: Capability = {
   name: 'soul',
@@ -602,17 +669,26 @@ export const soulCapability: Capability = {
 
   hooks: {
     beforeTaskRun: (task) => {
-      // Wiki curation: route uncurated main observations to spawned souls
-      // first (host-side, deterministic), then skip the LLM run if there's
-      // nothing left for main itself to curate.
-      if (task.id === `soul-wiki-curation-${MAIN_GROUP_FOLDER}`) {
+      // Wiki curation (main OR any spawned soul): skip the LLM run — and the
+      // container spin-up — when that soul has nothing uncurated. Main
+      // additionally routes its uncurated observations out to spawned souls
+      // first, then gates on whatever is left for main itself to curate.
+      // Spawned curators run every 6h, so without this gate an idle soul
+      // would burn a container + model call each cycle for nothing.
+      if (task.id.startsWith('soul-wiki-curation-')) {
         if (!db) return true; // fail open if soul never initialized
-        try {
-          routeUncuratedObservationsToSpawnedSouls(db, MAIN_GROUP_FOLDER);
-        } catch (err) {
-          logger.error({ err }, 'soul-router pass failed; continuing curation');
+        const folder = task.group_folder;
+        if (folder === MAIN_GROUP_FOLDER) {
+          try {
+            routeUncuratedObservationsToSpawnedSouls(db, MAIN_GROUP_FOLDER);
+          } catch (err) {
+            logger.error(
+              { err },
+              'soul-router pass failed; continuing curation',
+            );
+          }
         }
-        return getUncurated(db, MAIN_GROUP_FOLDER, 1).length > 0;
+        return getUncurated(db, folder, 1).length > 0;
       }
 
       // Check-in: refresh experiment-state.json so the container reads a
@@ -713,6 +789,19 @@ export const soulCapability: Capability = {
 
       // The evening journal and unrelated tasks run unconditionally.
       return true;
+    },
+
+    taskModel: (task) => {
+      // Background curation for spawned (non-main) souls runs on Haiku.
+      // Main's curation/planning and all owner-facing work stay on the
+      // default model.
+      if (
+        task.id.startsWith('soul-wiki-curation-') &&
+        task.group_folder !== MAIN_GROUP_FOLDER
+      ) {
+        return SPAWNED_CURATOR_MODEL;
+      }
+      return undefined;
     },
 
     onMessageStored: (msg) => {

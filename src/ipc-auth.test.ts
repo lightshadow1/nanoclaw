@@ -8,7 +8,7 @@ import {
   getTaskById,
   setRegisteredGroup,
 } from './db.js';
-import { processTaskIpc, IpcDeps } from './ipc.js';
+import { processTaskIpc, IpcDeps, SpawnSoulRequest } from './ipc.js';
 import { RegisteredGroup } from './types.js';
 
 // Set up registered groups used across tests
@@ -35,6 +35,7 @@ const THIRD_GROUP: RegisteredGroup = {
 
 let groups: Record<string, RegisteredGroup>;
 let deps: IpcDeps;
+let spawnCalls: SpawnSoulRequest[];
 
 beforeEach(() => {
   _initTestDatabase();
@@ -50,6 +51,7 @@ beforeEach(() => {
   setRegisteredGroup('other@g.us', OTHER_GROUP);
   setRegisteredGroup('third@g.us', THIRD_GROUP);
 
+  spawnCalls = [];
   deps = {
     sendMessage: async () => {},
     registeredGroups: () => groups,
@@ -61,6 +63,10 @@ beforeEach(() => {
     syncGroupMetadata: async () => {},
     getAvailableGroups: () => [],
     writeGroupsSnapshot: () => {},
+    spawnSoul: (req) => {
+      spawnCalls.push(req);
+      return { ok: true, folder: req.folder, did: `did:test:${req.folder}` };
+    },
   };
 });
 
@@ -590,5 +596,77 @@ describe('register_group success', () => {
     );
 
     expect(getRegisteredGroup('partial@g.us')).toBeUndefined();
+  });
+});
+
+// --- spawn_soul authorization + dispatch ---
+
+describe('spawn_soul', () => {
+  it('main group can spawn a soul', async () => {
+    await processTaskIpc(
+      {
+        type: 'spawn_soul',
+        folder: 'observability',
+        agentName: 'Observability Soul',
+        spawnReason: 'track the observability project',
+        topicKeywords: ['observability', 'tracing'],
+      },
+      'main',
+      true,
+      deps,
+    );
+
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0].folder).toBe('observability');
+    expect(spawnCalls[0].agentName).toBe('Observability Soul');
+    expect(spawnCalls[0].topicKeywords).toEqual(['observability', 'tracing']);
+  });
+
+  it('non-main group cannot spawn a soul', async () => {
+    await processTaskIpc(
+      {
+        type: 'spawn_soul',
+        folder: 'sneaky',
+        agentName: 'Sneaky Soul',
+        spawnReason: 'should be blocked',
+      },
+      'other-group',
+      false,
+      deps,
+    );
+
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it('rejects spawn_soul missing required fields', async () => {
+    await processTaskIpc(
+      {
+        type: 'spawn_soul',
+        folder: 'incomplete',
+        // missing agentName and spawnReason
+      },
+      'main',
+      true,
+      deps,
+    );
+
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it('does not crash when soul capability is unavailable', async () => {
+    const depsNoSoul: IpcDeps = { ...deps, spawnSoul: undefined };
+    await processTaskIpc(
+      {
+        type: 'spawn_soul',
+        folder: 'observability',
+        agentName: 'Observability Soul',
+        spawnReason: 'track the observability project',
+      },
+      'main',
+      true,
+      depsNoSoul,
+    );
+
+    expect(spawnCalls).toHaveLength(0);
   });
 });

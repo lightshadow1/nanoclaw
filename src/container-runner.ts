@@ -42,6 +42,9 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  // Optional model id/alias for this run (e.g. cheap background curation on
+  // Haiku). Undefined → the agent-runner uses the SDK default model.
+  model?: string;
   secrets?: Record<string, string>;
 }
 

@@ -274,6 +274,88 @@ Use available_groups.json to find the JID for a group. The folder name should be
   },
 );
 
+server.tool(
+  'spawn_soul',
+  `Spawn a dedicated soul: a persistent, separately-tracked identity with its own knowledge wiki and background curation, scoped to one project / topic / domain. Main group only.
+
+Use this ONLY when the owner explicitly asks you to create or spawn a dedicated soul (e.g. "spawn a soul to track the observability project", "create a dedicated soul for solo travel planning"). Do NOT decide to spawn souls on your own.
+
+A spawned soul is channel-less: it has no chat of its own and speaks THROUGH you (the main soul). It curates its own wiki in the background and can surface proposals that appear in your daily plan, attributed to it. This tool is the ONLY way to actually create a soul — writing markdown files or scheduling a task does NOT create one. If you cannot call this tool, you cannot create a soul; say so rather than pretending one exists.
+
+The folder slug must be lowercase letters, digits, and hyphens only (e.g. "observability", "travel-solo").`,
+  {
+    folder: z
+      .string()
+      .describe(
+        'Folder slug for the soul: lowercase letters, digits, hyphens only (e.g. "observability")',
+      ),
+    agent_name: z
+      .string()
+      .describe('Display name for the soul (e.g. "Observability Soul")'),
+    spawn_reason: z
+      .string()
+      .describe(
+        'Why this soul is being spawned — the owner request / purpose, in a sentence or two',
+      ),
+    description: z
+      .string()
+      .optional()
+      .describe("Optional longer description of the soul's domain"),
+    topic_keywords: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Optional topic keywords; observations matching these get routed to this soul',
+      ),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'Only the main soul can spawn dedicated souls.',
+          },
+        ],
+        isError: true,
+      };
+    }
+    if (!/^[a-z0-9-]+$/.test(args.folder)) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Invalid folder slug "${args.folder}". Use lowercase letters, digits, and hyphens only (e.g. "travel-solo").`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'spawn_soul',
+      folder: args.folder,
+      agentName: args.agent_name,
+      spawnReason: args.spawn_reason,
+      description: args.description || undefined,
+      topicKeywords: args.topic_keywords || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    const filename = writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `Soul "${args.agent_name}" (${args.folder}) spawn requested (${filename}). It will come online within a few seconds with its own wiki and background curation, and will speak through you. Tell the owner it's being set up — do not claim it has data yet.`,
+        },
+      ],
+    };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);
