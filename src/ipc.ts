@@ -14,6 +14,18 @@ import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
+export interface SpawnSoulRequest {
+  folder: string;
+  agentName: string;
+  description?: string;
+  spawnReason: string;
+  topicKeywords?: string[];
+}
+
+export type SpawnSoulOutcome =
+  | { ok: true; folder: string; did: string }
+  | { ok: false; error: string };
+
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
@@ -26,6 +38,9 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  // Optional: wired by the host only when the soul capability is enabled.
+  // Absent → spawn_soul IPC requests are logged and dropped.
+  spawnSoul?: (req: SpawnSoulRequest) => SpawnSoulOutcome;
 }
 
 let ipcWatcherRunning = false;
@@ -169,6 +184,11 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For spawn_soul
+    agentName?: string;
+    description?: string;
+    spawnReason?: string;
+    topicKeywords?: string[];
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -370,6 +390,51 @@ export async function processTaskIpc(
           { data },
           'Invalid register_group request - missing required fields',
         );
+      }
+      break;
+
+    case 'spawn_soul':
+      // Spokesperson model: only the main soul may spawn dedicated souls.
+      // Spawned souls are channel-less and speak through main, so a
+      // non-main group spawning siblings would break the channel/budget
+      // invariants.
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized spawn_soul attempt blocked');
+        break;
+      }
+      if (!deps.spawnSoul) {
+        logger.warn(
+          { sourceGroup },
+          'spawn_soul requested but soul capability is not enabled',
+        );
+        break;
+      }
+      if (!data.folder || !data.agentName || !data.spawnReason) {
+        logger.warn(
+          { data },
+          'Invalid spawn_soul request - missing folder, agentName, or spawnReason',
+        );
+        break;
+      }
+      {
+        const result = deps.spawnSoul({
+          folder: data.folder,
+          agentName: data.agentName,
+          description: data.description,
+          spawnReason: data.spawnReason,
+          topicKeywords: data.topicKeywords,
+        });
+        if (result.ok) {
+          logger.info(
+            { folder: result.folder, did: result.did, sourceGroup },
+            'Soul spawned via IPC',
+          );
+        } else {
+          logger.warn(
+            { folder: data.folder, error: result.error },
+            'spawn_soul request failed',
+          );
+        }
       }
       break;
 

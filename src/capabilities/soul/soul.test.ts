@@ -306,6 +306,72 @@ describe('ensureWikiForGroup', () => {
   });
 });
 
+describe('soul curation gating + model', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  it('routes spawned-soul curation to Haiku, keeps main on default', () => {
+    const taskModel = soulCapability.hooks!.taskModel!;
+    expect(
+      taskModel({
+        id: 'soul-wiki-curation-proj-x',
+        group_folder: 'proj-x',
+        schedule_type: 'interval',
+      }),
+    ).toBe('claude-haiku-4-5');
+    // Main curation keeps the default (richer) model.
+    expect(
+      taskModel({
+        id: 'soul-wiki-curation-main',
+        group_folder: 'main',
+        schedule_type: 'interval',
+      }),
+    ).toBeUndefined();
+    // Non-curation soul tasks keep the default model.
+    expect(
+      taskModel({
+        id: 'soul-check-in-main',
+        group_folder: 'main',
+        schedule_type: 'interval',
+      }),
+    ).toBeUndefined();
+  });
+
+  it('gates a spawned-soul curator on its own uncurated rows', async () => {
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: () => ({}),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+    const beforeTaskRun = soulCapability.hooks!.beforeTaskRun!;
+    const task = {
+      id: 'soul-wiki-curation-proj-x',
+      group_folder: 'proj-x',
+      schedule_type: 'interval' as const,
+    };
+
+    // No uncurated rows for proj-x → skip the run.
+    expect(await beforeTaskRun(task)).toBe(false);
+
+    // One uncurated row for proj-x → run.
+    addMemory(getDb(), {
+      groupFolder: 'proj-x',
+      timestamp: '2026-04-24T10:00:00Z',
+      type: 'observation',
+      source: 'router',
+      content: 'something to curate',
+      importance: 5,
+      metadata: {},
+    });
+    expect(await beforeTaskRun(task)).toBe(true);
+
+    await soulCapability.teardown!();
+  });
+});
+
 describe('soulCapability hook', () => {
   beforeEach(() => {
     runMigrations(getDb(), soulCapability);
