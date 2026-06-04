@@ -6,16 +6,16 @@
 // per-run prompt and never calls the LLM directly.
 
 export function buildWikiCurationPrompt(folder: string): string {
-  return `You are performing a wiki curation pass for your soul.
+  return `You are performing a wiki curation pass. You are the MAIN soul, and
+you are the only soul with database access — so you curate BOTH your own
+memory AND the memory of every spawned soul into their wikis.
 
-## Instructions
+# Part 1 — Curate your own (main) memory
 
-1. Query uncurated memory entries:
+1. Query your uncurated memory entries:
    sqlite3 /workspace/project/store/messages.db "SELECT id, timestamp, type, source, content, importance FROM memory_stream WHERE group_folder = '${folder}' AND curated = 0 ORDER BY timestamp ASC LIMIT 50"
 
-2. If there are no uncurated entries, or every returned row has importance <= 2, output exactly:
-   <internal>No entries worth curating this pass.</internal>
-   and exit. Do not write any wiki files. Do not run the curated UPDATE.
+2. If there are no uncurated entries, or every returned row has importance <= 2, skip to Part 2 without writing your own wiki and without running the curated UPDATE for yourself.
 
 3. Read your wiki index at /workspace/group/soul/wiki/_index.md and list the directory to see what pages exist.
 
@@ -41,10 +41,29 @@ export function buildWikiCurationPrompt(folder: string): string {
 
 9. Update _index.md only if you created, deleted, or significantly changed a page.
 
-10. Mark the entries you processed as curated (include skipped ones too — they're done):
+10. Mark your processed entries as curated (include skipped ones too — they're done):
     sqlite3 /workspace/project/store/messages.db "UPDATE memory_stream SET curated = 1 WHERE id IN ('id1','id2',...)"
 
-11. If you changed any page, output a 1-2 sentence summary of what changed (this goes to the user's chat). If nothing changed (other than marking entries curated), wrap your final output in <internal>...</internal> so nothing is sent.
+# Part 2 — Curate each spawned soul's memory
+
+Spawned souls have their own wikis but no database access, so you curate
+them. Their observations were routed into their memory_stream by the host.
+
+11. List the active spawned souls:
+    sqlite3 /workspace/project/store/messages.db "SELECT folder, agent_name, spawn_reason FROM souls WHERE state = 'active' AND folder != '${folder}'"
+
+12. For EACH spawned soul (call its folder SOUL):
+    a. Query its uncurated entries:
+       sqlite3 /workspace/project/store/messages.db "SELECT id, timestamp, type, source, content, importance FROM memory_stream WHERE group_folder = 'SOUL' AND curated = 0 ORDER BY timestamp ASC LIMIT 50"
+    b. If there are none, or every row has importance <= 2, skip this soul (do not write its wiki, do not run its curated UPDATE).
+    c. That soul's wiki lives at /workspace/project/groups/SOUL/soul/wiki/ — read its _index.md and list the directory.
+    d. Apply the SAME curation rules as steps 4-9 above, but write into /workspace/project/groups/SOUL/soul/wiki/ and keep strictly within THAT soul's domain (its spawn_reason). Do not mix one soul's knowledge into another's wiki, and do not put spawned-soul content into your own wiki.
+    e. Mark that soul's processed entries curated:
+       sqlite3 /workspace/project/store/messages.db "UPDATE memory_stream SET curated = 1 WHERE id IN ('id1','id2',...)"
+
+# Output
+
+13. Output a 1-2 sentence summary of what changed across yourself and the spawned souls (this goes to the user's chat). If nothing changed (other than marking entries curated), wrap your final output in <internal>...</internal> so nothing is sent.
 `;
 }
 

@@ -306,39 +306,30 @@ describe('ensureWikiForGroup', () => {
   });
 });
 
-describe('soul curation gating + model', () => {
+describe('soul curation gating (main curates all souls)', () => {
   beforeEach(() => {
     runMigrations(getDb(), soulCapability);
   });
 
-  it('routes spawned-soul curation to Haiku, keeps main on default', () => {
-    const taskModel = soulCapability.hooks!.taskModel!;
-    expect(
-      taskModel({
-        id: 'soul-wiki-curation-proj-x',
-        group_folder: 'proj-x',
-        schedule_type: 'interval',
-      }),
-    ).toBe('claude-haiku-4-5');
-    // Main curation keeps the default (richer) model.
-    expect(
-      taskModel({
-        id: 'soul-wiki-curation-main',
-        group_folder: 'main',
-        schedule_type: 'interval',
-      }),
-    ).toBeUndefined();
-    // Non-curation soul tasks keep the default model.
-    expect(
-      taskModel({
-        id: 'soul-check-in-main',
-        group_folder: 'main',
-        schedule_type: 'interval',
-      }),
-    ).toBeUndefined();
-  });
+  const MAIN_CURATION = {
+    id: 'soul-wiki-curation-main',
+    group_folder: 'main',
+    schedule_type: 'interval' as const,
+  };
 
-  it('gates a spawned-soul curator on its own uncurated rows', async () => {
+  function insertActiveSoul(folder: string): void {
+    getDb()
+      .prepare(
+        `INSERT INTO souls
+           (folder, owner, channel_jid, agent_name, description, state,
+            spawned_at, state_changed_at, did, parent_folder, spawn_reason)
+         VALUES (?, 'self', NULL, ?, NULL, 'active',
+            '2026-04-24T00:00:00Z', '2026-04-24T00:00:00Z', ?, 'main', 'x')`,
+      )
+      .run(folder, folder, `did:wba:host:agent:${folder}`);
+  }
+
+  it('runs when an active spawned soul has uncurated rows (main itself empty)', async () => {
     await soulCapability.init({
       db: getDb(),
       registeredGroups: () => ({}),
@@ -347,26 +338,76 @@ describe('soul curation gating + model', () => {
       dataDir: tmpDir,
     });
     const beforeTaskRun = soulCapability.hooks!.beforeTaskRun!;
-    const task = {
-      id: 'soul-wiki-curation-proj-x',
-      group_folder: 'proj-x',
-      schedule_type: 'interval' as const,
-    };
+    insertActiveSoul('proj-x');
 
-    // No uncurated rows for proj-x → skip the run.
-    expect(await beforeTaskRun(task)).toBe(false);
+    // Nothing uncurated anywhere → skip.
+    expect(await beforeTaskRun(MAIN_CURATION)).toBe(false);
 
-    // One uncurated row for proj-x → run.
+    // A spawned soul has an uncurated row → main must run to curate it.
     addMemory(getDb(), {
       groupFolder: 'proj-x',
       timestamp: '2026-04-24T10:00:00Z',
       type: 'observation',
       source: 'router',
-      content: 'something to curate',
+      content: 'something for proj-x',
       importance: 5,
       metadata: {},
     });
-    expect(await beforeTaskRun(task)).toBe(true);
+    expect(await beforeTaskRun(MAIN_CURATION)).toBe(true);
+
+    await soulCapability.teardown!();
+  });
+
+  it('runs when main itself has uncurated rows', async () => {
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: () => ({}),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+    const beforeTaskRun = soulCapability.hooks!.beforeTaskRun!;
+
+    expect(await beforeTaskRun(MAIN_CURATION)).toBe(false);
+    addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-04-24T10:00:00Z',
+      type: 'observation',
+      source: 'whatsapp',
+      content: 'remember the deadline',
+      importance: 6,
+      metadata: {},
+    });
+    expect(await beforeTaskRun(MAIN_CURATION)).toBe(true);
+
+    await soulCapability.teardown!();
+  });
+
+  it('ignores uncurated rows of archived (non-active) souls', async () => {
+    await soulCapability.init({
+      db: getDb(),
+      registeredGroups: () => ({}),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    });
+    const beforeTaskRun = soulCapability.hooks!.beforeTaskRun!;
+    insertActiveSoul('proj-x');
+    getDb()
+      .prepare(`UPDATE souls SET state = 'archived' WHERE folder = 'proj-x'`)
+      .run();
+
+    addMemory(getDb(), {
+      groupFolder: 'proj-x',
+      timestamp: '2026-04-24T10:00:00Z',
+      type: 'observation',
+      source: 'router',
+      content: 'stale row for an archived soul',
+      importance: 5,
+      metadata: {},
+    });
+    // Archived soul's rows don't pull main into a curation run.
+    expect(await beforeTaskRun(MAIN_CURATION)).toBe(false);
 
     await soulCapability.teardown!();
   });
@@ -3904,7 +3945,7 @@ describe('soul-lifecycle', () => {
     ).toThrow(/SPAWN_REASON_MAX_LEN/);
   });
 
-  it('spawnSoul creates wiki scaffold, per-soul key dir, souls row, registers in transport + registry, and schedules a curator task', () => {
+  it('spawnSoul creates wiki scaffold, per-soul key dir, souls row, registers in transport + registry, and does NOT create a per-soul curator task', () => {
     const soul = spawnSoul(lifecycleCtx, {
       folder: 'project-rust',
       agentName: 'Rust Soul',
@@ -3952,10 +3993,8 @@ describe('soul-lifecycle', () => {
     // Loopback can route to its DID.
     expect(transport.registeredCount()).toBeGreaterThanOrEqual(2); // main + project-rust
 
-    // Curator task scheduled at the lighter 6h cadence.
-    const task = getTaskByIdFn('soul-wiki-curation-project-rust');
-    expect(task?.schedule_value).toBe(String(6 * 60 * 60 * 1000));
-    expect(task?.status).toBe('active');
+    // No per-soul curator task: main is the sole curator for every soul.
+    expect(getTaskByIdFn('soul-wiki-curation-project-rust')).toBeUndefined();
   });
 
   it('two spawned souls get distinct key directories', () => {
@@ -4028,9 +4067,6 @@ describe('soul-lifecycle', () => {
     expect(row.state).toBe('dormant');
     expect(getSoul('project-rust')?.state).toBe('dormant');
 
-    const task = getTaskByIdFn('soul-wiki-curation-project-rust');
-    expect(task?.status).toBe('paused');
-
     // Transport still registered — dormant souls are still queryable.
     expect(() => transport.registerSoul(soul.did, async (req) => req)).toThrow(
       /already registered/,
@@ -4048,9 +4084,6 @@ describe('soul-lifecycle', () => {
     markActive(lifecycleCtx, 'project-rust');
 
     expect(getSoul('project-rust')?.state).toBe('active');
-    expect(getTaskByIdFn('soul-wiki-curation-project-rust')?.status).toBe(
-      'active',
-    );
   });
 
   it('markDormant/archive refuse to touch main', () => {
@@ -4076,9 +4109,6 @@ describe('soul-lifecycle', () => {
       .get() as { state: string };
     expect(row.state).toBe('archived');
     expect(getSoul('project-rust')).toBeNull();
-    expect(getTaskByIdFn('soul-wiki-curation-project-rust')?.status).toBe(
-      'paused',
-    );
     // Transport now has the DID slot free — registering again works.
     expect(() =>
       transport.registerSoul(soul.did, async (req) => req),
@@ -4097,9 +4127,6 @@ describe('soul-lifecycle', () => {
     const restored = resurrect(lifecycleCtx, 'project-rust');
     expect(restored.state).toBe('active');
     expect(getSoul('project-rust')?.state).toBe('active');
-    expect(getTaskByIdFn('soul-wiki-curation-project-rust')?.status).toBe(
-      'active',
-    );
   });
 
   it('resurrect refuses if soul is not archived', () => {

@@ -34,11 +34,6 @@ export interface CapabilityHooks {
   // expensive scheduled task (e.g. don't fire the soul curator if no
   // new memories accumulated). Skipped runs still advance next_run.
   beforeTaskRun?(task: ScheduledTaskInfo): boolean | Promise<boolean>;
-  // Optional per-task model override. Return a model id/alias (e.g.
-  // 'claude-haiku-4-5') to run this task's container on a specific model —
-  // e.g. cheap background work on Haiku — or undefined for the default.
-  // First capability to return a non-undefined value wins.
-  taskModel?(task: ScheduledTaskInfo): string | undefined;
 }
 
 export interface MigrationBundle {
