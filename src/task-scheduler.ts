@@ -10,7 +10,7 @@ import {
   SCHEDULER_POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
-import { dispatchBeforeTaskRun, dispatchTaskModel } from './capabilities/hooks.js';
+import { dispatchBeforeTaskRun } from './capabilities/hooks.js';
 import { ContainerOutput, runContainerAgent, writeTasksSnapshot } from './container-runner.js';
 import {
   getAllTasks,
@@ -82,6 +82,19 @@ async function runTask(
       result: null,
       error: `Group not found: ${task.group_folder}`,
     });
+    // Advance next_run so a genuinely-orphaned task doesn't hot-loop every
+    // scheduler poll (it stays due otherwise, re-firing the error forever).
+    let nextRun: string | null = null;
+    if (task.schedule_type === 'cron') {
+      nextRun = CronExpressionParser.parse(task.schedule_value, { tz: TIMEZONE })
+        .next()
+        .toISOString();
+    } else if (task.schedule_type === 'interval') {
+      nextRun = new Date(
+        Date.now() + parseInt(task.schedule_value, 10),
+      ).toISOString();
+    }
+    updateTaskAfterRun(task.id, nextRun, `Error: group not found`);
     return;
   }
 
@@ -110,14 +123,6 @@ async function runTask(
   const sessionId =
     task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
 
-  // Optional per-task model override from capabilities (e.g. soul routes
-  // spawned-soul background curation to a cheaper model).
-  const model = dispatchTaskModel({
-    id: task.id,
-    group_folder: task.group_folder,
-    schedule_type: task.schedule_type,
-  });
-
   // After the task produces a result, close the container promptly.
   // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the
   // query loop to time out. A short delay handles any final MCP calls.
@@ -142,7 +147,6 @@ async function runTask(
         chatJid: task.chat_jid,
         isMain,
         isScheduledTask: true,
-        model,
       },
       (proc, containerName) => deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
       async (streamedOutput: ContainerOutput) => {

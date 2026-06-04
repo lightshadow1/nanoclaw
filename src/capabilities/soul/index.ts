@@ -573,11 +573,6 @@ function ensureClaudeMdSection(groupsDirectory: string, folder: string): void {
   logger.info({ folder }, 'Refreshed soul section in CLAUDE.md');
 }
 
-// Spawned-soul background curation runs on a cheaper model than main's own
-// curation/planning — it digests a handful of routed observations, not a
-// live owner conversation. Main's tasks keep the default (richer) model.
-const SPAWNED_CURATOR_MODEL = 'claude-haiku-4-5';
-
 export const soulCapability: Capability = {
   name: 'soul',
 
@@ -669,26 +664,29 @@ export const soulCapability: Capability = {
 
   hooks: {
     beforeTaskRun: (task) => {
-      // Wiki curation (main OR any spawned soul): skip the LLM run — and the
-      // container spin-up — when that soul has nothing uncurated. Main
-      // additionally routes its uncurated observations out to spawned souls
-      // first, then gates on whatever is left for main itself to curate.
-      // Spawned curators run every 6h, so without this gate an idle soul
-      // would burn a container + model call each cycle for nothing.
-      if (task.id.startsWith('soul-wiki-curation-')) {
+      // Wiki curation: main is the sole curator for every soul (only it has
+      // DB access). Route main's uncurated observations out to spawned
+      // souls first, then run the pass if EITHER main or any active spawned
+      // soul has something uncurated — otherwise skip the container entirely.
+      if (task.id === `soul-wiki-curation-${MAIN_GROUP_FOLDER}`) {
         if (!db) return true; // fail open if soul never initialized
-        const folder = task.group_folder;
-        if (folder === MAIN_GROUP_FOLDER) {
-          try {
-            routeUncuratedObservationsToSpawnedSouls(db, MAIN_GROUP_FOLDER);
-          } catch (err) {
-            logger.error(
-              { err },
-              'soul-router pass failed; continuing curation',
-            );
-          }
+        try {
+          routeUncuratedObservationsToSpawnedSouls(db, MAIN_GROUP_FOLDER);
+        } catch (err) {
+          logger.error({ err }, 'soul-router pass failed; continuing curation');
         }
-        return getUncurated(db, folder, 1).length > 0;
+        const pending = db
+          .prepare(
+            `SELECT 1 FROM memory_stream
+              WHERE curated = 0
+                AND (group_folder = ?
+                     OR group_folder IN (
+                       SELECT folder FROM souls
+                        WHERE state = 'active' AND folder != ?))
+              LIMIT 1`,
+          )
+          .get(MAIN_GROUP_FOLDER, MAIN_GROUP_FOLDER);
+        return pending !== undefined;
       }
 
       // Check-in: refresh experiment-state.json so the container reads a
@@ -789,19 +787,6 @@ export const soulCapability: Capability = {
 
       // The evening journal and unrelated tasks run unconditionally.
       return true;
-    },
-
-    taskModel: (task) => {
-      // Background curation for spawned (non-main) souls runs on Haiku.
-      // Main's curation/planning and all owner-facing work stay on the
-      // default model.
-      if (
-        task.id.startsWith('soul-wiki-curation-') &&
-        task.group_folder !== MAIN_GROUP_FOLDER
-      ) {
-        return SPAWNED_CURATOR_MODEL;
-      }
-      return undefined;
     },
 
     onMessageStored: (msg) => {

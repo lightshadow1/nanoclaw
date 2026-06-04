@@ -14,9 +14,7 @@ import fs from 'fs';
 import path from 'path';
 import type Database from 'better-sqlite3';
 
-import { createTask, getTaskById, updateTask } from '../../db.js';
 import { logger } from '../../logger.js';
-import { buildWikiCurationPrompt } from './curator-prompts.js';
 import { generateKeypair, loadKeypair, soulKeyDir } from './identity.js';
 import type { SignedRequestHandler } from './protocol/transport.js';
 import type { LoopbackTransport } from './protocol/transport-loopback.js';
@@ -33,11 +31,6 @@ import { ensureWikiForGroup } from './wiki-scaffold.js';
 // Spec §17 constants.
 export const DORMANT_THRESHOLD_DAYS = 30;
 export const SPAWN_REASON_MAX_LEN = 500;
-
-// Spawned souls run their curator at a lighter cadence than main (every
-// 6h vs main's 2h) — they observe fewer rows per cycle so there's nothing
-// to curate hourly anyway.
-const SPAWNED_CURATOR_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 // Folder slug: lowercase, alphanumeric + hyphens. Same constraint
 // soulKeyDir enforces — duplicate here so spawn rejects bad slugs before
@@ -160,46 +153,6 @@ function insertSoulRow(
   );
 }
 
-function scheduleCuratorTask(
-  ctx: LifecycleContext,
-  folder: string,
-  channelJid: string | null,
-  now: Date,
-): void {
-  const id = `soul-wiki-curation-${folder}`;
-  const existing = getTaskById(id);
-  // Synthetic chat_jid for channel-less souls so the schema NOT NULL holds.
-  // The curator task doesn't message anywhere — chat_jid is metadata.
-  const chatJid = channelJid ?? `soul://${folder}`;
-  const scheduleValue = String(SPAWNED_CURATOR_INTERVAL_MS);
-  const prompt = buildWikiCurationPrompt(folder);
-
-  if (existing) {
-    updateTask(id, {
-      prompt,
-      schedule_type: 'interval',
-      schedule_value: scheduleValue,
-      status: 'active',
-    });
-    return;
-  }
-
-  createTask({
-    id,
-    group_folder: folder,
-    chat_jid: chatJid,
-    prompt,
-    schedule_type: 'interval',
-    schedule_value: scheduleValue,
-    context_mode: 'isolated',
-    next_run: new Date(
-      now.getTime() + SPAWNED_CURATOR_INTERVAL_MS,
-    ).toISOString(),
-    status: 'active',
-    created_at: now.toISOString(),
-  });
-}
-
 function setTasksStatus(
   db: Database.Database,
   folder: string,
@@ -304,8 +257,9 @@ export function spawnSoul(
   registerInMemory(soul);
   ctx.transport.registerSoul(did, ctx.buildSoulHandler(soul));
 
-  // Curator task (lighter cadence than main).
-  scheduleCuratorTask(ctx, opts.folder, opts.channelJid ?? null, now);
+  // No per-soul curator task: main is the sole curator for every soul
+  // (only main's container has DB access). Main's wiki-curation pass
+  // digests this soul's routed memory_stream rows into its wiki.
 
   logger.info(
     { folder: opts.folder, did, parent: opts.parentFolder },
