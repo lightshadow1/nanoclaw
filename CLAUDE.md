@@ -111,12 +111,13 @@ Memory Stream (SQLite, raw/immutable) → Wiki (markdown files, continuously cur
 | Phase 4: Planning + Initiative | Done | `PLANNING_PROMPT.md` | `planning-prompts.ts`, `proactive-budget.ts`, tasks: `soul-morning-plan-main`, `soul-check-in-main` |
 | Phase 4.5: Experimentation + Feedback | Done | `EXPERIMENTATION_PROMPT.md` | `timing-bandit.ts`, `experiment-store.ts`; migration `1.1.0` (tables: `experiment_episodes`, `experiment_tuning`); state file: `soul/experiment-state.json` |
 | Phase 5: Soul Protocol (transport-agnostic) | Done | `SOUL_PROTOCOL_PROMPT.md` | `protocol/` (envelope/signing/handler/transport-loopback/agent-card), `soul-registry.ts`, `soul-lifecycle.ts`, `soul-router.ts`; migration `1.2.0` (table: `souls`); per-soul keys at `~/.config/nanoclaw/soul/{folder}/`; in-process LoopbackTransport (IPC/network deferred) |
+| Phase 5.1: Spawn bridge + main-curates-all | Done | (this session) | `spawn_soul` MCP tool (`container/agent-runner/src/ipc-mcp-stdio.ts`) → IPC verb (`ipc.ts`) → `requestSpawnSoul` (`soul/index.ts`) → `spawnSoul`; main is the **sole curator for every soul** (spawned souls have no curator task — main's wiki-curation pass digests their routed rows into their wikis) |
 
 ### Soul Files
 
 ```
 src/capabilities/soul/
-  index.ts              # soulCapability: init, teardown, hooks, task registration
+  index.ts              # soulCapability: init, teardown, hooks, task registration; requestSpawnSoul() (host entry for the spawn_soul IPC verb)
   memory-stream.ts      # addMemory(), getUncurated(), MemoryType
   heuristic-score.ts    # heuristicScore() → 1-10
   wiki-scaffold.ts      # ensureWikiForGroup() — creates starter wiki pages
@@ -130,8 +131,8 @@ src/capabilities/soul/
   timing-bandit.ts      # Beta-Bernoulli arms, Marsaglia–Tsang Gamma sampler, Thompson ranking
   experiment-store.ts   # Episodes/posteriors/efficacy, backoff-state clamp, writeExperimentState, reviewGuardrails
   soul-registry.ts      # Runtime ActiveSoul registry; loadActiveSouls, resolvePublicKeyByDid
-  soul-lifecycle.ts     # spawnSoul / markDormant / markActive / archive / resurrect / processPendingSpawnApprovals
-  soul-router.ts        # Keyword-based routing of uncurated main observations into spawned souls
+  soul-lifecycle.ts     # spawnSoul / markDormant / markActive / archive / resurrect / processPendingSpawnApprovals (spawnSoul does NOT create a per-soul curator task — main curates all souls)
+  soul-router.ts        # Keyword-based routing of uncurated main observations into spawned souls (rows main's curator later digests into each soul's wiki)
   protocol/
     canonical.ts        # Recursive-key-sort JSON canonicalization (shared with identity.ts)
     types.ts            # Verb, MessageEnvelope, SignedMessage, verb body unions + guards
@@ -148,8 +149,9 @@ src/capabilities/soul/
 
 - Curation runs inside containers via scheduled tasks, NOT host-side LLM calls
 - Task prompts are static — the container agent reads live data (DB, files) itself
-- Curation restricted to main group only (non-main containers lack DB access)
-- `beforeTaskRun` hook gates curation (skip if no uncurated entries) — avoids unnecessary container spin-ups
+- **Main is the sole curator for every soul.** Only main's container has DB + repo access (`/workspace/project` + `messages.db` are mounted main-only), so spawned souls get no curator task of their own. Main's wiki-curation prompt has a Part 2 that lists active spawned souls and digests each one's routed `memory_stream` rows into its wiki at `/workspace/project/groups/<folder>/soul/wiki`. This is why spawned souls are channel-less *and* curator-less — they're fully serviced by main.
+- `beforeTaskRun` gates main's curation: run if main **or any active spawned soul** has uncurated entries; otherwise skip the container spin-up entirely
+- **Spawn-on-demand** is owner-initiated: the main agent calls the `spawn_soul` MCP tool when the owner asks for a dedicated soul → IPC file → host `processTaskIpc` (main-only auth) → `requestSpawnSoul` → `spawnSoul` (DID, keypair, wiki scaffold, registry + loopback registration). The agent is told in its CLAUDE.md that this tool is the *only* way to make a soul — never to fake one with files
 - Identity server binds 127.0.0.1 only (Tailscale Funnel handles TLS termination)
 - Private key at `~/.config/nanoclaw/soul/` (outside project, never mounted into containers)
 - Staleness markers: `<!-- last_confirmed: YYYY-MM-DD -->` on wiki sections, 14-day threshold
@@ -158,7 +160,7 @@ src/capabilities/soul/
 
 | Task ID | Schedule | Purpose |
 |---------|----------|---------|
-| `soul-wiki-curation-main` | Every 2 hours (interval) | Curate uncurated memory entries into wiki pages |
+| `soul-wiki-curation-main` | Every 2 hours (interval) | Part 1: curate main's uncurated memory into main's wiki. Part 2: for each active spawned soul, digest its routed uncurated rows into that soul's wiki. Gated: skip unless main or some active spawned soul has uncurated rows. (Spawned souls have **no** curator task of their own.) |
 | `soul-evening-journal-main` | 10 PM daily (cron) | Deep curation + plan reconciliation + staleness review |
 | `soul-morning-plan-main` | 6 AM daily (cron) | Generate daily-plan.json from wiki + pending interventions + Thompson timing + backoff (gated: skip if today's plan already written; host refreshes `experiment-state.json` first) |
 | `soul-check-in-main` | Every 2 hours (interval) | Step 0: evaluate `sent` plan items past the proximal window → insert episode row → flip to `done`. Step 1+: send proactive messages (gated: skip if budget exhausted, quiet hours, or withdrawal week; host refreshes `experiment-state.json` and runs self-rate-limited `reviewGuardrails` first) |
@@ -172,6 +174,8 @@ src/capabilities/soul/
 The original numbering called this "Claw Pod (A2A)" and assumed networked peer-to-peer between different NanoClaw instances as the primary motivation. That framing was retired because the multi-claw use case isn't apparent at this maturity level — a single soul covers most owner needs, and the peer-pod cold-start problem dominates any benefit.
 
 The recontextualized Phase 5 motivates the same protocol stack from a different angle: NanoClaw already supports multiple souls inside one process (`ctx.registeredGroups()`), and the natural next capability is **spawn-on-demand souls** — project souls, topic souls, person-scoped souls — most of them channel-less, speaking through the main soul as **spokesperson** on the single owner channel. The protocol is transport-agnostic: same A2A v1.2 + signed cards + RFC 9421 over an in-process transport in v1, with IPC and networked HTTPS as drop-in transports later. Loopback delivers the use case (intra-process multi-soul coordination); the network transport waits for an external use case to appear.
+
+Spawn-on-demand is now **wired and in production** (Phase 5.1): the owner asks the main agent in chat ("spawn a soul for X"), it calls the `spawn_soul` MCP tool, and the host brings a real channel-less soul online — its own DID/keypair/wiki, curated by main. Each spawned soul accumulates its knowledge in `groups/<folder>/soul/wiki/` and surfaces proposals through main. (Per-soul curator containers were tried and removed — non-main containers can't reach the DB, so main curates all souls instead.)
 
 ### Future: Networked Soul Pod
 
