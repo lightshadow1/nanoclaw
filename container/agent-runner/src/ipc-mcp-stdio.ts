@@ -393,6 +393,46 @@ The folder slug must be lowercase letters, digits, and hyphens only (e.g. "obser
   },
 );
 
+server.tool(
+  'publish_bet',
+  `Publish a proposed bet from the bets table to the owner's channel. Main group only.
+
+The HOST does the actual send: it formats the bet (title, body, recommendation), attaches one-tap response buttons (Act on it / Later / Not useful), stamps the bet as sent, consumes the daily proactive budget, and refreshes the pinned ledger. Do NOT also send the bet text via send_message — that would double-post.
+
+The bet must already exist with status 'proposed' (created via sqlite3 INSERT during a production pass). The host refuses to publish during quiet hours or when the proactive budget is exhausted.`,
+  {
+    bet_id: z.string().describe("The bets-table id of the 'proposed' bet to publish"),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [
+          { type: 'text' as const, text: 'Only the main soul can publish bets.' },
+        ],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'publish_bet',
+      betId: args.bet_id,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    const filename = writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `Bet ${args.bet_id} publish requested (${filename}). The host will send it with response buttons and update the ledger; check the bets table status if you need confirmation.`,
+        },
+      ],
+    };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

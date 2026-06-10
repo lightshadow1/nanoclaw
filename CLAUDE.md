@@ -112,6 +112,7 @@ Memory Stream (SQLite, raw/immutable) → Wiki (markdown files, continuously cur
 | Phase 4.5: Experimentation + Feedback | Done | `EXPERIMENTATION_PROMPT.md` | `timing-bandit.ts`, `experiment-store.ts`; migration `1.1.0` (tables: `experiment_episodes`, `experiment_tuning`); state file: `soul/experiment-state.json` |
 | Phase 5: Soul Protocol (transport-agnostic) | Done | `SOUL_PROTOCOL_PROMPT.md` | `protocol/` (envelope/signing/handler/transport-loopback/agent-card), `soul-registry.ts`, `soul-lifecycle.ts`, `soul-router.ts`; migration `1.2.0` (table: `souls`); per-soul keys at `~/.config/nanoclaw/soul/{folder}/`; in-process LoopbackTransport (IPC/network deferred) |
 | Phase 5.1: Spawn bridge + main-curates-all | Done | (this session) | `spawn_soul` MCP tool (`container/agent-runner/src/ipc-mcp-stdio.ts`) → IPC verb (`ipc.ts`) → `requestSpawnSoul` (`soul/index.ts`) → `spawnSoul`; main is the **sole curator for every soul** (spawned souls have no curator task — main's wiki-curation pass digests their routed rows into their wikis) |
+| Phase 6: Bet Ledger | Done | `BET_LEDGER_PROMPT.md` | `bet-store.ts`; migration `1.3.0` (table: `bets`); rewritten `planning-prompts.ts`; task `soul-production-main`; Telegram primitives (`src/channels/telegram.ts` buttons/reactions, `src/ledger.ts` pinned ledger); MCP tools `publish_bet`, `set_ledger`; timing bandit + withdrawal weeks demoted to dormant |
 
 ### Soul Files
 
@@ -126,10 +127,11 @@ src/capabilities/soul/
   identity.ts           # Ed25519 key management, DID document generation
   identity-server.ts    # HTTP server: /.well-known/did.json, agent-description.json
   agent-description.ts  # JSON-LD Agent Description generation
-  planning-prompts.ts   # Static prompts for morning plan + check-in tasks (Step 0 evaluation)
-  proactive-budget.ts   # Host-side gate: readBudget(), canSendProactive(), inWithdrawalPeriod()
-  timing-bandit.ts      # Beta-Bernoulli arms, Marsaglia–Tsang Gamma sampler, Thompson ranking
-  experiment-store.ts   # Episodes/posteriors/efficacy, backoff-state clamp, writeExperimentState, reviewGuardrails
+  planning-prompts.ts   # Static prompts: morning ledger maintenance, bet check-in, weekly production pass
+  bet-store.ts          # Phase 6: bets CRUD, expiry, ledger rendering, bet-message formatting, button parsing
+  proactive-budget.ts   # Host-side gate: readBudget(), canSendProactive(), recordProactiveSend(); inWithdrawalPeriod() (dormant)
+  timing-bandit.ts      # DORMANT (Phase 6): Beta-Bernoulli arms, Thompson ranking — no live call sites
+  experiment-store.ts   # DORMANT (Phase 6): episodes/posteriors/efficacy, writeExperimentState, reviewGuardrails — no live call sites
   soul-registry.ts      # Runtime ActiveSoul registry; loadActiveSouls, resolvePublicKeyByDid
   soul-lifecycle.ts     # spawnSoul / markDormant / markActive / archive / resurrect / processPendingSpawnApprovals (spawnSoul does NOT create a per-soul curator task — main curates all souls)
   soul-router.ts        # Keyword-based routing of uncurated main observations into spawned souls (rows main's curator later digests into each soul's wiki)
@@ -155,6 +157,7 @@ src/capabilities/soul/
 - Identity server binds 127.0.0.1 only (Tailscale Funnel handles TLS termination)
 - Private key at `~/.config/nanoclaw/soul/` (outside project, never mounted into containers)
 - Staleness markers: `<!-- last_confirmed: YYYY-MM-DD -->` on wiki sections, 14-day threshold
+- **Bets are the only sanctioned proactive outreach** (Phase 6). Owner silence is the noise baseline — never narrated, never analyzed. A bet = decision-ready finding (recommendation + pros/cons + concrete action) INSERTed into the `bets` table by the weekly production pass; the check-in publishes at most one via `publish_bet` (host sends with one-tap buttons, stamps `sent`, consumes budget, refreshes pinned ledger). Resolution is ground truth on a days timescale: button tap / 👍👎 reaction (host-side, `onChannelEvent`), topic reference (container judges), or 7-day timeout (host-side expiry — itself a valid label). Timing bandit + withdrawal weeks are demoted to dormant code; quiet hours + daily budget remain hard guardrails enforced host-side in `requestPublishBet`.
 
 ### Scheduled Soul Tasks (Main Group)
 
@@ -162,12 +165,13 @@ src/capabilities/soul/
 |---------|----------|---------|
 | `soul-wiki-curation-main` | Every 2 hours (interval) | Part 1: curate main's uncurated memory into main's wiki. Part 2: for each active spawned soul, digest its routed uncurated rows into that soul's wiki. Gated: skip unless main or some active spawned soul has uncurated rows. (Spawned souls have **no** curator task of their own.) |
 | `soul-evening-journal-main` | 10 PM daily (cron) | Deep curation + plan reconciliation + staleness review |
-| `soul-morning-plan-main` | 6 AM daily (cron) | Generate daily-plan.json from wiki + pending interventions + Thompson timing + backoff (gated: skip if today's plan already written; host refreshes `experiment-state.json` first) |
-| `soul-check-in-main` | Every 2 hours (interval) | Step 0: evaluate `sent` plan items past the proximal window → insert episode row → flip to `done`. Step 1+: send proactive messages (gated: skip if budget exhausted, quiet hours, or withdrawal week; host refreshes `experiment-state.json` and runs self-rate-limited `reviewGuardrails` first) |
+| `soul-morning-plan-main` | 6 AM daily (cron) | Ledger maintenance: retract stale proposed bets, surface pending interventions, write minimal daily-plan.json (reminder/project_work only, ≤2-sentence notes — no outreach items, no quiet-day narration). Gated: skip if today's plan exists. Host processes approved spawn_soul interventions first. |
+| `soul-check-in-main` | Every 2 hours (interval) | Step 0: resolve `sent` bets by topic reference in owner messages. Step 2: publish the single best `proposed` bet via `publish_bet`. Step 3: send pending plan reminders. Gated host-side: expire overdue bets first, then run only if (proposed bet && budget ok) OR (sent bet && uncurated owner observation) OR (pending reminder && budget ok). |
+| `soul-production-main` | Monday 9 AM (cron) | Weekly production pass: for each active soul (spawned + main), read its wiki, research its topics, update the wiki, and INSERT at most ONE decision-ready bet (skip souls with an open bet; global cap 3). Gated: skip when the ledger is at capacity. Never messages the owner directly. |
 
 ### Parent Spec
 
-`SOUL_IDENTITY_PROMPT.md` is the master design document covering the original Phases 0–5. Individual coding prompts (`WIKI_CURATION_PROMPT.md`, `IDENTITY_PROMPT.md`, `PLANNING_PROMPT.md`) are implementation specs derived from it. Two prompts insert outside the original numbering: `EXPERIMENTATION_PROMPT.md` (Phase 4.5) closes the feedback loop Phase 4 left open, and `SOUL_PROTOCOL_PROMPT.md` (Phase 5, recontextualized) replaces the original "Claw Pod (A2A)" framing with a smaller, transport-agnostic spec — same A2A v1.2 + signed AgentCards + RFC 9421 messages, with v1 implementing only the in-process (loopback) transport. Networked peer-pods become a future-work item, not a load-bearing phase.
+`SOUL_IDENTITY_PROMPT.md` is the master design document covering the original Phases 0–5. Individual coding prompts (`WIKI_CURATION_PROMPT.md`, `IDENTITY_PROMPT.md`, `PLANNING_PROMPT.md`) are implementation specs derived from it. Two prompts insert outside the original numbering: `EXPERIMENTATION_PROMPT.md` (Phase 4.5) closes the feedback loop Phase 4 left open, and `SOUL_PROTOCOL_PROMPT.md` (Phase 5, recontextualized) replaces the original "Claw Pod (A2A)" framing with a smaller, transport-agnostic spec — same A2A v1.2 + signed AgentCards + RFC 9421 messages, with v1 implementing only the in-process (loopback) transport. Networked peer-pods become a future-work item, not a load-bearing phase. `BET_LEDGER_PROMPT.md` (Phase 6) supersedes the Phase 4/4.5 planning layer: it replaces narrative daily plans, the timing bandit, and withdrawal weeks with the bet ledger, after the 2026-06 soak showed the proactive system optimizing message timing while having no decision-grade content to send.
 
 ### Phase 5 framing notes
 

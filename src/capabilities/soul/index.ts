@@ -16,6 +16,7 @@ import {
 import { logger } from '../../logger.js';
 import { createTask, getTaskById, updateTask } from '../../db.js';
 import {
+  betsMigration,
   experimentMigration,
   memoryStreamMigration,
   soulsMigration,
@@ -30,9 +31,25 @@ import {
 import {
   buildCheckInPrompt,
   buildMorningPlanPrompt,
+  buildProductionPrompt,
 } from './planning-prompts.js';
-import { canSendProactive, readBudget } from './proactive-budget.js';
-import { reviewGuardrails, writeExperimentState } from './experiment-store.js';
+import {
+  canSendProactive,
+  readBudget,
+  recordProactiveSend,
+} from './proactive-budget.js';
+import {
+  expireOverdueBets,
+  formatBetMessage,
+  getBetById,
+  getOpenBets,
+  markBetSent,
+  MAX_OPEN_BETS,
+  parseBetButton,
+  renderLedger,
+  resolveBetById,
+  resolveBetByMessageId,
+} from './bet-store.js';
 import {
   discoverCapabilities,
   generateAgentDescription,
@@ -80,6 +97,12 @@ let db: Database.Database | null = null;
 let groupsDir: string | null = null;
 let identityServer: http.Server | null = null;
 const scaffoldedGroups = new Set<string>();
+
+// Phase 6: outbound handles for the bet ledger. capCtx carries the host's
+// lazy sendMessage/setLedger closures; mainChatJid is where bets publish
+// (spawned souls are channel-less — everything surfaces on main's chat).
+let capCtx: CapabilityContext | null = null;
+let mainChatJid: string | null = null;
 
 // Phase 5 module state. Single LoopbackTransport shared across souls;
 // lifecycleCtx is what spawn/archive/resurrect close over (also used by
@@ -377,6 +400,79 @@ export function requestSpawnSoul(
   }
 }
 
+// Re-render the pinned bet ledger on main's chat. Fire-and-forget: the
+// ledger is a convenience surface and must never block or fail the caller.
+function refreshLedger(): void {
+  if (!db || !capCtx?.setLedger || !mainChatJid) return;
+  try {
+    const text = renderLedger(db);
+    void capCtx
+      .setLedger(mainChatJid, MAIN_GROUP_FOLDER, text)
+      .catch((err) => logger.warn({ err }, 'Bet ledger refresh failed'));
+  } catch (err) {
+    logger.warn({ err }, 'Bet ledger render failed');
+  }
+}
+
+// Host-callable entry point for publishing a proposed bet to the owner's
+// channel. The IPC watcher calls this when the main agent (typically the
+// check-in task) invokes the `publish_bet` MCP tool. The host owns the
+// send: message formatting, response buttons, sent-stamping, proactive
+// budget consumption, and the ledger refresh all happen here so the
+// container can't skip the bookkeeping.
+export type RequestPublishBetOutcome =
+  | { ok: true; betId: string }
+  | { ok: false; error: string };
+
+export async function requestPublishBet(input: {
+  betId: string;
+}): Promise<RequestPublishBetOutcome> {
+  if (!db || !groupsDir) {
+    return { ok: false, error: 'soul capability not initialized' };
+  }
+  if (!capCtx?.sendMessage) {
+    return { ok: false, error: 'host has no outbound channel wired' };
+  }
+  if (!mainChatJid) {
+    return { ok: false, error: 'no main chat registered' };
+  }
+
+  const bet = getBetById(db, input.betId);
+  if (!bet) return { ok: false, error: `bet ${input.betId} not found` };
+  if (bet.status !== 'proposed') {
+    return { ok: false, error: `bet is '${bet.status}', not 'proposed'` };
+  }
+
+  // Hard guardrail, independent of whatever the container believed.
+  const now = new Date();
+  if (!canSendProactive(readBudget(groupsDir, MAIN_GROUP_FOLDER, now), now)) {
+    return {
+      ok: false,
+      error: 'proactive budget exhausted or quiet hours — try next window',
+    };
+  }
+
+  const { text, buttons } = formatBetMessage(bet);
+  let messageId: string | null = null;
+  try {
+    messageId = await capCtx.sendMessage(mainChatJid, text, { buttons });
+  } catch (err) {
+    return {
+      ok: false,
+      error: `send failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  if (!markBetSent(db, bet.id, messageId, now)) {
+    // Lost a race (double IPC delivery) — the message went out once already.
+    return { ok: false, error: 'bet was no longer proposed at send time' };
+  }
+  recordProactiveSend(groupsDir, MAIN_GROUP_FOLDER, now);
+  refreshLedger();
+  logger.info({ betId: bet.id, soul: bet.groupFolder }, 'Bet published');
+  return { ok: true, betId: bet.id };
+}
+
 function scaffoldOnce(folder: string): void {
   if (!groupsDir || scaffoldedGroups.has(folder)) return;
   try {
@@ -495,6 +591,18 @@ function ensureSoulTasks(ctx: CapabilityContext): void {
     schedule_type: 'interval',
     schedule_value: '7200000',
   });
+
+  // Phase 6: weekly production pass — each soul turns accumulated knowledge
+  // + fresh research into at most one decision-ready bet. Main-run (only
+  // main's container reaches the DB and every soul's wiki).
+  upsertSoulTask({
+    id: `soul-production-${MAIN_GROUP_FOLDER}`,
+    group_folder: MAIN_GROUP_FOLDER,
+    chat_jid: mainJid,
+    prompt: buildProductionPrompt(MAIN_GROUP_FOLDER),
+    schedule_type: 'cron',
+    schedule_value: '0 9 * * 1', // Monday 9 AM local
+  });
 }
 
 const SOUL_CLAUDE_MD_MARKER = '<!-- soul-section -->';
@@ -507,9 +615,13 @@ You have a soul — a persistent identity and memory that spans sessions.
 
 - Your knowledge wiki lives at \`soul/wiki/\` — start by reading \`soul/wiki/_index.md\` at the beginning of each session.
 - Load specific wiki pages (people / preferences / learnings / topic pages) based on what the conversation is about.
-- Today's plan: \`soul/daily-plan.json\` — your scheduled intentions for today (regenerated each morning, archived to \`soul/plan-history/\` each evening).
+- Today's plan: \`soul/daily-plan.json\` — reminders and project work only (regenerated each morning, archived to \`soul/plan-history/\` each evening).
 - Proactive budget: \`soul/proactive-budget.json\` — tracks how many outreach messages you've sent today. Stay within it.
 - Your wiki is curated between sessions by a scheduled task. Trust it as your long-term memory; do not duplicate its contents in chat replies.
+
+### Bets
+
+Unprompted outreach to the owner happens ONLY through **bets** — decision-ready findings (a recommendation with pros/cons and a concrete action) stored in the \`bets\` table and published with the \`publish_bet\` tool, which attaches one-tap response buttons and a pinned ledger. Owner silence is the noise baseline: never compose ad-hoc check-ins, never narrate quiet days, never analyze the owner's engagement patterns. If the owner taps a button on a bet (you'll see it as \`[<name> tapped "..."]\`), that's them speaking — act on the choice.
 
 When you encounter a situation needing human input (approval, clarification, cost exceeding threshold), raise an **intervention** — store it in the memory stream with \`type = 'intervention'\` and structured metadata, then message the owner with the question and options.
 
@@ -582,11 +694,21 @@ export const soulCapability: Capability = {
     return value === 'true';
   },
 
-  migrations: [memoryStreamMigration, experimentMigration, soulsMigration],
+  migrations: [
+    memoryStreamMigration,
+    experimentMigration,
+    soulsMigration,
+    betsMigration,
+  ],
 
   init: async (ctx) => {
     db = ctx.db;
     groupsDir = ctx.groupsDir;
+    capCtx = ctx;
+    mainChatJid =
+      Object.entries(ctx.registeredGroups()).find(
+        ([, g]) => g.folder === MAIN_GROUP_FOLDER,
+      )?.[0] ?? null;
     scaffoldedGroups.clear();
     for (const { folder } of Object.values(ctx.registeredGroups())) {
       scaffoldOnce(folder);
@@ -659,10 +781,59 @@ export const soulCapability: Capability = {
     mainSoulDid = null;
     db = null;
     groupsDir = null;
+    capCtx = null;
+    mainChatJid = null;
     scaffoldedGroups.clear();
   },
 
   hooks: {
+    // Phase 6: ground-truth bet resolution from interaction events.
+    // Button taps carry `bet:<id>:<resolution>`; reactions resolve the bet
+    // whose published message was reacted to (👍/❤️ → acted, 👎 → rejected).
+    onChannelEvent: (event) => {
+      if (!db) return;
+      try {
+        if (event.kind === 'button') {
+          const parsed = parseBetButton(event.data);
+          if (!parsed) return;
+          const resolved = resolveBetById(
+            db,
+            parsed.betId,
+            parsed.resolution,
+            'button',
+          );
+          if (resolved) {
+            logger.info(
+              { betId: parsed.betId, resolution: parsed.resolution },
+              'Bet resolved via button',
+            );
+            refreshLedger();
+          }
+          return;
+        }
+
+        // Reaction: only meaningful on a sent bet's message.
+        const positive = ['👍', '❤️', '🔥', '💯'].includes(event.emoji);
+        const negative = event.emoji === '👎';
+        if (!positive && !negative) return;
+        const bet = resolveBetByMessageId(
+          db,
+          event.messageId,
+          positive ? 'acted' : 'rejected',
+          'reaction',
+        );
+        if (bet) {
+          logger.info(
+            { betId: bet.id, emoji: event.emoji },
+            'Bet resolved via reaction',
+          );
+          refreshLedger();
+        }
+      } catch (err) {
+        logger.error({ err }, 'Failed to process channel event for bets');
+      }
+    },
+
     beforeTaskRun: (task) => {
       // Wiki curation: main is the sole curator for every soul (only it has
       // DB access). Route main's uncurated observations out to spawned
@@ -689,62 +860,100 @@ export const soulCapability: Capability = {
         return pending !== undefined;
       }
 
-      // Check-in: refresh experiment-state.json so the container reads a
-      // current Thompson draw + backoff, then run the (self-rate-limited)
-      // guardrail review. Skip the run itself if proactive budget is
-      // exhausted or it's quiet hours.
+      // Check-in (Phase 6): expire overdue bets host-side first (that's
+      // deterministic — no container needed), then spin up the container
+      // only when it has actual work:
+      //   - a proposed bet exists and the budget allows publishing, or
+      //   - a sent bet awaits resolution AND the owner has said something
+      //     new (uncurated observations) worth checking for references, or
+      //   - the daily plan holds a pending reminder and the budget allows.
       if (task.id === `soul-check-in-${MAIN_GROUP_FOLDER}`) {
         if (!groupsDir) return true;
         const now = new Date();
-        if (db) {
-          try {
-            writeExperimentState(db, groupsDir, MAIN_GROUP_FOLDER, now);
-            const review = reviewGuardrails(db, MAIN_GROUP_FOLDER, now);
-            if (review.driftAlerts.length > 0) {
-              logger.warn(
-                { alerts: review.driftAlerts },
-                'Soul guardrail drift alerts',
-              );
-            }
-            if (review.rolledBack) {
-              logger.warn(
-                {
-                  trailing: review.trailingEfficacy,
-                  baseline: review.baselineEfficacy,
-                },
-                'Soul guardrail rolled back backoff state',
-              );
-            }
-          } catch (err) {
-            logger.error(
-              { err },
-              'Failed to refresh experiment state / review guardrails',
-            );
-          }
+        if (!db) {
+          return canSendProactive(
+            readBudget(groupsDir, MAIN_GROUP_FOLDER, now),
+            now,
+          );
         }
-        return canSendProactive(
+        try {
+          if (expireOverdueBets(db, now) > 0) refreshLedger();
+        } catch (err) {
+          logger.error({ err }, 'Failed to expire overdue bets');
+        }
+
+        const budgetOk = canSendProactive(
           readBudget(groupsDir, MAIN_GROUP_FOLDER, now),
           now,
         );
-      }
+        let hasProposed = false;
+        let hasSent = false;
+        try {
+          for (const bet of getOpenBets(db)) {
+            if (bet.status === 'proposed') hasProposed = true;
+            if (bet.status === 'sent') hasSent = true;
+          }
+        } catch (err) {
+          logger.error({ err }, 'Failed to read open bets; failing open');
+          return true;
+        }
 
-      // Morning plan: refresh experiment-state.json so the container reads
-      // a current Thompson timing draw + backoff. Also process any
-      // resolved+approved spawn_soul interventions so newly-spawned souls
-      // are visible to today's plan. Then skip if today's plan is already
-      // written.
-      if (task.id === `soul-morning-plan-${MAIN_GROUP_FOLDER}`) {
-        if (!groupsDir) return true;
-        if (db) {
-          try {
-            writeExperimentState(db, groupsDir, MAIN_GROUP_FOLDER, new Date());
-          } catch (err) {
-            logger.error(
-              { err },
-              'Failed to refresh experiment state for morning plan',
+        const ownerSpokeRecently =
+          hasSent &&
+          db
+            .prepare(
+              `SELECT 1 FROM memory_stream
+                WHERE group_folder = ? AND type = 'observation'
+                  AND curated = 0
+                LIMIT 1`,
+            )
+            .get(MAIN_GROUP_FOLDER) !== undefined;
+
+        let planHasReminder = false;
+        try {
+          const planPath = path.join(
+            groupsDir,
+            MAIN_GROUP_FOLDER,
+            'soul',
+            'daily-plan.json',
+          );
+          if (fs.existsSync(planPath)) {
+            const plan = JSON.parse(fs.readFileSync(planPath, 'utf-8')) as {
+              items?: { type?: string; status?: string }[];
+            };
+            planHasReminder = (plan.items ?? []).some(
+              (i) => i.type === 'reminder' && i.status === 'pending',
             );
           }
+        } catch {
+          // malformed plan — ignore; reminders just wait for the next pass
         }
+
+        return (
+          (hasProposed && budgetOk) ||
+          ownerSpokeRecently ||
+          (planHasReminder && budgetOk)
+        );
+      }
+
+      // Production pass: skip the weekly run entirely when the ledger is
+      // already at capacity — the prompt would just no-op.
+      if (task.id === `soul-production-${MAIN_GROUP_FOLDER}`) {
+        if (!db) return true;
+        try {
+          return getOpenBets(db).length < MAX_OPEN_BETS;
+        } catch (err) {
+          logger.error({ err }, 'Failed to check bet capacity; failing open');
+          return true;
+        }
+      }
+
+      // Morning plan: process any resolved+approved spawn_soul interventions
+      // so newly-spawned souls are visible to today's plan, then skip if
+      // today's plan is already written. (Phase 6 dropped the experiment
+      // state refresh — the timing bandit no longer drives planning.)
+      if (task.id === `soul-morning-plan-${MAIN_GROUP_FOLDER}`) {
+        if (!groupsDir) return true;
         if (lifecycleCtx) {
           try {
             const res = processPendingSpawnApprovals(lifecycleCtx);
