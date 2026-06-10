@@ -1,18 +1,22 @@
-import { Bot } from 'grammy';
+import { Bot, InlineKeyboard } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { logger } from '../logger.js';
 import {
   Channel,
+  OnChannelEvent,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
+  SendOptions,
 } from '../types.js';
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  // Optional: button taps and reactions. Only registered chats emit events.
+  onChannelEvent?: OnChannelEvent;
 }
 
 export class TelegramChannel implements Channel {
@@ -164,14 +168,97 @@ export class TelegramChannel implements Channel {
     this.bot.on('message:location', (ctx) => storeNonText(ctx, '[Location]'));
     this.bot.on('message:contact', (ctx) => storeNonText(ctx, '[Contact]'));
 
+    // Button taps. Telegram requires answering every callback query (the
+    // client shows a spinner until we do), then we surface the tap as a
+    // ChannelEvent so the host can both record it and react to it.
+    this.bot.on('callback_query:data', async (ctx) => {
+      try {
+        await ctx.answerCallbackQuery();
+      } catch (err) {
+        logger.debug({ err }, 'Failed to answer Telegram callback query');
+      }
+
+      const msg = ctx.callbackQuery.message;
+      if (!msg) return;
+      const chatJid = `tg:${msg.chat.id}`;
+      if (!this.opts.registeredGroups()[chatJid]) return;
+
+      // Resolve the human-readable label from the keyboard we sent.
+      const data = ctx.callbackQuery.data;
+      let label: string | undefined;
+      const keyboard = msg.reply_markup?.inline_keyboard ?? [];
+      for (const row of keyboard) {
+        for (const btn of row) {
+          if ('callback_data' in btn && btn.callback_data === data) {
+            label = btn.text;
+          }
+        }
+      }
+
+      const sourceText =
+        'text' in msg && msg.text ? msg.text.slice(0, 80) : undefined;
+
+      this.opts.onChannelEvent?.({
+        kind: 'button',
+        chatJid,
+        messageId: msg.message_id.toString(),
+        sender: ctx.from.id.toString(),
+        senderName: ctx.from.first_name || ctx.from.username || 'Unknown',
+        data,
+        label,
+        sourceText,
+        timestamp: new Date().toISOString(),
+      });
+    });
+
+    // Reactions. Not in Telegram's default update set — see allowed_updates
+    // in start() below. Only newly-added emoji are reported (removals are
+    // visible in old_reaction but not interesting to us).
+    this.bot.on('message_reaction', (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      if (!this.opts.registeredGroups()[chatJid]) return;
+
+      const update = ctx.messageReaction;
+      const oldEmoji = new Set(
+        update.old_reaction
+          .filter((r) => r.type === 'emoji')
+          .map((r) => (r as { emoji: string }).emoji),
+      );
+      const added = update.new_reaction
+        .filter((r) => r.type === 'emoji')
+        .map((r) => (r as { emoji: string }).emoji)
+        .filter((e) => !oldEmoji.has(e));
+      if (added.length === 0) return;
+
+      this.opts.onChannelEvent?.({
+        kind: 'reaction',
+        chatJid,
+        messageId: update.message_id.toString(),
+        sender: update.user?.id.toString() || '',
+        senderName:
+          update.user?.first_name || update.user?.username || 'Unknown',
+        emoji: added[added.length - 1],
+        timestamp: new Date(update.date * 1000).toISOString(),
+      });
+    });
+
     // Handle errors gracefully
     this.bot.catch((err) => {
       logger.error({ err: err.message }, 'Telegram bot error');
     });
 
-    // Start polling — returns a Promise that resolves when started
+    // Start polling — returns a Promise that resolves when started.
+    // allowed_updates must be explicit: message_reaction is excluded from
+    // Telegram's default set, and once you pass the list you must include
+    // everything you want (it replaces, not extends, the default).
     return new Promise<void>((resolve) => {
       this.bot!.start({
+        allowed_updates: [
+          'message',
+          'edited_message',
+          'callback_query',
+          'message_reaction',
+        ],
         onStart: (botInfo) => {
           logger.info(
             { username: botInfo.username, id: botInfo.id },
@@ -187,31 +274,77 @@ export class TelegramChannel implements Channel {
     });
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(
+    jid: string,
+    text: string,
+    opts?: SendOptions,
+  ): Promise<string | null> {
     if (!this.bot) {
       logger.warn('Telegram bot not initialized');
-      return;
+      return null;
     }
 
     try {
       const numericId = jid.replace(/^tg:/, '');
 
-      // Telegram has a 4096 character limit per message — split if needed
+      let keyboard: InlineKeyboard | undefined;
+      if (opts?.buttons && opts.buttons.length > 0) {
+        const kb = new InlineKeyboard();
+        opts.buttons.forEach((row, idx) => {
+          if (idx > 0) kb.row();
+          for (const btn of row) {
+            // callback_data is capped at 64 bytes by Telegram.
+            kb.text(btn.label, btn.id.slice(0, 64));
+          }
+        });
+        keyboard = kb;
+      }
+
+      // Telegram has a 4096 character limit per message — split if needed.
+      // Buttons attach to the LAST chunk so they sit under the full text.
       const MAX_LENGTH = 4096;
-      if (text.length <= MAX_LENGTH) {
-        await this.bot.api.sendMessage(numericId, text);
-      } else {
-        for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await this.bot.api.sendMessage(
-            numericId,
-            text.slice(i, i + MAX_LENGTH),
-          );
-        }
+      const chunks: string[] = [];
+      for (let i = 0; i < text.length; i += MAX_LENGTH) {
+        chunks.push(text.slice(i, i + MAX_LENGTH));
+      }
+
+      let lastMessageId: string | null = null;
+      for (let i = 0; i < chunks.length; i++) {
+        const isLast = i === chunks.length - 1;
+        const sent = await this.bot.api.sendMessage(numericId, chunks[i], {
+          disable_notification: opts?.silent || undefined,
+          reply_markup: isLast ? keyboard : undefined,
+        });
+        lastMessageId = sent.message_id.toString();
       }
       logger.info({ jid, length: text.length }, 'Telegram message sent');
+      return lastMessageId;
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Telegram message');
+      return null;
     }
+  }
+
+  async editMessage(
+    jid: string,
+    messageId: string,
+    text: string,
+  ): Promise<void> {
+    if (!this.bot) throw new Error('Telegram bot not initialized');
+    const numericId = jid.replace(/^tg:/, '');
+    await this.bot.api.editMessageText(
+      numericId,
+      parseInt(messageId, 10),
+      text.slice(0, 4096),
+    );
+  }
+
+  async pinMessage(jid: string, messageId: string): Promise<void> {
+    if (!this.bot) throw new Error('Telegram bot not initialized');
+    const numericId = jid.replace(/^tg:/, '');
+    await this.bot.api.pinChatMessage(numericId, parseInt(messageId, 10), {
+      disable_notification: true,
+    });
   }
 
   isConnected(): boolean {

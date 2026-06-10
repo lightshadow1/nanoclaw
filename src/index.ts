@@ -39,12 +39,13 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { startIpcWatcher } from './ipc.js';
+import { setLedger } from './ledger.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import { Channel, ChannelEvent, NewMessage, RegisteredGroup, SendOptions } from './types.js';
 import { logger } from './logger.js';
 import { loadCapabilities, teardownCapabilities } from './capabilities/registry.js';
-import { dispatchMessageStored, dispatchMessageSent, dispatchShutdown } from './capabilities/hooks.js';
+import { dispatchChannelEvent, dispatchMessageStored, dispatchMessageSent, dispatchShutdown } from './capabilities/hooks.js';
 import { requestSpawnSoul } from './capabilities/soul/index.js';
 
 // Re-export for backwards compatibility during refactor
@@ -428,12 +429,37 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  // Outbound primitives shared by capabilities and the IPC watcher. Lazy:
+  // `channels` is module-level and populated after capabilities load, so
+  // these resolve a channel at call time, not at wiring time.
+  const sendViaChannel = (
+    jid: string,
+    text: string,
+    opts?: SendOptions,
+  ): Promise<string | null> => {
+    const channel = findChannel(channels, jid);
+    if (!channel) throw new Error(`No channel for JID: ${jid}`);
+    return channel.sendMessage(jid, text, opts);
+  };
+  const setLedgerForGroup = (
+    chatJid: string,
+    folder: string,
+    text: string,
+  ): Promise<void> => {
+    const channel = findChannel(channels, chatJid);
+    if (!channel) throw new Error(`No channel for JID: ${chatJid}`);
+    return setLedger(channel, chatJid, folder, text);
+  };
+
   await loadCapabilities({
     db: getDb(),
     registeredGroups: () => registeredGroups,
     projectRoot: process.cwd(),
     groupsDir: GROUPS_DIR,
     dataDir: DATA_DIR,
+    sendMessage: sendViaChannel,
+    setLedger: setLedgerForGroup,
   });
 
   // Graceful shutdown handlers
@@ -470,6 +496,28 @@ async function main(): Promise<void> {
     onChatMetadata: (chatJid: string, timestamp: string, name?: string, channel?: string, isGroup?: boolean) =>
       storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    onChannelEvent: (event: ChannelEvent) => {
+      // Capabilities get every event (e.g. the soul resolves bets from taps).
+      dispatchChannelEvent(event);
+
+      // A button tap is the owner speaking — synthesize an inbound message
+      // so the conversational agent picks it up and can act on the choice.
+      // Reactions stay ambient: recorded by capabilities, no agent wake-up.
+      if (event.kind === 'button') {
+        const content = `[${event.senderName} tapped "${event.label ?? event.data}"${
+          event.sourceText ? ` — re: "${event.sourceText}"` : ''
+        }]`;
+        channelOpts.onMessage(event.chatJid, {
+          id: `${event.messageId}-btn-${Date.now()}`,
+          chat_jid: event.chatJid,
+          sender: event.sender,
+          sender_name: event.senderName,
+          content,
+          timestamp: event.timestamp,
+          is_from_me: false,
+        });
+      }
+    },
   };
 
   // Create and connect channels based on CHANNELS config
@@ -507,11 +555,8 @@ async function main(): Promise<void> {
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
-    },
+    sendMessage: sendViaChannel,
+    setLedger: setLedgerForGroup,
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroupMetadata: (force) => whatsapp?.syncGroupMetadata(force) ?? Promise.resolve(),

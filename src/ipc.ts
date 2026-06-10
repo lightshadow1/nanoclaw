@@ -12,7 +12,7 @@ import {
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { MessageButton, RegisteredGroup, SendOptions } from './types.js';
 
 export interface SpawnSoulRequest {
   folder: string;
@@ -27,7 +27,14 @@ export type SpawnSoulOutcome =
   | { ok: false; error: string };
 
 export interface IpcDeps {
-  sendMessage: (jid: string, text: string) => Promise<void>;
+  sendMessage: (
+    jid: string,
+    text: string,
+    opts?: SendOptions,
+  ) => Promise<string | null>;
+  // Create-or-edit a group's pinned ledger message. Optional: absent in
+  // hosts/tests that don't wire channels.
+  setLedger?: (chatJid: string, folder: string, text: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
@@ -41,6 +48,43 @@ export interface IpcDeps {
   // Optional: wired by the host only when the soul capability is enabled.
   // Absent → spawn_soul IPC requests are logged and dropped.
   spawnSoul?: (req: SpawnSoulRequest) => SpawnSoulOutcome;
+}
+
+// Sanitize container-supplied inline buttons. Caps keep a compromised or
+// confused agent from rendering walls of buttons; Telegram limits
+// callback_data to 64 bytes.
+const MAX_BUTTON_ROWS = 3;
+const MAX_BUTTONS_PER_ROW = 3;
+const MAX_BUTTON_ID_LEN = 64;
+const MAX_BUTTON_LABEL_LEN = 48;
+
+export function sanitizeButtons(raw: unknown): MessageButton[][] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const rows: MessageButton[][] = [];
+  for (const rawRow of raw.slice(0, MAX_BUTTON_ROWS)) {
+    if (!Array.isArray(rawRow)) continue;
+    const row: MessageButton[] = [];
+    for (const btn of rawRow.slice(0, MAX_BUTTONS_PER_ROW)) {
+      if (
+        typeof btn === 'object' &&
+        btn !== null &&
+        typeof (btn as { id?: unknown }).id === 'string' &&
+        typeof (btn as { label?: unknown }).label === 'string' &&
+        (btn as { id: string }).id.length > 0 &&
+        (btn as { label: string }).label.length > 0
+      ) {
+        row.push({
+          id: (btn as { id: string }).id.slice(0, MAX_BUTTON_ID_LEN),
+          label: (btn as { label: string }).label.slice(
+            0,
+            MAX_BUTTON_LABEL_LEN,
+          ),
+        });
+      }
+    }
+    if (row.length > 0) rows.push(row);
+  }
+  return rows.length > 0 ? rows : undefined;
 }
 
 let ipcWatcherRunning = false;
@@ -93,7 +137,10 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  await deps.sendMessage(data.chatJid, data.text, {
+                    buttons: sanitizeButtons(data.buttons),
+                    silent: data.silent === true || undefined,
+                  });
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',
@@ -189,6 +236,8 @@ export async function processTaskIpc(
     description?: string;
     spawnReason?: string;
     topicKeywords?: string[];
+    // For set_ledger
+    text?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -435,6 +484,37 @@ export async function processTaskIpc(
             'spawn_soul request failed',
           );
         }
+      }
+      break;
+
+    case 'set_ledger':
+      // A group maintains its OWN chat's pinned ledger; main may set any.
+      if (!deps.setLedger) {
+        logger.warn(
+          { sourceGroup },
+          'set_ledger requested but host has no ledger support wired',
+        );
+        break;
+      }
+      if (!data.chatJid || typeof data.text !== 'string' || !data.text) {
+        logger.warn({ data }, 'Invalid set_ledger request');
+        break;
+      }
+      {
+        const targetGroup = registeredGroups[data.chatJid];
+        if (!isMain && (!targetGroup || targetGroup.folder !== sourceGroup)) {
+          logger.warn(
+            { chatJid: data.chatJid, sourceGroup },
+            'Unauthorized set_ledger attempt blocked',
+          );
+          break;
+        }
+        const ledgerFolder = targetGroup?.folder ?? sourceGroup;
+        await deps.setLedger(data.chatJid, ledgerFolder, data.text);
+        logger.info(
+          { chatJid: data.chatJid, sourceGroup },
+          'Ledger updated via IPC',
+        );
       }
       break;
 

@@ -32,8 +32,10 @@ vi.mock('grammy', () => ({
     errorHandler: Handler | null = null;
 
     api = {
-      sendMessage: vi.fn().mockResolvedValue(undefined),
+      sendMessage: vi.fn().mockResolvedValue({ message_id: 42 }),
       sendChatAction: vi.fn().mockResolvedValue(undefined),
+      editMessageText: vi.fn().mockResolvedValue(undefined),
+      pinChatMessage: vi.fn().mockResolvedValue(undefined),
     };
 
     constructor(token: string) {
@@ -60,6 +62,20 @@ vi.mock('grammy', () => ({
     }
 
     stop() {}
+  },
+  InlineKeyboard: class MockInlineKeyboard {
+    inline_keyboard: { text: string; callback_data: string }[][] = [[]];
+    text(label: string, data: string) {
+      this.inline_keyboard[this.inline_keyboard.length - 1].push({
+        text: label,
+        callback_data: data,
+      });
+      return this;
+    }
+    row() {
+      this.inline_keyboard.push([]);
+      return this;
+    }
   },
 }));
 
@@ -696,7 +712,18 @@ describe('TelegramChannel', () => {
       expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
         '100200300',
         'Hello',
+        { disable_notification: undefined, reply_markup: undefined },
       );
+    });
+
+    it('returns the channel message id', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await expect(
+        channel.sendMessage('tg:100200300', 'Hello'),
+      ).resolves.toBe('42');
     });
 
     it('strips tg: prefix from JID', async () => {
@@ -709,6 +736,7 @@ describe('TelegramChannel', () => {
       expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
         '-1001234567890',
         'Group message',
+        { disable_notification: undefined, reply_markup: undefined },
       );
     });
 
@@ -725,11 +753,13 @@ describe('TelegramChannel', () => {
         1,
         '100200300',
         'x'.repeat(4096),
+        { disable_notification: undefined, reply_markup: undefined },
       );
       expect(currentBot().api.sendMessage).toHaveBeenNthCalledWith(
         2,
         '100200300',
         'x'.repeat(904),
+        { disable_notification: undefined, reply_markup: undefined },
       );
     });
 
@@ -756,7 +786,7 @@ describe('TelegramChannel', () => {
       // Should not throw
       await expect(
         channel.sendMessage('tg:100200300', 'Will fail'),
-      ).resolves.toBeUndefined();
+      ).resolves.toBeNull();
     });
 
     it('does nothing when bot is not initialized', async () => {
@@ -767,6 +797,238 @@ describe('TelegramChannel', () => {
       await channel.sendMessage('tg:100200300', 'No bot');
 
       // No error, no API call
+    });
+  });
+
+  // --- interaction primitives (buttons, callbacks, reactions, edit/pin) ---
+
+  describe('sendMessage options', () => {
+    it('attaches inline keyboard from buttons option', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.sendMessage('tg:100200300', 'Pick one', {
+        buttons: [
+          [
+            { id: 'bet:1:acted', label: '✅ Act on it' },
+            { id: 'bet:1:rejected', label: '❌ Not useful' },
+          ],
+          [{ id: 'bet:1:deferred', label: '⏸ Later' }],
+        ],
+      });
+
+      const call = currentBot().api.sendMessage.mock.calls[0];
+      expect(call[2].reply_markup.inline_keyboard).toEqual([
+        [
+          { text: '✅ Act on it', callback_data: 'bet:1:acted' },
+          { text: '❌ Not useful', callback_data: 'bet:1:rejected' },
+        ],
+        [{ text: '⏸ Later', callback_data: 'bet:1:deferred' }],
+      ]);
+    });
+
+    it('passes disable_notification for silent sends', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.sendMessage('tg:100200300', 'Ambient update', {
+        silent: true,
+      });
+
+      expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
+        '100200300',
+        'Ambient update',
+        { disable_notification: true, reply_markup: undefined },
+      );
+    });
+
+    it('attaches buttons only to the last chunk of a split message', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.sendMessage('tg:100200300', 'z'.repeat(5000), {
+        buttons: [[{ id: 'b1', label: 'OK' }]],
+      });
+
+      const calls = currentBot().api.sendMessage.mock.calls;
+      expect(calls).toHaveLength(2);
+      expect(calls[0][2].reply_markup).toBeUndefined();
+      expect(calls[1][2].reply_markup).toBeDefined();
+    });
+  });
+
+  describe('callback queries', () => {
+    function createCallbackCtx(overrides?: {
+      data?: string;
+      chatId?: number;
+      messageText?: string;
+    }) {
+      return {
+        callbackQuery: {
+          data: overrides?.data ?? 'bet:1:acted',
+          message: {
+            message_id: 77,
+            chat: { id: overrides?.chatId ?? 100200300 },
+            text: overrides?.messageText ?? 'Bet: do the thing',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '✅ Act on it', callback_data: 'bet:1:acted' }],
+              ],
+            },
+          },
+        },
+        from: { id: 99001, first_name: 'Alice', username: 'alice_user' },
+        answerCallbackQuery: vi.fn().mockResolvedValue(undefined),
+      };
+    }
+
+    async function triggerCallback(ctx: unknown) {
+      const handlers =
+        currentBot().filterHandlers.get('callback_query:data') || [];
+      for (const h of handlers) await h(ctx);
+    }
+
+    it('answers the callback and emits a button event', async () => {
+      const onChannelEvent = vi.fn();
+      const opts = createTestOpts({ onChannelEvent });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createCallbackCtx();
+      await triggerCallback(ctx);
+
+      expect(ctx.answerCallbackQuery).toHaveBeenCalled();
+      expect(onChannelEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'button',
+          chatJid: 'tg:100200300',
+          messageId: '77',
+          sender: '99001',
+          senderName: 'Alice',
+          data: 'bet:1:acted',
+          label: '✅ Act on it',
+          sourceText: 'Bet: do the thing',
+        }),
+      );
+    });
+
+    it('ignores callbacks from unregistered chats', async () => {
+      const onChannelEvent = vi.fn();
+      const opts = createTestOpts({ onChannelEvent });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerCallback(createCallbackCtx({ chatId: 555 }));
+
+      expect(onChannelEvent).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('reactions', () => {
+    async function triggerReaction(ctx: unknown) {
+      const handlers =
+        currentBot().filterHandlers.get('message_reaction') || [];
+      for (const h of handlers) await h(ctx);
+    }
+
+    function createReactionCtx(overrides?: {
+      chatId?: number;
+      newEmoji?: string[];
+      oldEmoji?: string[];
+    }) {
+      const chatId = overrides?.chatId ?? 100200300;
+      return {
+        chat: { id: chatId },
+        messageReaction: {
+          message_id: 88,
+          date: 1750000000,
+          user: { id: 99001, first_name: 'Alice' },
+          old_reaction: (overrides?.oldEmoji ?? []).map((e) => ({
+            type: 'emoji',
+            emoji: e,
+          })),
+          new_reaction: (overrides?.newEmoji ?? ['👍']).map((e) => ({
+            type: 'emoji',
+            emoji: e,
+          })),
+        },
+      };
+    }
+
+    it('emits a reaction event for newly added emoji', async () => {
+      const onChannelEvent = vi.fn();
+      const opts = createTestOpts({ onChannelEvent });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerReaction(createReactionCtx());
+
+      expect(onChannelEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'reaction',
+          chatJid: 'tg:100200300',
+          messageId: '88',
+          senderName: 'Alice',
+          emoji: '👍',
+        }),
+      );
+    });
+
+    it('does not emit when reactions were only removed', async () => {
+      const onChannelEvent = vi.fn();
+      const opts = createTestOpts({ onChannelEvent });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerReaction(
+        createReactionCtx({ newEmoji: [], oldEmoji: ['👍'] }),
+      );
+
+      expect(onChannelEvent).not.toHaveBeenCalled();
+    });
+
+    it('ignores reactions from unregistered chats', async () => {
+      const onChannelEvent = vi.fn();
+      const opts = createTestOpts({ onChannelEvent });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerReaction(createReactionCtx({ chatId: 555 }));
+
+      expect(onChannelEvent).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('editMessage / pinMessage', () => {
+    it('edits a message in place', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.editMessage('tg:100200300', '42', 'Updated text');
+
+      expect(currentBot().api.editMessageText).toHaveBeenCalledWith(
+        '100200300',
+        42,
+        'Updated text',
+      );
+    });
+
+    it('pins a message silently', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.pinMessage('tg:100200300', '42');
+
+      expect(currentBot().api.pinChatMessage).toHaveBeenCalledWith(
+        '100200300',
+        42,
+        { disable_notification: true },
+      );
     });
   });
 

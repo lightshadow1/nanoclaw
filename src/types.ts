@@ -78,15 +78,68 @@ export interface TaskRunLog {
 
 // --- Channel abstraction ---
 
+// One row of inline buttons. `id` becomes the callback payload delivered back
+// as a ChannelEvent when the user taps it (Telegram callback_data, max 64
+// bytes). Channels without button support ignore these.
+export interface MessageButton {
+  id: string;
+  label: string;
+}
+
+export interface SendOptions {
+  buttons?: MessageButton[][];
+  // Deliver without a notification sound (Telegram disable_notification).
+  // For ambient/low-priority content that shouldn't buzz the owner's phone.
+  silent?: boolean;
+}
+
+// Interaction events that aren't messages: button taps and reactions.
+// `messageId` is the channel-native id of the message interacted with.
+export interface ChannelButtonEvent {
+  kind: 'button';
+  chatJid: string;
+  messageId: string;
+  sender: string;
+  senderName: string;
+  data: string; // the tapped button's id
+  label?: string; // the tapped button's label, when resolvable
+  sourceText?: string; // excerpt of the message the button was attached to
+  timestamp: string;
+}
+
+export interface ChannelReactionEvent {
+  kind: 'reaction';
+  chatJid: string;
+  messageId: string;
+  sender: string;
+  senderName: string;
+  emoji: string;
+  timestamp: string;
+}
+
+export type ChannelEvent = ChannelButtonEvent | ChannelReactionEvent;
+
+export type OnChannelEvent = (event: ChannelEvent) => void;
+
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  // Returns the channel-native message id when the channel exposes one
+  // (Telegram), null otherwise. Callers that don't track ids ignore it.
+  sendMessage(
+    jid: string,
+    text: string,
+    opts?: SendOptions,
+  ): Promise<string | null>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  // Optional: edit a previously sent message in place.
+  editMessage?(jid: string, messageId: string, text: string): Promise<void>;
+  // Optional: pin a message in the chat.
+  pinMessage?(jid: string, messageId: string): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

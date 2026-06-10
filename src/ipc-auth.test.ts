@@ -8,7 +8,7 @@ import {
   getTaskById,
   setRegisteredGroup,
 } from './db.js';
-import { processTaskIpc, IpcDeps, SpawnSoulRequest } from './ipc.js';
+import { processTaskIpc, sanitizeButtons, IpcDeps, SpawnSoulRequest } from './ipc.js';
 import { RegisteredGroup } from './types.js';
 
 // Set up registered groups used across tests
@@ -53,7 +53,7 @@ beforeEach(() => {
 
   spawnCalls = [];
   deps = {
-    sendMessage: async () => {},
+    sendMessage: async () => null,
     registeredGroups: () => groups,
     registerGroup: (jid, group) => {
       groups[jid] = group;
@@ -668,5 +668,127 @@ describe('spawn_soul', () => {
     );
 
     expect(spawnCalls).toHaveLength(0);
+  });
+});
+
+// --- set_ledger authorization ---
+
+describe('set_ledger', () => {
+  let ledgerCalls: { chatJid: string; folder: string; text: string }[];
+
+  beforeEach(() => {
+    ledgerCalls = [];
+    deps.setLedger = async (chatJid, folder, text) => {
+      ledgerCalls.push({ chatJid, folder, text });
+    };
+  });
+
+  it('group can set its own chat ledger', async () => {
+    await processTaskIpc(
+      { type: 'set_ledger', chatJid: 'other@g.us', text: 'ledger body' },
+      'other-group',
+      false,
+      deps,
+    );
+
+    expect(ledgerCalls).toEqual([
+      { chatJid: 'other@g.us', folder: 'other-group', text: 'ledger body' },
+    ]);
+  });
+
+  it("non-main group cannot set another group's ledger", async () => {
+    await processTaskIpc(
+      { type: 'set_ledger', chatJid: 'third@g.us', text: 'sneaky' },
+      'other-group',
+      false,
+      deps,
+    );
+
+    expect(ledgerCalls).toHaveLength(0);
+  });
+
+  it('main can set any ledger', async () => {
+    await processTaskIpc(
+      { type: 'set_ledger', chatJid: 'other@g.us', text: 'from main' },
+      'main',
+      true,
+      deps,
+    );
+
+    expect(ledgerCalls).toEqual([
+      { chatJid: 'other@g.us', folder: 'other-group', text: 'from main' },
+    ]);
+  });
+
+  it('drops requests with missing fields', async () => {
+    await processTaskIpc(
+      { type: 'set_ledger', chatJid: 'other@g.us' },
+      'other-group',
+      false,
+      deps,
+    );
+    await processTaskIpc(
+      { type: 'set_ledger', text: 'no chat' },
+      'other-group',
+      false,
+      deps,
+    );
+
+    expect(ledgerCalls).toHaveLength(0);
+  });
+
+  it('drops requests when host has no ledger support wired', async () => {
+    deps.setLedger = undefined;
+    // Must not throw
+    await processTaskIpc(
+      { type: 'set_ledger', chatJid: 'other@g.us', text: 'x' },
+      'other-group',
+      false,
+      deps,
+    );
+  });
+});
+
+// --- button sanitization ---
+
+describe('sanitizeButtons', () => {
+  it('passes well-formed rows through', () => {
+    expect(
+      sanitizeButtons([
+        [{ id: 'a', label: 'A' }],
+        [{ id: 'b', label: 'B' }, { id: 'c', label: 'C' }],
+      ]),
+    ).toEqual([
+      [{ id: 'a', label: 'A' }],
+      [{ id: 'b', label: 'B' }, { id: 'c', label: 'C' }],
+    ]);
+  });
+
+  it('caps rows and buttons per row', () => {
+    const row = [
+      { id: '1', label: 'x' },
+      { id: '2', label: 'x' },
+      { id: '3', label: 'x' },
+      { id: '4', label: 'x' },
+    ];
+    const result = sanitizeButtons([row, row, row, row]);
+    expect(result).toHaveLength(3);
+    for (const r of result!) expect(r).toHaveLength(3);
+  });
+
+  it('truncates oversized ids and labels', () => {
+    const result = sanitizeButtons([
+      [{ id: 'i'.repeat(100), label: 'l'.repeat(100) }],
+    ]);
+    expect(result![0][0].id).toHaveLength(64);
+    expect(result![0][0].label).toHaveLength(48);
+  });
+
+  it('rejects malformed input', () => {
+    expect(sanitizeButtons('nope')).toBeUndefined();
+    expect(sanitizeButtons([['nope']])).toBeUndefined();
+    expect(sanitizeButtons([[{ id: '', label: 'x' }]])).toBeUndefined();
+    expect(sanitizeButtons([[{ id: 'x' }]])).toBeUndefined();
+    expect(sanitizeButtons([])).toBeUndefined();
   });
 });
