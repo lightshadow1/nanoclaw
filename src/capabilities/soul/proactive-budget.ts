@@ -98,6 +98,30 @@ export function readBudget(
 }
 
 /**
+ * Consume one unit of proactive budget after a HOST-side send (e.g.
+ * publish_bet). The container-side check-in still updates the file itself
+ * after its own send_message calls; the two writers never race in practice
+ * because host sends happen synchronously inside IPC handling, not while a
+ * check-in container is mid-run on the same item.
+ */
+export function recordProactiveSend(
+  groupsDir: string,
+  folder: string,
+  now: Date = new Date(),
+): void {
+  const budget = readBudget(groupsDir, folder, now);
+  budget.messages_sent += 1;
+  budget.last_message_at = now.toISOString();
+  const dir = path.join(groupsDir, folder, 'soul');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'proactive-budget.json'),
+    JSON.stringify(budget, null, 2),
+    'utf-8',
+  );
+}
+
+/**
  * True iff the agent is allowed to send a proactive message at `now`.
  *
  * Does NOT consume budget. The container increments the counter on its own

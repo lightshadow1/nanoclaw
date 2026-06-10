@@ -46,7 +46,7 @@ import { Channel, ChannelEvent, NewMessage, RegisteredGroup, SendOptions } from 
 import { logger } from './logger.js';
 import { loadCapabilities, teardownCapabilities } from './capabilities/registry.js';
 import { dispatchChannelEvent, dispatchMessageStored, dispatchMessageSent, dispatchShutdown } from './capabilities/hooks.js';
-import { requestSpawnSoul } from './capabilities/soul/index.js';
+import { requestPublishBet, requestSpawnSoul } from './capabilities/soul/index.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -565,6 +565,7 @@ async function main(): Promise<void> {
     // No-ops to an error result if the soul capability is disabled / not
     // initialized; the IPC handler logs and drops the request in that case.
     spawnSoul: (req) => requestSpawnSoul(req),
+    publishBet: (req) => requestPublishBet(req),
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();

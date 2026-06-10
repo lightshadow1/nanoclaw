@@ -113,7 +113,7 @@ import {
   type BetaPosterior,
   type TimingArm,
 } from './timing-bandit.js';
-import { soulCapability } from './index.js';
+import { requestPublishBet, soulCapability } from './index.js';
 
 // Tiny seeded LCG for deterministic bandit tests. Numerical Recipes constants.
 function seededRng(seed: number): () => number {
@@ -640,6 +640,12 @@ describe('ensureSoulTasks', () => {
     expect(checkIn!.schedule_value).toBe('7200000');
     expect(checkIn!.prompt).toContain('proactive-budget.json');
 
+    const production = getTaskById('soul-production-main');
+    expect(production).toBeDefined();
+    expect(production!.schedule_type).toBe('cron');
+    expect(production!.schedule_value).toBe('0 9 * * 1');
+    expect(production!.prompt).toContain('INSERT INTO bets');
+
     await soulCapability.teardown!();
   });
 
@@ -687,7 +693,7 @@ describe('ensureSoulTasks', () => {
         "SELECT COUNT(*) as n FROM scheduled_tasks WHERE id LIKE 'soul-%'",
       )
       .get() as { n: number };
-    expect(count.n).toBe(4);
+    expect(count.n).toBe(5);
 
     // next_run was preserved (cadence not reset on re-init)
     expect(getTaskById('soul-wiki-curation-main')!.next_run).toBe(firstNextRun);
@@ -792,14 +798,45 @@ describe('soulCapability beforeTaskRun gate', () => {
     };
   }
 
-  function writePlan(folder: string, dateStr: string): void {
+  function writePlan(
+    folder: string,
+    dateStr: string,
+    items: { type?: string; status?: string }[] = [],
+  ): void {
     const soulDir = path.join(tmpDir, folder, 'soul');
     fs.mkdirSync(soulDir, { recursive: true });
     fs.writeFileSync(
       path.join(soulDir, 'daily-plan.json'),
-      JSON.stringify({ date: dateStr, items: [] }),
+      JSON.stringify({ date: dateStr, items }),
       'utf-8',
     );
+  }
+
+  function insertBet(overrides?: {
+    id?: string;
+    groupFolder?: string;
+    status?: string;
+    sentAt?: string | null;
+    channelMessageId?: string | null;
+    windowDays?: number;
+  }): string {
+    const id =
+      overrides?.id ?? `bet-${Math.random().toString(36).slice(2, 10)}`;
+    getDb()
+      .prepare(
+        `INSERT INTO bets (id, group_folder, title, body, status, created_at,
+           sent_at, channel_message_id, window_days)
+         VALUES (?, ?, 'Test bet', 'Body', ?, datetime('now'), ?, ?, ?)`,
+      )
+      .run(
+        id,
+        overrides?.groupFolder ?? 'observability',
+        overrides?.status ?? 'proposed',
+        overrides?.sentAt ?? null,
+        overrides?.channelMessageId ?? null,
+        overrides?.windowDays ?? 7,
+      );
+    return id;
   }
 
   function writeBudgetFile(
@@ -838,10 +875,11 @@ describe('soulCapability beforeTaskRun gate', () => {
     vi.useRealTimers();
   }
 
-  it('allows check-in at 2 PM with a fresh budget', async () => {
+  it('allows check-in when a proposed bet exists and the budget is fresh', async () => {
     pinClock(new Date(2026, 4, 15, 14, 0, 0)); // May 15, 2026, 2:00 PM local
     try {
       await soulCapability.init(ctx());
+      insertBet({ status: 'proposed' });
       writeBudgetFile('main', {
         date: todayLocal(),
         messages_sent: 0,
@@ -855,44 +893,64 @@ describe('soulCapability beforeTaskRun gate', () => {
     }
   });
 
-  it('skips check-in at 11 PM (quiet hours) even when the budget is fresh', async () => {
-    pinClock(new Date(2026, 4, 15, 23, 0, 0));
-    try {
-      await soulCapability.init(ctx());
-      writeBudgetFile('main', {
-        date: todayLocal(),
-        messages_sent: 0,
-        last_message_at: null,
-      });
-      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
-      expect(allow).toBe(false);
-      await soulCapability.teardown!();
-    } finally {
-      releaseClock();
-    }
-  });
-
-  it('skips check-in at 5 AM (quiet hours) even when the budget is fresh', async () => {
-    pinClock(new Date(2026, 4, 15, 5, 0, 0));
-    try {
-      await soulCapability.init(ctx());
-      writeBudgetFile('main', {
-        date: todayLocal(),
-        messages_sent: 0,
-        last_message_at: null,
-      });
-      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
-      expect(allow).toBe(false);
-      await soulCapability.teardown!();
-    } finally {
-      releaseClock();
-    }
-  });
-
-  it('skips check-in at 2 PM when budget is exhausted', async () => {
+  it('skips check-in when there is nothing to do (no bets, no reminders)', async () => {
     pinClock(new Date(2026, 4, 15, 14, 0, 0));
     try {
       await soulCapability.init(ctx());
+      writeBudgetFile('main', {
+        date: todayLocal(),
+        messages_sent: 0,
+        last_message_at: null,
+      });
+      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+      expect(allow).toBe(false);
+      await soulCapability.teardown!();
+    } finally {
+      releaseClock();
+    }
+  });
+
+  it('skips check-in at 11 PM (quiet hours) even with a proposed bet', async () => {
+    pinClock(new Date(2026, 4, 15, 23, 0, 0));
+    try {
+      await soulCapability.init(ctx());
+      insertBet({ status: 'proposed' });
+      writeBudgetFile('main', {
+        date: todayLocal(),
+        messages_sent: 0,
+        last_message_at: null,
+      });
+      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+      expect(allow).toBe(false);
+      await soulCapability.teardown!();
+    } finally {
+      releaseClock();
+    }
+  });
+
+  it('skips check-in at 5 AM (quiet hours) even with a proposed bet', async () => {
+    pinClock(new Date(2026, 4, 15, 5, 0, 0));
+    try {
+      await soulCapability.init(ctx());
+      insertBet({ status: 'proposed' });
+      writeBudgetFile('main', {
+        date: todayLocal(),
+        messages_sent: 0,
+        last_message_at: null,
+      });
+      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+      expect(allow).toBe(false);
+      await soulCapability.teardown!();
+    } finally {
+      releaseClock();
+    }
+  });
+
+  it('skips check-in at 2 PM when budget is exhausted, even with a proposed bet', async () => {
+    pinClock(new Date(2026, 4, 15, 14, 0, 0));
+    try {
+      await soulCapability.init(ctx());
+      insertBet({ status: 'proposed' });
       writeBudgetFile('main', {
         date: todayLocal(),
         messages_sent: 3, // PROACTIVE_MAX_MESSAGES
@@ -904,6 +962,118 @@ describe('soulCapability beforeTaskRun gate', () => {
     } finally {
       releaseClock();
     }
+  });
+
+  it('allows check-in for reference resolution when a sent bet awaits and the owner spoke, regardless of budget', async () => {
+    pinClock(new Date(2026, 4, 15, 14, 0, 0));
+    try {
+      await soulCapability.init(ctx());
+      insertBet({ status: 'sent', sentAt: new Date().toISOString() });
+      // Uncurated owner observation = "the owner said something new".
+      addMemory(getDb(), {
+        groupFolder: 'main',
+        timestamp: new Date().toISOString(),
+        type: 'observation',
+        source: 'telegram',
+        content: 'I tried the Langfuse setup you suggested',
+        importance: 5,
+      });
+      writeBudgetFile('main', {
+        date: todayLocal(),
+        messages_sent: 3, // exhausted — resolution work is not a send
+        last_message_at: '2000-01-01T00:00:00Z',
+      });
+      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+      expect(allow).toBe(true);
+      await soulCapability.teardown!();
+    } finally {
+      releaseClock();
+    }
+  });
+
+  it('skips check-in when a sent bet awaits but the owner has been silent', async () => {
+    pinClock(new Date(2026, 4, 15, 14, 0, 0));
+    try {
+      await soulCapability.init(ctx());
+      insertBet({ status: 'sent', sentAt: new Date().toISOString() });
+      writeBudgetFile('main', {
+        date: todayLocal(),
+        messages_sent: 0,
+        last_message_at: null,
+      });
+      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+      expect(allow).toBe(false);
+      await soulCapability.teardown!();
+    } finally {
+      releaseClock();
+    }
+  });
+
+  it('expires overdue sent bets host-side during the gate', async () => {
+    pinClock(new Date(2026, 4, 15, 14, 0, 0));
+    try {
+      await soulCapability.init(ctx());
+      const overdue = insertBet({
+        status: 'sent',
+        sentAt: new Date(2026, 4, 1, 12, 0, 0).toISOString(), // 14 days ago
+        windowDays: 7,
+      });
+      writeBudgetFile('main', {
+        date: todayLocal(),
+        messages_sent: 0,
+        last_message_at: null,
+      });
+      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+      expect(allow).toBe(false); // nothing left to do once expired
+      const row = getDb()
+        .prepare('SELECT status, resolution, resolution_source FROM bets WHERE id = ?')
+        .get(overdue) as { status: string; resolution: string; resolution_source: string };
+      expect(row.status).toBe('expired');
+      expect(row.resolution).toBe('expired');
+      expect(row.resolution_source).toBe('timeout');
+      await soulCapability.teardown!();
+    } finally {
+      releaseClock();
+    }
+  });
+
+  it('allows check-in when the plan holds a pending reminder and budget is fresh', async () => {
+    pinClock(new Date(2026, 4, 15, 14, 0, 0));
+    try {
+      await soulCapability.init(ctx());
+      writePlan('main', todayLocal(), [
+        { type: 'reminder', status: 'pending' },
+      ]);
+      writeBudgetFile('main', {
+        date: todayLocal(),
+        messages_sent: 0,
+        last_message_at: null,
+      });
+      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+      expect(allow).toBe(true);
+      await soulCapability.teardown!();
+    } finally {
+      releaseClock();
+    }
+  });
+
+  it('runs the production pass when below bet capacity and skips at capacity', async () => {
+    await soulCapability.init(ctx());
+    const productionTask = {
+      id: 'soul-production-main',
+      group_folder: 'main',
+      schedule_type: 'cron' as const,
+    };
+    expect(await soulCapability.hooks!.beforeTaskRun!(productionTask)).toBe(
+      true,
+    );
+    insertBet({ status: 'proposed' });
+    insertBet({ status: 'sent', sentAt: new Date().toISOString() });
+    insertBet({ status: 'proposed' });
+    expect(await soulCapability.hooks!.beforeTaskRun!(productionTask)).toBe(
+      false,
+    );
+    await soulCapability.teardown!();
   });
 
   it("skips morning plan when today's plan already exists", async () => {
@@ -941,6 +1111,253 @@ describe('soulCapability beforeTaskRun gate', () => {
     const allow = await soulCapability.hooks!.beforeTaskRun!(morningPlanTask());
     expect(allow).toBe(true);
     await soulCapability.teardown!();
+  });
+});
+
+describe('bet ledger: channel events + publish (Phase 6)', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  function insertBet(overrides?: {
+    id?: string;
+    status?: string;
+    sentAt?: string | null;
+    channelMessageId?: string | null;
+  }): string {
+    const id =
+      overrides?.id ?? `bet-${Math.random().toString(36).slice(2, 10)}`;
+    getDb()
+      .prepare(
+        `INSERT INTO bets (id, group_folder, title, body, status, created_at,
+           sent_at, channel_message_id, window_days)
+         VALUES (?, 'observability', 'Test bet', 'Body', ?, datetime('now'), ?, ?, 7)`,
+      )
+      .run(
+        id,
+        overrides?.status ?? 'proposed',
+        overrides?.sentAt ?? null,
+        overrides?.channelMessageId ?? null,
+      );
+    return id;
+  }
+
+  function outboundCtx() {
+    const sendMessage = vi.fn().mockResolvedValue('321');
+    const setLedger = vi.fn().mockResolvedValue(undefined);
+    return {
+      ctx: {
+        db: getDb(),
+        registeredGroups: () => ({
+          'main@g.us': { name: 'Main', folder: 'main' },
+        }),
+        projectRoot: tmpDir,
+        groupsDir: tmpDir,
+        dataDir: tmpDir,
+        sendMessage,
+        setLedger,
+      },
+      sendMessage,
+      setLedger,
+    };
+  }
+
+  it('button tap resolves the bet and refreshes the ledger', async () => {
+    const { ctx, setLedger } = outboundCtx();
+    await soulCapability.init(ctx);
+    const id = insertBet({
+      status: 'sent',
+      sentAt: new Date().toISOString(),
+      channelMessageId: '777',
+    });
+
+    soulCapability.hooks!.onChannelEvent!({
+      kind: 'button',
+      chatJid: 'main@g.us',
+      messageId: '777',
+      sender: '1',
+      senderName: 'Will',
+      data: `bet:${id}:acted`,
+      timestamp: new Date().toISOString(),
+    });
+
+    const row = getDb()
+      .prepare('SELECT status, resolution, resolution_source FROM bets WHERE id = ?')
+      .get(id) as { status: string; resolution: string; resolution_source: string };
+    expect(row.status).toBe('resolved');
+    expect(row.resolution).toBe('acted');
+    expect(row.resolution_source).toBe('button');
+    expect(setLedger).toHaveBeenCalled();
+
+    await soulCapability.teardown!();
+  });
+
+  it('ignores non-bet button payloads', async () => {
+    const { ctx, setLedger } = outboundCtx();
+    await soulCapability.init(ctx);
+    const id = insertBet({ status: 'sent', sentAt: new Date().toISOString() });
+
+    soulCapability.hooks!.onChannelEvent!({
+      kind: 'button',
+      chatJid: 'main@g.us',
+      messageId: '777',
+      sender: '1',
+      senderName: 'Will',
+      data: 'unrelated:button',
+      timestamp: new Date().toISOString(),
+    });
+
+    expect(
+      (getDb().prepare('SELECT status FROM bets WHERE id = ?').get(id) as {
+        status: string;
+      }).status,
+    ).toBe('sent');
+    expect(setLedger).not.toHaveBeenCalled();
+    await soulCapability.teardown!();
+  });
+
+  it('👍 reaction on the bet message resolves it as acted; 👎 as rejected', async () => {
+    const { ctx } = outboundCtx();
+    await soulCapability.init(ctx);
+    const up = insertBet({
+      status: 'sent',
+      sentAt: new Date().toISOString(),
+      channelMessageId: '100',
+    });
+    const down = insertBet({
+      status: 'sent',
+      sentAt: new Date().toISOString(),
+      channelMessageId: '200',
+    });
+
+    soulCapability.hooks!.onChannelEvent!({
+      kind: 'reaction',
+      chatJid: 'main@g.us',
+      messageId: '100',
+      sender: '1',
+      senderName: 'Will',
+      emoji: '👍',
+      timestamp: new Date().toISOString(),
+    });
+    soulCapability.hooks!.onChannelEvent!({
+      kind: 'reaction',
+      chatJid: 'main@g.us',
+      messageId: '200',
+      sender: '1',
+      senderName: 'Will',
+      emoji: '👎',
+      timestamp: new Date().toISOString(),
+    });
+    // Irrelevant emoji on an unrelated message — no-op.
+    soulCapability.hooks!.onChannelEvent!({
+      kind: 'reaction',
+      chatJid: 'main@g.us',
+      messageId: '300',
+      sender: '1',
+      senderName: 'Will',
+      emoji: '🤔',
+      timestamp: new Date().toISOString(),
+    });
+
+    const get = (id: string) =>
+      getDb().prepare('SELECT resolution FROM bets WHERE id = ?').get(id) as {
+        resolution: string | null;
+      };
+    expect(get(up).resolution).toBe('acted');
+    expect(get(down).resolution).toBe('rejected');
+    await soulCapability.teardown!();
+  });
+
+  it('requestPublishBet sends with buttons, stamps the bet, consumes budget, refreshes ledger', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(2026, 4, 15, 14, 0, 0)); // 2 PM local
+    try {
+      const { ctx, sendMessage, setLedger } = outboundCtx();
+      await soulCapability.init(ctx);
+      const id = insertBet();
+
+      const result = await requestPublishBet({ betId: id });
+      expect(result).toEqual({ ok: true, betId: id });
+
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      const [jid, text, opts] = sendMessage.mock.calls[0];
+      expect(jid).toBe('main@g.us');
+      expect(text).toContain('🎯 Test bet');
+      expect(opts.buttons[0].map((b: { id: string }) => b.id)).toEqual([
+        `bet:${id}:acted`,
+        `bet:${id}:deferred`,
+        `bet:${id}:rejected`,
+      ]);
+
+      const row = getDb()
+        .prepare('SELECT status, channel_message_id FROM bets WHERE id = ?')
+        .get(id) as { status: string; channel_message_id: string };
+      expect(row.status).toBe('sent');
+      expect(row.channel_message_id).toBe('321');
+
+      const budget = JSON.parse(
+        fs.readFileSync(
+          path.join(tmpDir, 'main', 'soul', 'proactive-budget.json'),
+          'utf-8',
+        ),
+      ) as { messages_sent: number };
+      expect(budget.messages_sent).toBe(1);
+      expect(setLedger).toHaveBeenCalled();
+
+      await soulCapability.teardown!();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('requestPublishBet refuses during quiet hours', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(2026, 4, 15, 23, 0, 0)); // 11 PM local
+    try {
+      const { ctx, sendMessage } = outboundCtx();
+      await soulCapability.init(ctx);
+      const id = insertBet();
+
+      const result = await requestPublishBet({ betId: id });
+      expect(result.ok).toBe(false);
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(
+        (getDb().prepare('SELECT status FROM bets WHERE id = ?').get(id) as {
+          status: string;
+        }).status,
+      ).toBe('proposed');
+
+      await soulCapability.teardown!();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('requestPublishBet refuses unknown and non-proposed bets', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(2026, 4, 15, 14, 0, 0));
+    try {
+      const { ctx, sendMessage } = outboundCtx();
+      await soulCapability.init(ctx);
+
+      expect((await requestPublishBet({ betId: 'nope' })).ok).toBe(false);
+
+      const sent = insertBet({
+        status: 'sent',
+        sentAt: new Date().toISOString(),
+      });
+      expect((await requestPublishBet({ betId: sent })).ok).toBe(false);
+      expect(sendMessage).not.toHaveBeenCalled();
+
+      await soulCapability.teardown!();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('requestPublishBet errors cleanly when the capability is not initialized', async () => {
+    const result = await requestPublishBet({ betId: 'x' });
+    expect(result.ok).toBe(false);
   });
 });
 
@@ -2387,29 +2804,48 @@ describe('inWithdrawalPeriod', () => {
   });
 });
 
-describe('planning-prompts: Phase 4.5 additions', () => {
-  it('buildMorningPlanPrompt references experiment-state.json and backoff rules', async () => {
+describe('planning-prompts: Phase 6 bet ledger', () => {
+  it('buildMorningPlanPrompt is ledger maintenance, not outreach planning', async () => {
     const { buildMorningPlanPrompt } = await import('./planning-prompts.js');
     const prompt = buildMorningPlanPrompt('main');
-    expect(prompt).toContain('experiment-state.json');
-    expect(prompt).toContain('thompson_ranking');
-    expect(prompt).toContain('withdrawal_week');
-    expect(prompt).toContain('outreach_multiplier');
-    expect(prompt).toContain(String(MIN_OUTREACH_MULTIPLIER));
+    expect(prompt).toContain('bets');
+    expect(prompt).toContain('retracted');
+    expect(prompt).toContain('NO outreach items');
+    // The narrative-planning machinery is gone.
+    expect(prompt).not.toContain('experiment-state.json');
+    expect(prompt).not.toContain('thompson_ranking');
+    expect(prompt).not.toContain('withdrawal_week');
+    expect(prompt).not.toContain('check_in');
   });
 
-  it('buildCheckInPrompt contains the Step 0 evaluation and experiment_episodes insert', async () => {
+  it('buildCheckInPrompt resolves and publishes bets', async () => {
     const { buildCheckInPrompt } = await import('./planning-prompts.js');
     const prompt = buildCheckInPrompt('main');
     expect(prompt).toContain('Step 0');
-    expect(prompt).toContain('experiment_episodes');
-    expect(prompt).toContain('proximal');
-    expect(prompt).toContain('withdrawal_week');
-    expect(prompt).toContain('"sent"'); // the interim status
+    expect(prompt).toContain("resolution = 'referenced'");
+    expect(prompt).toContain('publish_bet');
+    expect(prompt).toContain('proactive-budget.json');
+    // Old proximal-window evaluation is gone.
+    expect(prompt).not.toContain('experiment_episodes');
+    expect(prompt).not.toContain('withdrawal_week');
+    expect(prompt).not.toContain('timing_arm');
   });
 
-  // Touch the constants so unused-import lint doesn't pull them later.
-  it('exports the phase-4.5 tuning constants used in tests', () => {
+  it('buildProductionPrompt enforces the decision-ready bar and caps', async () => {
+    const { buildProductionPrompt } = await import('./planning-prompts.js');
+    const { MAX_OPEN_BETS } = await import('./bet-store.js');
+    const prompt = buildProductionPrompt('main');
+    expect(prompt).toContain('AT MOST ONE bet');
+    expect(prompt).toContain('INSERT INTO bets');
+    expect(prompt).toContain(String(MAX_OPEN_BETS));
+    expect(prompt).toContain('pros/cons');
+    // Production never messages the owner directly.
+    expect(prompt).toContain('never messages the owner directly');
+  });
+
+  // Touch the dormant phase-4.5 constants — the modules stay (demoted, not
+  // deleted) and these guard against accidental removal while data exists.
+  it('keeps the phase-4.5 tuning constants exported (dormant)', () => {
     expect(DRIFT_ALERT_DELTA).toBeGreaterThan(0);
     expect(EPISODE_DECAY_DAYS).toBeGreaterThan(0);
   });

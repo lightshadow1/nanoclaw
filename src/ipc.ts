@@ -48,6 +48,10 @@ export interface IpcDeps {
   // Optional: wired by the host only when the soul capability is enabled.
   // Absent → spawn_soul IPC requests are logged and dropped.
   spawnSoul?: (req: SpawnSoulRequest) => SpawnSoulOutcome;
+  // Optional: publish a proposed bet to the owner's channel (Phase 6).
+  publishBet?: (req: {
+    betId: string;
+  }) => Promise<{ ok: true; betId: string } | { ok: false; error: string }>;
 }
 
 // Sanitize container-supplied inline buttons. Caps keep a compromised or
@@ -238,6 +242,8 @@ export async function processTaskIpc(
     topicKeywords?: string[];
     // For set_ledger
     text?: string;
+    // For publish_bet
+    betId?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -482,6 +488,40 @@ export async function processTaskIpc(
           logger.warn(
             { folder: data.folder, error: result.error },
             'spawn_soul request failed',
+          );
+        }
+      }
+      break;
+
+    case 'publish_bet':
+      // Bets publish to the owner's main channel with budget consumption —
+      // main-only, like spawn_soul.
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized publish_bet attempt blocked',
+        );
+        break;
+      }
+      if (!deps.publishBet) {
+        logger.warn(
+          { sourceGroup },
+          'publish_bet requested but soul capability is not enabled',
+        );
+        break;
+      }
+      if (!data.betId) {
+        logger.warn({ data }, 'Invalid publish_bet request - missing betId');
+        break;
+      }
+      {
+        const result = await deps.publishBet({ betId: data.betId });
+        if (result.ok) {
+          logger.info({ betId: result.betId, sourceGroup }, 'Bet published via IPC');
+        } else {
+          logger.warn(
+            { betId: data.betId, error: result.error },
+            'publish_bet request failed',
           );
         }
       }

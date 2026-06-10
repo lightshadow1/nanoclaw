@@ -792,3 +792,53 @@ describe('sanitizeButtons', () => {
     expect(sanitizeButtons([])).toBeUndefined();
   });
 });
+
+// --- publish_bet authorization ---
+
+describe('publish_bet', () => {
+  let publishCalls: { betId: string }[];
+
+  beforeEach(() => {
+    publishCalls = [];
+    deps.publishBet = async (req) => {
+      publishCalls.push(req);
+      return { ok: true, betId: req.betId };
+    };
+  });
+
+  it('main can publish a bet', async () => {
+    await processTaskIpc(
+      { type: 'publish_bet', betId: 'bet-1' },
+      'main',
+      true,
+      deps,
+    );
+    expect(publishCalls).toEqual([{ betId: 'bet-1' }]);
+  });
+
+  it('non-main groups cannot publish bets', async () => {
+    await processTaskIpc(
+      { type: 'publish_bet', betId: 'bet-1' },
+      'other-group',
+      false,
+      deps,
+    );
+    expect(publishCalls).toHaveLength(0);
+  });
+
+  it('drops requests missing betId', async () => {
+    await processTaskIpc({ type: 'publish_bet' }, 'main', true, deps);
+    expect(publishCalls).toHaveLength(0);
+  });
+
+  it('drops requests when soul capability is not wired', async () => {
+    deps.publishBet = undefined;
+    // Must not throw
+    await processTaskIpc(
+      { type: 'publish_bet', betId: 'bet-1' },
+      'main',
+      true,
+      deps,
+    );
+  });
+});

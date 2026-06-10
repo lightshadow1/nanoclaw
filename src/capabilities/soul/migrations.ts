@@ -111,3 +111,41 @@ export const soulsMigration: MigrationBundle = {
     `);
   },
 };
+
+// Phase 6: bet ledger. A bet is a decision-ready finding a soul wants to
+// surface to the owner: created as 'proposed' (by the main container via
+// sqlite3), published to the channel as 'sent' (host stamps the message id),
+// and resolved by ground-truth interaction (button tap / reaction / topic
+// reference) or host-side timeout after window_days.
+export const betsMigration: MigrationBundle = {
+  version: '1.3.0',
+  up: (db) => {
+    db.exec(`
+      CREATE TABLE bets (
+        id TEXT PRIMARY KEY,
+        group_folder TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        recommendation TEXT,
+        prediction TEXT,
+        status TEXT NOT NULL DEFAULT 'proposed',
+        created_at TEXT NOT NULL,
+        sent_at TEXT,
+        channel_message_id TEXT,
+        window_days INTEGER NOT NULL DEFAULT 7,
+        resolution TEXT,
+        resolution_source TEXT,
+        resolved_at TEXT
+      );
+      CREATE INDEX idx_bets_status ON bets(status);
+      CREATE INDEX idx_bets_group ON bets(group_folder);
+    `);
+  },
+  down: (db) => {
+    db.exec(`
+      DROP INDEX IF EXISTS idx_bets_group;
+      DROP INDEX IF EXISTS idx_bets_status;
+      DROP TABLE IF EXISTS bets;
+    `);
+  },
+};
