@@ -4,6 +4,7 @@ import type {
   StoredMessage,
   SentMessage,
 } from './types.js';
+import type { ChannelEvent } from '../types.js';
 import { logger } from '../logger.js';
 
 interface RegisteredHook {
@@ -59,6 +60,17 @@ export async function dispatchBeforeTaskRun(
     }
   }
   return true;
+}
+
+export function dispatchChannelEvent(event: ChannelEvent): void {
+  for (const { name, hooks } of registered) {
+    if (!hooks.onChannelEvent) continue;
+    try {
+      hooks.onChannelEvent(event);
+    } catch (err) {
+      logger.error({ capability: name, err }, 'Hook error in onChannelEvent');
+    }
+  }
 }
 
 export async function dispatchShutdown(): Promise<void> {

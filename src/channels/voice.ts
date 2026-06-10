@@ -146,8 +146,8 @@ export class VoiceChannel implements Channel {
     });
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
-    if (!this.ownsJid(jid)) return;
+  async sendMessage(jid: string, text: string): Promise<string | null> {
+    if (!this.ownsJid(jid)) return null;
 
     // Synthesize speech and send to all active clients
     try {
@@ -176,6 +176,7 @@ export class VoiceChannel implements Channel {
         }
       }
     }
+    return null;
   }
 
   isConnected(): boolean {

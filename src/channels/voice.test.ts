@@ -135,16 +135,16 @@ describe('VoiceChannel', () => {
     it('accepts voice JIDs', async () => {
       // Note: actual sendMessage requires active WebSocket clients
       // This tests that the method accepts the JID pattern
-      await expect(channel.sendMessage('voice:main@local', 'test')).resolves.toBeUndefined();
+      await expect(channel.sendMessage('voice:main@local', 'test')).resolves.toBeNull();
     });
 
     it('handles empty message text', async () => {
-      await expect(channel.sendMessage('voice:main@local', '')).resolves.toBeUndefined();
+      await expect(channel.sendMessage('voice:main@local', '')).resolves.toBeNull();
     });
 
     it('handles very long messages', async () => {
       const longText = 'a'.repeat(10000);
-      await expect(channel.sendMessage('voice:main@local', longText)).resolves.toBeUndefined();
+      await expect(channel.sendMessage('voice:main@local', longText)).resolves.toBeNull();
     });
   });
 
@@ -250,7 +250,7 @@ describe('VoiceChannel', () => {
 
     it('handles empty audio buffers', async () => {
       // Verify the channel can handle empty messages
-      await expect(channel.sendMessage('voice:main@local', '')).resolves.toBeUndefined();
+      await expect(channel.sendMessage('voice:main@local', '')).resolves.toBeNull();
     });
   });
 

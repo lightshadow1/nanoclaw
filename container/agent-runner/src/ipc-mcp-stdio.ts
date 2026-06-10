@@ -45,13 +45,27 @@ server.tool(
   {
     text: z.string().describe('The message text to send'),
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
+    buttons: z
+      .array(z.array(z.object({ id: z.string(), label: z.string() })))
+      .optional()
+      .describe(
+        'Inline buttons (rows of {id, label}), Telegram only. Max 3 rows × 3 buttons; id ≤64 chars. When the user taps one, the tap comes back as a message: [<name> tapped "<label>"]. Use for one-tap decisions, not decoration.',
+      ),
+    silent: z
+      .boolean()
+      .optional()
+      .describe(
+        'Deliver without a notification sound (Telegram only). Use for low-priority/ambient content that should not buzz the user.',
+      ),
   },
   async (args) => {
-    const data: Record<string, string | undefined> = {
+    const data: Record<string, unknown> = {
       type: 'message',
       chatJid,
       text: args.text,
       sender: args.sender || undefined,
+      buttons: args.buttons && args.buttons.length > 0 ? args.buttons : undefined,
+      silent: args.silent || undefined,
       groupFolder,
       timestamp: new Date().toISOString(),
     };
@@ -59,6 +73,29 @@ server.tool(
     writeIpcFile(MESSAGES_DIR, data);
 
     return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+  },
+);
+
+server.tool(
+  'set_ledger',
+  `Create or update this chat's pinned ledger message — a single bot-maintained, silently-edited message pinned to the top of the chat. Use it as an ambient status surface (open items, current state) the user can glance at any time without being notified.
+
+Calling it again REPLACES the previous ledger content (it edits the same pinned message). Keep it short and scannable (well under 4096 chars). Telegram only.`,
+  {
+    text: z.string().describe('The full new ledger content (replaces the previous content)'),
+  },
+  async (args) => {
+    const data = {
+      type: 'set_ledger',
+      chatJid,
+      text: args.text,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: 'Ledger update requested.' }] };
   },
 );
 

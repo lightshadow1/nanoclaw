@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import type { ChannelEvent, SendOptions } from '../types.js';
 
 export interface StoredMessage {
   id: string;
@@ -34,6 +35,8 @@ export interface CapabilityHooks {
   // expensive scheduled task (e.g. don't fire the soul curator if no
   // new memories accumulated). Skipped runs still advance next_run.
   beforeTaskRun?(task: ScheduledTaskInfo): boolean | Promise<boolean>;
+  // Interaction events that aren't messages: button taps and reactions.
+  onChannelEvent?(event: ChannelEvent): void;
 }
 
 export interface MigrationBundle {
@@ -48,6 +51,16 @@ export interface CapabilityContext {
   projectRoot: string;
   groupsDir: string;
   dataDir: string;
+  // Outbound primitives, wired by the host as lazy closures (capabilities
+  // load before channels connect; the closures resolve a channel at call
+  // time). Absent in test harnesses that don't exercise outbound paths.
+  sendMessage?: (
+    jid: string,
+    text: string,
+    opts?: SendOptions,
+  ) => Promise<string | null>;
+  // Create-or-edit the group's pinned ledger message (see src/ledger.ts).
+  setLedger?: (chatJid: string, folder: string, text: string) => Promise<void>;
 }
 
 export interface Capability {
