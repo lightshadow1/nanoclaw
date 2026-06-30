@@ -1058,6 +1058,57 @@ describe('soulCapability beforeTaskRun gate', () => {
     }
   });
 
+  it('check-in gate runs when an acted blog bet has no draft file', async () => {
+    pinClock(new Date(2026, 4, 15, 14, 0, 0));
+    try {
+      await soulCapability.init(ctx());
+      getDb()
+        .prepare(
+          `INSERT INTO bets (id, group_folder, title, body, status, created_at, window_days, resolution, resolved_at)
+           VALUES ('blog1', 'main', '📝 Blog: x', 'b', 'resolved', datetime('now'), 7, 'acted', datetime('now'))`,
+        )
+        .run();
+      writeBudgetFile('main', {
+        date: todayLocal(),
+        messages_sent: 3,
+        last_message_at: '2000-01-01T00:00:00Z',
+      });
+      // no file at groups/main/scout/drafts/blog1.md
+      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+      expect(allow).toBe(true);
+      await soulCapability.teardown!();
+    } finally {
+      releaseClock();
+    }
+  });
+
+  it('check-in gate does NOT run for an acted blog bet already drafted', async () => {
+    pinClock(new Date(2026, 4, 15, 14, 0, 0));
+    try {
+      await soulCapability.init(ctx());
+      getDb()
+        .prepare(
+          `INSERT INTO bets (id, group_folder, title, body, status, created_at, window_days, resolution, resolved_at)
+           VALUES ('blog2', 'main', '📝 Blog: y', 'b', 'resolved', datetime('now'), 7, 'acted', datetime('now'))`,
+        )
+        .run();
+      writeBudgetFile('main', {
+        date: todayLocal(),
+        messages_sent: 3,
+        last_message_at: '2000-01-01T00:00:00Z',
+      });
+      const dir = path.join(tmpDir, 'main', 'scout', 'drafts');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'blog2.md'), 'done');
+      // budget exhausted + no other work → false
+      const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
+      expect(allow).toBe(false);
+      await soulCapability.teardown!();
+    } finally {
+      releaseClock();
+    }
+  });
+
   it('runs the production pass when below bet capacity and skips at capacity', async () => {
     await soulCapability.init(ctx());
     const productionTask = {
