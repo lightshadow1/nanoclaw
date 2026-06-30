@@ -114,6 +114,7 @@ import {
   type TimingArm,
 } from './timing-bandit.js';
 import { requestPublishBet, soulCapability } from './index.js';
+import { getActedBlogBets } from './bet-store.js';
 
 // Tiny seeded LCG for deterministic bandit tests. Numerical Recipes constants.
 function seededRng(seed: number): () => number {
@@ -1358,6 +1359,35 @@ describe('bet ledger: channel events + publish (Phase 6)', () => {
   it('requestPublishBet errors cleanly when the capability is not initialized', async () => {
     const result = await requestPublishBet({ betId: 'x' });
     expect(result.ok).toBe(false);
+  });
+});
+
+describe('bet-store: getActedBlogBets', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  it('getActedBlogBets returns only resolved+acted blog bets', () => {
+    const db = getDb();
+    const ins = (
+      id: string,
+      title: string,
+      status: string,
+      resolution: string | null,
+    ) =>
+      db
+        .prepare(
+          `INSERT INTO bets (id, group_folder, title, body, status, created_at, window_days, resolution)
+           VALUES (?, 'main', ?, 'b', ?, datetime('now'), 7, ?)`,
+        )
+        .run(id, title, status, resolution);
+    ins('a', '📝 Blog: topic one', 'resolved', 'acted');
+    ins('b', '📝 Blog: topic two', 'resolved', 'rejected');
+    ins('c', '🎯 normal bet', 'resolved', 'acted');
+    ins('d', '📝 Blog: topic three', 'sent', null);
+
+    const result = getActedBlogBets(db).map((x) => x.id);
+    expect(result).toEqual(['a']);
   });
 });
 

@@ -10,6 +10,9 @@ export const BET_WINDOW_DAYS = 7;
 // Max bets that may be 'proposed' or 'sent' at once, across all souls.
 // Frequency discipline lives here, not in prompt exhortations.
 export const MAX_OPEN_BETS = 3;
+// Blog candidates are bets whose title carries this exact prefix (written by
+// the Scout blog-triage INSERT). Used to route them to draft delivery.
+export const BLOG_BET_PREFIX = '📝 Blog:';
 
 export type BetStatus = 'proposed' | 'sent' | 'resolved' | 'expired' | 'retracted';
 export type BetResolution =
@@ -108,6 +111,20 @@ export function getRecentResolvedBets(
         LIMIT ?`,
     )
     .all(limit) as BetRow[];
+  return rows.map(rowToBet);
+}
+
+// Blog bets the owner chose to draft (resolved as 'acted'). The host pairs
+// these with on-disk draft files to decide which still need generating.
+export function getActedBlogBets(db: Database.Database): Bet[] {
+  const rows = db
+    .prepare(
+      `SELECT ${SELECT_COLS} FROM bets
+        WHERE status = 'resolved' AND resolution = 'acted'
+          AND title LIKE ? || '%'
+        ORDER BY resolved_at DESC`,
+    )
+    .all(BLOG_BET_PREFIX) as BetRow[];
   return rows.map(rowToBet);
 }
 
