@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 import {
   _initTestDatabase,
@@ -840,5 +840,80 @@ describe('publish_bet', () => {
       true,
       deps,
     );
+  });
+});
+
+// --- send_document authorization ---
+
+describe('send_document', () => {
+  it('blocks a non-main group targeting another chat', async () => {
+    const sendDocument = vi.fn().mockResolvedValue(undefined);
+    deps.sendDocument = sendDocument;
+    await processTaskIpc(
+      { type: 'send_document', chatJid: 'tg:999', filename: 'd.md', content: 'x' },
+      'someGroup',
+      false,
+      deps,
+    );
+    expect(sendDocument).not.toHaveBeenCalled();
+  });
+
+  it('main may send to any chat', async () => {
+    const sendDocument = vi.fn().mockResolvedValue(undefined);
+    deps.sendDocument = sendDocument;
+    await processTaskIpc(
+      { type: 'send_document', chatJid: 'tg:999', filename: 'd.md', content: 'x', caption: 'c' },
+      'main',
+      true,
+      deps,
+    );
+    expect(sendDocument).toHaveBeenCalledWith('tg:999', 'd.md', 'x', 'c');
+  });
+
+  it('caption is passed through when provided', async () => {
+    const sendDocument = vi.fn().mockResolvedValue(undefined);
+    deps.sendDocument = sendDocument;
+    await processTaskIpc(
+      { type: 'send_document', chatJid: 'tg:999', filename: 'report.pdf', content: 'data', caption: 'my caption' },
+      'main',
+      true,
+      deps,
+    );
+    expect(sendDocument).toHaveBeenCalledWith('tg:999', 'report.pdf', 'data', 'my caption');
+  });
+
+  it('drops request when host has no sendDocument wired', async () => {
+    deps.sendDocument = undefined;
+    // Must not throw
+    await processTaskIpc(
+      { type: 'send_document', chatJid: 'tg:999', filename: 'd.md', content: 'x' },
+      'main',
+      true,
+      deps,
+    );
+  });
+
+  it('drops request with missing filename', async () => {
+    const sendDocument = vi.fn().mockResolvedValue(undefined);
+    deps.sendDocument = sendDocument;
+    await processTaskIpc(
+      { type: 'send_document', chatJid: 'tg:999', content: 'x' },
+      'main',
+      true,
+      deps,
+    );
+    expect(sendDocument).not.toHaveBeenCalled();
+  });
+
+  it('drops request with missing content', async () => {
+    const sendDocument = vi.fn().mockResolvedValue(undefined);
+    deps.sendDocument = sendDocument;
+    await processTaskIpc(
+      { type: 'send_document', chatJid: 'tg:999', filename: 'd.md' },
+      'main',
+      true,
+      deps,
+    );
+    expect(sendDocument).not.toHaveBeenCalled();
   });
 });
