@@ -1,4 +1,4 @@
-import { Bot, InlineKeyboard } from 'grammy';
+import { Bot, InlineKeyboard, InputFile } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { logger } from '../logger.js';
@@ -345,6 +345,19 @@ export class TelegramChannel implements Channel {
     await this.bot.api.pinChatMessage(numericId, parseInt(messageId, 10), {
       disable_notification: true,
     });
+  }
+
+  async sendDocument(
+    jid: string,
+    filename: string,
+    content: string,
+    caption?: string,
+  ): Promise<void> {
+    if (!this.bot) throw new Error('Telegram bot not initialized');
+    const numericId = jid.replace(/^tg:/, '');
+    const file = new InputFile(Buffer.from(content, 'utf8'), filename);
+    await this.bot.api.sendDocument(numericId, file, { caption });
+    logger.info({ jid, filename, length: content.length }, 'Telegram document sent');
   }
 
   isConnected(): boolean {

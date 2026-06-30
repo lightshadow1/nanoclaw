@@ -36,6 +36,7 @@ vi.mock('grammy', () => ({
       sendChatAction: vi.fn().mockResolvedValue(undefined),
       editMessageText: vi.fn().mockResolvedValue(undefined),
       pinChatMessage: vi.fn().mockResolvedValue(undefined),
+      sendDocument: vi.fn().mockResolvedValue({ message_id: 99 }),
     };
 
     constructor(token: string) {
@@ -76,6 +77,12 @@ vi.mock('grammy', () => ({
       this.inline_keyboard.push([]);
       return this;
     }
+  },
+  InputFile: class MockInputFile {
+    constructor(
+      public data: Buffer,
+      public filename: string,
+    ) {}
   },
 }));
 
@@ -1029,6 +1036,38 @@ describe('TelegramChannel', () => {
         42,
         { disable_notification: true },
       );
+    });
+  });
+
+  describe('sendDocument', () => {
+    it('sends a document via bot API with filename and caption', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.sendDocument(
+        'tg:100200300',
+        'draft.md',
+        '# Hello\n\nbody',
+        '📝 Draft material',
+      );
+
+      const call = (currentBot().api.sendDocument as any).mock.calls[0];
+      expect(call[0]).toBe('100200300');
+      expect(call[1].filename).toBe('draft.md');
+      expect(call[1].data.toString('utf8')).toBe('# Hello\n\nbody');
+      expect(call[2]).toEqual({ caption: '📝 Draft material' });
+    });
+
+    it('omits caption when not provided', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.sendDocument('tg:100200300', 'd.md', 'x');
+
+      const call = (currentBot().api.sendDocument as any).mock.calls[0];
+      expect(call[2]).toEqual({ caption: undefined });
     });
   });
 
