@@ -1458,6 +1458,14 @@ describe('planning-prompts', () => {
     expect(prompt).toContain('proactive-budget.json');
     expect(prompt.length).toBeGreaterThan(200);
   });
+
+  it('check-in prompt instructs blog-draft assembly + send_document', async () => {
+    const { buildCheckInPrompt } = await import('./planning-prompts.js');
+    const prompt = buildCheckInPrompt('main');
+    expect(prompt).toContain('scout/drafts/');
+    expect(prompt).toContain('send_document');
+    expect(prompt).toContain('VERIFY BEFORE PUBLISHING');
+  });
 });
 
 describe('ensureClaudeMdSection', () => {
