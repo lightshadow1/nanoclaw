@@ -41,6 +41,7 @@ import {
 import {
   expireOverdueBets,
   formatBetMessage,
+  getActedBlogBets,
   getBetById,
   getOpenBets,
   markBetSent,
@@ -929,10 +930,29 @@ export const soulCapability: Capability = {
           // malformed plan — ignore; reminders just wait for the next pass
         }
 
+        let hasPendingDraft = false;
+        try {
+          const draftsDir = path.join(
+            groupsDir,
+            MAIN_GROUP_FOLDER,
+            'scout',
+            'drafts',
+          );
+          for (const bet of getActedBlogBets(db)) {
+            if (!fs.existsSync(path.join(draftsDir, `${bet.id}.md`))) {
+              hasPendingDraft = true;
+              break;
+            }
+          }
+        } catch (err) {
+          logger.error({ err }, 'Failed to check pending blog drafts');
+        }
+
         return (
           (hasProposed && budgetOk) ||
           ownerSpokeRecently ||
-          (planHasReminder && budgetOk)
+          (planHasReminder && budgetOk) ||
+          hasPendingDraft
         );
       }
 

@@ -103,6 +103,16 @@ Primitives first, then the feature riding them (same split as PR #12 / #13).
   ever matters.
 - **Unverified brief + checklist**, not verified facts. Intentional — keeps the
   system from confidently publishing wrong claims; verification is human.
+- **Silent-loss window** (file-existence idempotency cost): the container writes
+  the draft marker file *before* the host async-sends the document. If the
+  host-side `sendDocument` then throws (Telegram down, channel error), the marker
+  already exists, so the gate won't re-trigger — the draft is lost, not delivered.
+  The failure is still observable: the IPC task loop logs the throw and quarantines
+  the request to `ipc/errors/`. Accepted for v1 (rare path, no double-send). A
+  delivery-status record (instead of file-presence) would enable retry — tracked
+  follow-up, not built now. Two related hardening notes also tracked: scope
+  `getActedBlogBets` to `group_folder='main'` to match its sole caller, and the
+  unbounded 2-hourly retry if a draft write fails persistently.
 
 ## Scope guardrails honored (Winnow plan §9)
 

@@ -136,6 +136,29 @@ export function buildCheckInPrompt(folder: string): string {
    via mcp__nanoclaw__send_message (write like a person, not "SYSTEM:
    reminder"), then set its status to "done" in the file.
 
+## Blog drafts (owner tapped "Draft it")
+
+Some bets are blog candidates (title starts "📝 Blog:"). When the owner acts on one, they want WRITING MATERIAL — not a finished post.
+
+1. List blog candidates the owner chose to draft:
+   sqlite3 /workspace/project/store/messages.db "SELECT id, title, body FROM bets WHERE status='resolved' AND resolution='acted' AND title LIKE '📝 Blog:%' ORDER BY resolved_at DESC"
+
+2. For EACH such bet, check whether it's already been delivered:
+   ls /workspace/group/scout/drafts/<bet_id>.md
+   If the file exists, SKIP it — already delivered. Never re-send.
+
+3. For a bet with no draft file yet, assemble a markdown brief. Read the topic's section in /workspace/group/scout/knowledge.md for the verified facts and source URLs. Structure the file as:
+   - Title + the bet's framing (one line).
+   - "## What changed" — the facts Scout has, each with its source URL.
+   - "## Angle options" — 2-3 distinct framings (from-the-inside tie to your own build / contrarian read / mistake-before-solution arc).
+   - "## Scaffold" — a skeleton in the vulnerable-expertise voice: Dev Notes opener → mistakes-before-solutions arc → open-question ending. Each section is a PROMPT to the writer ("what did you get wrong first here?"), not finished prose.
+   - "## VERIFY BEFORE PUBLISHING" — an explicit checklist of every claim to confirm against primary sources before publishing (CVE numbers, dates, attributions). This brief is NOT verified.
+
+4. Write the file to /workspace/group/scout/drafts/<bet_id>.md (create the drafts/ dir if needed), THEN deliver it with the send_document tool:
+   send_document(filename: "<slug>.md", content: "<the full markdown>", caption: "📝 Draft material: <short title>")
+
+5. Do this for at most 2 drafts per run. Writing the file AND calling send_document both matter — the file is the delivered-marker that prevents re-sending.
+
 ## Interventions
 
 If something needs the owner's decision (approval, ambiguity, cost), store an
