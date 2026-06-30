@@ -451,6 +451,20 @@ async function main(): Promise<void> {
     if (!channel) throw new Error(`No channel for JID: ${chatJid}`);
     return setLedger(channel, chatJid, folder, text);
   };
+  const sendDocumentForGroup = (
+    chatJid: string,
+    filename: string,
+    content: string,
+    caption?: string,
+  ): Promise<void> => {
+    const channel = findChannel(channels, chatJid);
+    if (!channel) throw new Error(`No channel for JID: ${chatJid}`);
+    if (!channel.sendDocument) {
+      logger.warn({ chatJid }, 'Channel does not support sendDocument; dropping');
+      return Promise.resolve();
+    }
+    return channel.sendDocument(chatJid, filename, content, caption);
+  };
 
   await loadCapabilities({
     db: getDb(),
@@ -460,6 +474,7 @@ async function main(): Promise<void> {
     dataDir: DATA_DIR,
     sendMessage: sendViaChannel,
     setLedger: setLedgerForGroup,
+    sendDocument: sendDocumentForGroup,
   });
 
   // Graceful shutdown handlers
@@ -557,6 +572,7 @@ async function main(): Promise<void> {
   startIpcWatcher({
     sendMessage: sendViaChannel,
     setLedger: setLedgerForGroup,
+    sendDocument: sendDocumentForGroup,
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroupMetadata: (force) => whatsapp?.syncGroupMetadata(force) ?? Promise.resolve(),
