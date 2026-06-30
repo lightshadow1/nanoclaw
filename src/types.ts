@@ -140,6 +140,14 @@ export interface Channel {
   editMessage?(jid: string, messageId: string, text: string): Promise<void>;
   // Optional: pin a message in the chat.
   pinMessage?(jid: string, messageId: string): Promise<void>;
+  // Optional: send a file (e.g. a markdown draft) as a document attachment.
+  // content is the file body; filename is the displayed name.
+  sendDocument?(
+    jid: string,
+    filename: string,
+    content: string,
+    caption?: string,
+  ): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

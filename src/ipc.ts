@@ -52,6 +52,14 @@ export interface IpcDeps {
   publishBet?: (req: {
     betId: string;
   }) => Promise<{ ok: true; betId: string } | { ok: false; error: string }>;
+  // Optional: send a file as a document to a chat. Absent in hosts/tests
+  // that don't wire channels.
+  sendDocument?: (
+    chatJid: string,
+    filename: string,
+    content: string,
+    caption?: string,
+  ) => Promise<void>;
 }
 
 // Sanitize container-supplied inline buttons. Caps keep a compromised or
@@ -244,6 +252,10 @@ export async function processTaskIpc(
     text?: string;
     // For publish_bet
     betId?: string;
+    // For send_document
+    filename?: string;
+    content?: string;
+    caption?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -554,6 +566,45 @@ export async function processTaskIpc(
         logger.info(
           { chatJid: data.chatJid, sourceGroup },
           'Ledger updated via IPC',
+        );
+      }
+      break;
+
+    case 'send_document':
+      // A group may send a document to its OWN chat; main may send anywhere.
+      // Same posture as send_message.
+      if (!deps.sendDocument) {
+        logger.warn(
+          { sourceGroup },
+          'send_document requested but host has no channel wired',
+        );
+        break;
+      }
+      if (
+        !data.chatJid ||
+        typeof data.filename !== 'string' ||
+        !data.filename ||
+        typeof data.content !== 'string' ||
+        !data.content
+      ) {
+        logger.warn({ data }, 'Invalid send_document request');
+        break;
+      }
+      {
+        const targetGroup = registeredGroups[data.chatJid];
+        if (!isMain && (!targetGroup || targetGroup.folder !== sourceGroup)) {
+          logger.warn(
+            { chatJid: data.chatJid, sourceGroup },
+            'Unauthorized send_document attempt blocked',
+          );
+          break;
+        }
+        const caption =
+          typeof data.caption === 'string' ? data.caption.slice(0, 1024) : undefined;
+        await deps.sendDocument(data.chatJid, data.filename, data.content, caption);
+        logger.info(
+          { chatJid: data.chatJid, filename: data.filename, sourceGroup },
+          'Document sent via IPC',
         );
       }
       break;

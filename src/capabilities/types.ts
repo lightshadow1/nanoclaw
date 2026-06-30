@@ -61,6 +61,8 @@ export interface CapabilityContext {
   ) => Promise<string | null>;
   // Create-or-edit the group's pinned ledger message (see src/ledger.ts).
   setLedger?: (chatJid: string, folder: string, text: string) => Promise<void>;
+  // Send a file as a document attachment (Telegram only; no-ops if the channel lacks support).
+  sendDocument?: (chatJid: string, filename: string, content: string, caption?: string) => Promise<void>;
 }
 
 export interface Capability {

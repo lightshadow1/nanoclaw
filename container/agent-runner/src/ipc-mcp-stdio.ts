@@ -100,6 +100,33 @@ Calling it again REPLACES the previous ledger content (it edits the same pinned 
 );
 
 server.tool(
+  'send_document',
+  `Send a file to the chat as a document attachment. Use for content too long for a chat message (e.g. a markdown draft or brief). Telegram only.
+
+The file arrives as a downloadable attachment named by \`filename\`. \`caption\` is a short label shown under it (keep well under 1024 chars).`,
+  {
+    filename: z.string().describe('Displayed file name, e.g. "draft-isolation.md"'),
+    content: z.string().describe('The full file body (markdown or text)'),
+    caption: z.string().optional().describe('Short label shown under the file'),
+  },
+  async (args) => {
+    const data = {
+      type: 'send_document',
+      chatJid,
+      filename: args.filename,
+      content: args.content,
+      caption: args.caption,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: 'Document send requested.' }] };
+  },
+);
+
+server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools.
 
