@@ -434,6 +434,49 @@ export function processPendingSpawnApprovals(
   return { spawned, errors };
 }
 
+interface IdleCandidateRow {
+  folder: string;
+  spawned_at: string;
+  last_routed: string | null;
+}
+
+// Mark active spawned souls dormant when their activity clock —
+// max(newest routed row, spawned_at) — is older than DORMANT_THRESHOLD_DAYS.
+// Host-side, deterministic; returns the folders it dormanted.
+export function sweepIdleSouls(
+  ctx: LifecycleContext,
+  now: Date = new Date(),
+): string[] {
+  const rows = ctx.db
+    .prepare(
+      `SELECT s.folder AS folder, s.spawned_at AS spawned_at,
+              (SELECT MAX(ms.timestamp) FROM memory_stream ms
+                WHERE ms.group_folder = s.folder AND ms.source = 'router')
+                AS last_routed
+         FROM souls s
+        WHERE s.state = 'active' AND s.folder != ?`,
+    )
+    .all(ctx.mainFolder) as IdleCandidateRow[];
+
+  const thresholdMs = DORMANT_THRESHOLD_DAYS * 24 * 60 * 60 * 1000;
+  const dormanted: string[] = [];
+
+  for (const row of rows) {
+    try {
+      const spawnedMs = new Date(row.spawned_at).getTime();
+      const routedMs = row.last_routed ? new Date(row.last_routed).getTime() : 0;
+      const clock = Math.max(spawnedMs, routedMs);
+      if (now.getTime() - clock > thresholdMs) {
+        markDormant(ctx, row.folder, now);
+        dormanted.push(row.folder);
+      }
+    } catch (err) {
+      logger.error({ err, folder: row.folder }, 'sweepIdleSouls: failed on soul');
+    }
+  }
+  return dormanted;
+}
+
 export function resurrect(
   ctx: LifecycleContext,
   folder: string,

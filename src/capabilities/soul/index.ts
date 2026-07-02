@@ -90,6 +90,7 @@ import {
   processPendingSpawnApprovals,
   resurrectRoutedSouls,
   spawnSoul,
+  sweepIdleSouls,
   type LifecycleContext,
 } from './soul-lifecycle.js';
 
@@ -1004,6 +1005,14 @@ export const soulCapability: Capability = {
             }
           } catch (err) {
             logger.error({ err }, 'processPendingSpawnApprovals failed');
+          }
+          try {
+            const dormanted = sweepIdleSouls(lifecycleCtx);
+            if (dormanted.length > 0) {
+              logger.info({ dormanted }, 'Swept idle souls dormant');
+            }
+          } catch (err) {
+            logger.error({ err }, 'sweepIdleSouls failed');
           }
         }
         const planPath = path.join(

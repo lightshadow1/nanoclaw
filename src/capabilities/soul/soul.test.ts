@@ -91,6 +91,7 @@ import {
   resurrect,
   resurrectRoutedSouls,
   spawnSoul,
+  sweepIdleSouls,
   SPAWN_REASON_MAX_LEN,
   type LifecycleContext,
 } from './soul-lifecycle.js';
@@ -4693,6 +4694,72 @@ describe('soul-lifecycle', () => {
     const woke = resurrectRoutedSouls(lifecycleCtx, ['topic2', 'nonexistent']);
     expect(woke).toEqual([]); // topic2 already active, nonexistent has no soul
     expect(getSoul('topic2')?.state).toBe('active');
+  });
+
+  it('sweepIdleSouls dormants an active soul idle >30d, keeps a recent one', () => {
+    const now = new Date('2026-07-01T00:00:00Z');
+    // idle: last routed row 40 days ago
+    spawnSoul(lifecycleCtx, {
+      folder: 'stale',
+      agentName: 'S',
+      parentFolder: 'main',
+      spawnReason: 'x',
+    });
+    lifecycleCtx.db
+      .prepare(`UPDATE souls SET spawned_at = '2026-05-01T00:00:00Z' WHERE folder='stale'`)
+      .run();
+    lifecycleCtx.db
+      .prepare(
+        `INSERT INTO memory_stream (id, group_folder, timestamp, type, source, content, importance, metadata, curated)
+         VALUES ('r1','stale','2026-05-22T00:00:00Z','observation','router','x',5,NULL,0)`,
+      )
+      .run();
+    // fresh: routed row 5 days ago
+    spawnSoul(lifecycleCtx, {
+      folder: 'fresh',
+      agentName: 'F',
+      parentFolder: 'main',
+      spawnReason: 'x',
+    });
+    lifecycleCtx.db
+      .prepare(`UPDATE souls SET spawned_at = '2026-05-01T00:00:00Z' WHERE folder='fresh'`)
+      .run();
+    lifecycleCtx.db
+      .prepare(
+        `INSERT INTO memory_stream (id, group_folder, timestamp, type, source, content, importance, metadata, curated)
+         VALUES ('r2','fresh','2026-06-26T00:00:00Z','observation','router','x',5,NULL,0)`,
+      )
+      .run();
+
+    const dormanted = sweepIdleSouls(lifecycleCtx, now);
+    expect(dormanted).toEqual(['stale']);
+    expect(getSoul('stale')?.state).toBe('dormant');
+    expect(getSoul('fresh')?.state).toBe('active');
+  });
+
+  it('sweepIdleSouls uses spawned_at when there are no routed rows', () => {
+    const now = new Date('2026-07-01T00:00:00Z');
+    spawnSoul(lifecycleCtx, {
+      folder: 'old',
+      agentName: 'O',
+      parentFolder: 'main',
+      spawnReason: 'x',
+    });
+    lifecycleCtx.db
+      .prepare(`UPDATE souls SET spawned_at='2026-05-01T00:00:00Z' WHERE folder='old'`)
+      .run(); // 61d ago, no routed rows
+    spawnSoul(lifecycleCtx, {
+      folder: 'young',
+      agentName: 'Y',
+      parentFolder: 'main',
+      spawnReason: 'x',
+    });
+    lifecycleCtx.db
+      .prepare(`UPDATE souls SET spawned_at='2026-06-28T00:00:00Z' WHERE folder='young'`)
+      .run(); // 3d ago, no routed rows
+
+    expect(sweepIdleSouls(lifecycleCtx, now)).toEqual(['old']);
+    expect(getSoul('young')?.state).toBe('active');
   });
 });
 
