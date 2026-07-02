@@ -3,7 +3,11 @@
 
 FROM node:22-slim
 
-# Install system dependencies for Chromium
+# Install system dependencies: Chromium (agent-browser) + sqlite3 CLI.
+# sqlite3 is REQUIRED — soul task prompts (curation, journal, production,
+# check-in, blog triage/draft) shell out to `sqlite3 /workspace/project/store/
+# messages.db "..."` to read/write memory_stream, bets, souls. Without it those
+# prompts silently fail (the evening journal escalates "sqlite3 unavailable").
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-liberation \
@@ -23,6 +27,7 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Chromium path for agent-browser
