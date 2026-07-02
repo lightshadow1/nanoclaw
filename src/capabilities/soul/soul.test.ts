@@ -89,7 +89,9 @@ import {
   markDormant,
   processPendingSpawnApprovals,
   resurrect,
+  resurrectRoutedSouls,
   spawnSoul,
+  sweepIdleSouls,
   SPAWN_REASON_MAX_LEN,
   type LifecycleContext,
 } from './soul-lifecycle.js';
@@ -4666,6 +4668,141 @@ describe('soul-lifecycle', () => {
       /already active/,
     );
   });
+
+  it('resurrectRoutedSouls reactivates a dormant soul that received rows', () => {
+    spawnSoul(lifecycleCtx, {
+      folder: 'topic',
+      agentName: 'T',
+      parentFolder: 'main',
+      spawnReason: 'x',
+    });
+    markDormant(lifecycleCtx, 'topic');
+    expect(getSoul('topic')?.state).toBe('dormant');
+
+    const woke = resurrectRoutedSouls(lifecycleCtx, ['topic']);
+    expect(woke).toEqual(['topic']);
+    expect(getSoul('topic')?.state).toBe('active');
+  });
+
+  it('resurrectRoutedSouls leaves active souls and unknown folders untouched', () => {
+    spawnSoul(lifecycleCtx, {
+      folder: 'topic2',
+      agentName: 'T',
+      parentFolder: 'main',
+      spawnReason: 'x',
+    });
+    const woke = resurrectRoutedSouls(lifecycleCtx, ['topic2', 'nonexistent']);
+    expect(woke).toEqual([]); // topic2 already active, nonexistent has no soul
+    expect(getSoul('topic2')?.state).toBe('active');
+  });
+
+  it('sweepIdleSouls dormants an active soul idle >30d, keeps a recent one', () => {
+    const now = new Date('2026-07-01T00:00:00Z');
+    // idle: last routed row 40 days ago
+    spawnSoul(lifecycleCtx, {
+      folder: 'stale',
+      agentName: 'S',
+      parentFolder: 'main',
+      spawnReason: 'x',
+    });
+    lifecycleCtx.db
+      .prepare(
+        `UPDATE souls SET spawned_at = '2026-05-01T00:00:00Z', state_changed_at = '2026-05-01T00:00:00Z' WHERE folder='stale'`,
+      )
+      .run();
+    lifecycleCtx.db
+      .prepare(
+        `INSERT INTO memory_stream (id, group_folder, timestamp, type, source, content, importance, metadata, curated)
+         VALUES ('r1','stale','2026-05-22T00:00:00Z','observation','router','x',5,NULL,0)`,
+      )
+      .run();
+    // fresh: routed row 5 days ago
+    spawnSoul(lifecycleCtx, {
+      folder: 'fresh',
+      agentName: 'F',
+      parentFolder: 'main',
+      spawnReason: 'x',
+    });
+    lifecycleCtx.db
+      .prepare(
+        `UPDATE souls SET spawned_at = '2026-05-01T00:00:00Z', state_changed_at = '2026-05-01T00:00:00Z' WHERE folder='fresh'`,
+      )
+      .run();
+    lifecycleCtx.db
+      .prepare(
+        `INSERT INTO memory_stream (id, group_folder, timestamp, type, source, content, importance, metadata, curated)
+         VALUES ('r2','fresh','2026-06-26T00:00:00Z','observation','router','x',5,NULL,0)`,
+      )
+      .run();
+
+    const dormanted = sweepIdleSouls(lifecycleCtx, now);
+    expect(dormanted).toEqual(['stale']);
+    expect(getSoul('stale')?.state).toBe('dormant');
+    expect(getSoul('fresh')?.state).toBe('active');
+  });
+
+  it('sweepIdleSouls uses spawned_at when there are no routed rows', () => {
+    const now = new Date('2026-07-01T00:00:00Z');
+    spawnSoul(lifecycleCtx, {
+      folder: 'old',
+      agentName: 'O',
+      parentFolder: 'main',
+      spawnReason: 'x',
+    });
+    lifecycleCtx.db
+      .prepare(
+        `UPDATE souls SET spawned_at='2026-05-01T00:00:00Z', state_changed_at='2026-05-01T00:00:00Z' WHERE folder='old'`,
+      )
+      .run(); // 61d ago, no routed rows
+    spawnSoul(lifecycleCtx, {
+      folder: 'young',
+      agentName: 'Y',
+      parentFolder: 'main',
+      spawnReason: 'x',
+    });
+    lifecycleCtx.db
+      .prepare(
+        `UPDATE souls SET spawned_at='2026-06-28T00:00:00Z', state_changed_at='2026-06-28T00:00:00Z' WHERE folder='young'`,
+      )
+      .run(); // 3d ago, no routed rows
+
+    expect(sweepIdleSouls(lifecycleCtx, now)).toEqual(['old']);
+    expect(getSoul('young')?.state).toBe('active');
+  });
+
+  it('sweepIdleSouls does not re-dormant a soul just resurrected via an old routed row', () => {
+    // Regression: when the triggering routed row is itself >30d old (backlog
+    // after downtime), the idle clock must include state_changed_at (set to
+    // `now` by markActive/resurrectRoutedSouls) so the soul isn't immediately
+    // re-dormanted on the next daily sweep.
+    const now = new Date('2026-07-01T00:00:00Z');
+    spawnSoul(lifecycleCtx, {
+      folder: 'resurrected',
+      agentName: 'R',
+      parentFolder: 'main',
+      spawnReason: 'resurrection flap regression',
+    });
+    // Backdate both spawned_at and state_changed_at to >30d before now.
+    lifecycleCtx.db
+      .prepare(
+        `UPDATE souls SET spawned_at='2026-05-01T00:00:00Z', state_changed_at='2026-05-01T00:00:00Z' WHERE folder='resurrected'`,
+      )
+      .run();
+    // Insert an old routed row simulating a backlog observation.
+    lifecycleCtx.db
+      .prepare(
+        `INSERT INTO memory_stream (id, group_folder, timestamp, type, source, content, importance, metadata, curated)
+         VALUES ('r-old','resurrected','2026-05-15T00:00:00Z','observation','router','x',5,NULL,0)`,
+      )
+      .run();
+    // Simulate resurrection at `now` — markActive stamps state_changed_at=now.
+    markActive(lifecycleCtx, 'resurrected', now);
+
+    // The soul was just resurrected; sweepIdleSouls at `now` must NOT dormant it.
+    const dormanted = sweepIdleSouls(lifecycleCtx, now);
+    expect(dormanted).not.toContain('resurrected');
+    expect(getSoul('resurrected')?.state).toBe('active');
+  });
 });
 
 // --- Phase 5 soul-router ---
@@ -4706,7 +4843,7 @@ describe('routeUncuratedObservationsToSpawnedSouls', () => {
   function insertSpawnedSoulRow(
     folder: string,
     spawnReason: string,
-    state: 'active' | 'dormant' = 'active',
+    state: 'active' | 'dormant' | 'archived' = 'active',
   ): void {
     const now = '2026-05-29T00:00:00Z';
     getDb()
@@ -4786,8 +4923,8 @@ describe('routeUncuratedObservationsToSpawnedSouls', () => {
     expect(getUncurated(getDb(), 'project-rust').length).toBe(1);
   });
 
-  it('skips dormant souls', () => {
-    insertSpawnedSoulRow('project-rust', 'learning rust ownership', 'dormant');
+  it('does NOT route to archived souls', () => {
+    insertSpawnedSoulRow('project-rust', 'learning rust ownership', 'archived');
     addMemory(getDb(), {
       groupFolder: 'main',
       timestamp: '2026-05-29T10:00:00Z',
@@ -4798,6 +4935,20 @@ describe('routeUncuratedObservationsToSpawnedSouls', () => {
     });
     const res = routeUncuratedObservationsToSpawnedSouls(getDb(), 'main');
     expect(res.routed).toBe(0);
+  });
+
+  it('routes to dormant souls (so they can be resurrected)', () => {
+    insertSpawnedSoulRow('k8s', 'monitoring kubernetes', 'dormant');
+    addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-05-29T10:00:00Z',
+      type: 'observation',
+      source: 'user',
+      content: 'kubernetes autoscaling notes',
+      importance: 5,
+    });
+    const res = routeUncuratedObservationsToSpawnedSouls(getDb(), 'main');
+    expect(res.perFolder['k8s']).toBeGreaterThan(0);
   });
 
   it('returns {routed:0} early when there are no spawned souls', () => {

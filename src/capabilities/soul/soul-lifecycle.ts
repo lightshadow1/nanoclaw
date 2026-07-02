@@ -299,6 +299,25 @@ export function markActive(
   logger.info({ folder }, 'Marked soul active');
 }
 
+// Wake any of the given folders that are currently dormant (e.g. the router
+// just delivered rows to them — their topic resurfaced). Returns the folders
+// actually resurrected. Unknown folders and already-active souls are skipped.
+export function resurrectRoutedSouls(
+  ctx: LifecycleContext,
+  folders: string[],
+  now: Date = new Date(),
+): string[] {
+  const woke: string[] = [];
+  for (const folder of folders) {
+    const soul = getSoul(folder);
+    if (soul && soul.state === 'dormant') {
+      markActive(ctx, folder, now);
+      woke.push(folder);
+    }
+  }
+  return woke;
+}
+
 export function archive(
   ctx: LifecycleContext,
   folder: string,
@@ -413,6 +432,54 @@ export function processPendingSpawnApprovals(
     logger.info({ spawned }, 'Processed spawn_soul approvals');
   }
   return { spawned, errors };
+}
+
+interface IdleCandidateRow {
+  folder: string;
+  spawned_at: string;
+  last_routed: string | null;
+  state_changed_at: string;
+}
+
+// Mark active spawned souls dormant when their activity clock —
+// max(spawned_at, newest routed row, state_changed_at) — is older than
+// DORMANT_THRESHOLD_DAYS. state_changed_at keeps a just-resurrected soul fresh
+// for a full window even if the row that woke it was an old backlog observation.
+// Host-side, deterministic; returns the folders it dormanted.
+export function sweepIdleSouls(
+  ctx: LifecycleContext,
+  now: Date = new Date(),
+): string[] {
+  const rows = ctx.db
+    .prepare(
+      `SELECT s.folder AS folder, s.spawned_at AS spawned_at,
+              s.state_changed_at AS state_changed_at,
+              (SELECT MAX(ms.timestamp) FROM memory_stream ms
+                WHERE ms.group_folder = s.folder AND ms.source = 'router')
+                AS last_routed
+         FROM souls s
+        WHERE s.state = 'active' AND s.folder != ?`,
+    )
+    .all(ctx.mainFolder) as IdleCandidateRow[];
+
+  const thresholdMs = DORMANT_THRESHOLD_DAYS * 24 * 60 * 60 * 1000;
+  const dormanted: string[] = [];
+
+  for (const row of rows) {
+    try {
+      const spawnedMs = new Date(row.spawned_at).getTime();
+      const routedMs = row.last_routed ? new Date(row.last_routed).getTime() : 0;
+      const stateChangedMs = new Date(row.state_changed_at).getTime();
+      const clock = Math.max(spawnedMs, routedMs, stateChangedMs);
+      if (now.getTime() - clock > thresholdMs) {
+        markDormant(ctx, row.folder, now);
+        dormanted.push(row.folder);
+      }
+    } catch (err) {
+      logger.error({ err, folder: row.folder }, 'sweepIdleSouls: failed on soul');
+    }
+  }
+  return dormanted;
 }
 
 export function resurrect(

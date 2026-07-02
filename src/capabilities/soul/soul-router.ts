@@ -115,14 +115,16 @@ interface MainObservationRow {
   metadata: string | null;
 }
 
-function loadActiveSpawnedSouls(
+function loadRoutableSpawnedSouls(
   db: Database.Database,
   mainFolder: string,
 ): SpawnedSoulRow[] {
+  // active AND dormant: dormant souls must still be routing targets so a
+  // resurfacing topic can route a row and trigger resurrection (see index.ts).
   return db
     .prepare(
       `SELECT folder, spawn_reason FROM souls
-        WHERE state = 'active' AND folder != ?`,
+        WHERE state IN ('active', 'dormant') AND folder != ?`,
     )
     .all(mainFolder) as SpawnedSoulRow[];
 }
@@ -177,7 +179,7 @@ export function routeUncuratedObservationsToSpawnedSouls(
   mainFolder: string,
   limit: number = 100,
 ): RouteResult {
-  const spawned = loadActiveSpawnedSouls(db, mainFolder);
+  const spawned = loadRoutableSpawnedSouls(db, mainFolder);
   if (spawned.length === 0) {
     return { routed: 0, perFolder: {} };
   }

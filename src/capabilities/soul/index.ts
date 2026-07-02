@@ -88,7 +88,9 @@ import {
 import { routeUncuratedObservationsToSpawnedSouls } from './soul-router.js';
 import {
   processPendingSpawnApprovals,
+  resurrectRoutedSouls,
   spawnSoul,
+  sweepIdleSouls,
   type LifecycleContext,
 } from './soul-lifecycle.js';
 
@@ -843,7 +845,19 @@ export const soulCapability: Capability = {
       if (task.id === `soul-wiki-curation-${MAIN_GROUP_FOLDER}`) {
         if (!db) return true; // fail open if soul never initialized
         try {
-          routeUncuratedObservationsToSpawnedSouls(db, MAIN_GROUP_FOLDER);
+          const routed = routeUncuratedObservationsToSpawnedSouls(
+            db,
+            MAIN_GROUP_FOLDER,
+          );
+          if (lifecycleCtx) {
+            const woke = resurrectRoutedSouls(
+              lifecycleCtx,
+              Object.keys(routed.perFolder),
+            );
+            if (woke.length > 0) {
+              logger.info({ woke }, 'Resurrected dormant souls on new routed memory');
+            }
+          }
         } catch (err) {
           logger.error({ err }, 'soul-router pass failed; continuing curation');
         }
@@ -991,6 +1005,14 @@ export const soulCapability: Capability = {
             }
           } catch (err) {
             logger.error({ err }, 'processPendingSpawnApprovals failed');
+          }
+          try {
+            const dormanted = sweepIdleSouls(lifecycleCtx);
+            if (dormanted.length > 0) {
+              logger.info({ dormanted }, 'Swept idle souls dormant');
+            }
+          } catch (err) {
+            logger.error({ err }, 'sweepIdleSouls failed');
           }
         }
         const planPath = path.join(
