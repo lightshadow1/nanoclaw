@@ -299,6 +299,25 @@ export function markActive(
   logger.info({ folder }, 'Marked soul active');
 }
 
+// Wake any of the given folders that are currently dormant (e.g. the router
+// just delivered rows to them — their topic resurfaced). Returns the folders
+// actually resurrected. Unknown folders and already-active souls are skipped.
+export function resurrectRoutedSouls(
+  ctx: LifecycleContext,
+  folders: string[],
+  now: Date = new Date(),
+): string[] {
+  const woke: string[] = [];
+  for (const folder of folders) {
+    const soul = getSoul(folder);
+    if (soul && soul.state === 'dormant') {
+      markActive(ctx, folder, now);
+      woke.push(folder);
+    }
+  }
+  return woke;
+}
+
 export function archive(
   ctx: LifecycleContext,
   folder: string,

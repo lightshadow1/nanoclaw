@@ -89,6 +89,7 @@ import {
   markDormant,
   processPendingSpawnApprovals,
   resurrect,
+  resurrectRoutedSouls,
   spawnSoul,
   SPAWN_REASON_MAX_LEN,
   type LifecycleContext,
@@ -4665,6 +4666,33 @@ describe('soul-lifecycle', () => {
     expect(() => resurrect(lifecycleCtx, 'project-rust')).toThrow(
       /already active/,
     );
+  });
+
+  it('resurrectRoutedSouls reactivates a dormant soul that received rows', () => {
+    spawnSoul(lifecycleCtx, {
+      folder: 'topic',
+      agentName: 'T',
+      parentFolder: 'main',
+      spawnReason: 'x',
+    });
+    markDormant(lifecycleCtx, 'topic');
+    expect(getSoul('topic')?.state).toBe('dormant');
+
+    const woke = resurrectRoutedSouls(lifecycleCtx, ['topic']);
+    expect(woke).toEqual(['topic']);
+    expect(getSoul('topic')?.state).toBe('active');
+  });
+
+  it('resurrectRoutedSouls leaves active souls and unknown folders untouched', () => {
+    spawnSoul(lifecycleCtx, {
+      folder: 'topic2',
+      agentName: 'T',
+      parentFolder: 'main',
+      spawnReason: 'x',
+    });
+    const woke = resurrectRoutedSouls(lifecycleCtx, ['topic2', 'nonexistent']);
+    expect(woke).toEqual([]); // topic2 already active, nonexistent has no soul
+    expect(getSoul('topic2')?.state).toBe('active');
   });
 });
 
