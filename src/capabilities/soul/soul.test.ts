@@ -4706,7 +4706,9 @@ describe('soul-lifecycle', () => {
       spawnReason: 'x',
     });
     lifecycleCtx.db
-      .prepare(`UPDATE souls SET spawned_at = '2026-05-01T00:00:00Z' WHERE folder='stale'`)
+      .prepare(
+        `UPDATE souls SET spawned_at = '2026-05-01T00:00:00Z', state_changed_at = '2026-05-01T00:00:00Z' WHERE folder='stale'`,
+      )
       .run();
     lifecycleCtx.db
       .prepare(
@@ -4722,7 +4724,9 @@ describe('soul-lifecycle', () => {
       spawnReason: 'x',
     });
     lifecycleCtx.db
-      .prepare(`UPDATE souls SET spawned_at = '2026-05-01T00:00:00Z' WHERE folder='fresh'`)
+      .prepare(
+        `UPDATE souls SET spawned_at = '2026-05-01T00:00:00Z', state_changed_at = '2026-05-01T00:00:00Z' WHERE folder='fresh'`,
+      )
       .run();
     lifecycleCtx.db
       .prepare(
@@ -4746,7 +4750,9 @@ describe('soul-lifecycle', () => {
       spawnReason: 'x',
     });
     lifecycleCtx.db
-      .prepare(`UPDATE souls SET spawned_at='2026-05-01T00:00:00Z' WHERE folder='old'`)
+      .prepare(
+        `UPDATE souls SET spawned_at='2026-05-01T00:00:00Z', state_changed_at='2026-05-01T00:00:00Z' WHERE folder='old'`,
+      )
       .run(); // 61d ago, no routed rows
     spawnSoul(lifecycleCtx, {
       folder: 'young',
@@ -4755,11 +4761,47 @@ describe('soul-lifecycle', () => {
       spawnReason: 'x',
     });
     lifecycleCtx.db
-      .prepare(`UPDATE souls SET spawned_at='2026-06-28T00:00:00Z' WHERE folder='young'`)
+      .prepare(
+        `UPDATE souls SET spawned_at='2026-06-28T00:00:00Z', state_changed_at='2026-06-28T00:00:00Z' WHERE folder='young'`,
+      )
       .run(); // 3d ago, no routed rows
 
     expect(sweepIdleSouls(lifecycleCtx, now)).toEqual(['old']);
     expect(getSoul('young')?.state).toBe('active');
+  });
+
+  it('sweepIdleSouls does not re-dormant a soul just resurrected via an old routed row', () => {
+    // Regression: when the triggering routed row is itself >30d old (backlog
+    // after downtime), the idle clock must include state_changed_at (set to
+    // `now` by markActive/resurrectRoutedSouls) so the soul isn't immediately
+    // re-dormanted on the next daily sweep.
+    const now = new Date('2026-07-01T00:00:00Z');
+    spawnSoul(lifecycleCtx, {
+      folder: 'resurrected',
+      agentName: 'R',
+      parentFolder: 'main',
+      spawnReason: 'resurrection flap regression',
+    });
+    // Backdate both spawned_at and state_changed_at to >30d before now.
+    lifecycleCtx.db
+      .prepare(
+        `UPDATE souls SET spawned_at='2026-05-01T00:00:00Z', state_changed_at='2026-05-01T00:00:00Z' WHERE folder='resurrected'`,
+      )
+      .run();
+    // Insert an old routed row simulating a backlog observation.
+    lifecycleCtx.db
+      .prepare(
+        `INSERT INTO memory_stream (id, group_folder, timestamp, type, source, content, importance, metadata, curated)
+         VALUES ('r-old','resurrected','2026-05-15T00:00:00Z','observation','router','x',5,NULL,0)`,
+      )
+      .run();
+    // Simulate resurrection at `now` — markActive stamps state_changed_at=now.
+    markActive(lifecycleCtx, 'resurrected', now);
+
+    // The soul was just resurrected; sweepIdleSouls at `now` must NOT dormant it.
+    const dormanted = sweepIdleSouls(lifecycleCtx, now);
+    expect(dormanted).not.toContain('resurrected');
+    expect(getSoul('resurrected')?.state).toBe('active');
   });
 });
 
