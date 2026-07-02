@@ -4706,7 +4706,7 @@ describe('routeUncuratedObservationsToSpawnedSouls', () => {
   function insertSpawnedSoulRow(
     folder: string,
     spawnReason: string,
-    state: 'active' | 'dormant' = 'active',
+    state: 'active' | 'dormant' | 'archived' = 'active',
   ): void {
     const now = '2026-05-29T00:00:00Z';
     getDb()
@@ -4786,8 +4786,8 @@ describe('routeUncuratedObservationsToSpawnedSouls', () => {
     expect(getUncurated(getDb(), 'project-rust').length).toBe(1);
   });
 
-  it('skips dormant souls', () => {
-    insertSpawnedSoulRow('project-rust', 'learning rust ownership', 'dormant');
+  it('does NOT route to archived souls', () => {
+    insertSpawnedSoulRow('project-rust', 'learning rust ownership', 'archived');
     addMemory(getDb(), {
       groupFolder: 'main',
       timestamp: '2026-05-29T10:00:00Z',
@@ -4798,6 +4798,20 @@ describe('routeUncuratedObservationsToSpawnedSouls', () => {
     });
     const res = routeUncuratedObservationsToSpawnedSouls(getDb(), 'main');
     expect(res.routed).toBe(0);
+  });
+
+  it('routes to dormant souls (so they can be resurrected)', () => {
+    insertSpawnedSoulRow('k8s', 'monitoring kubernetes', 'dormant');
+    addMemory(getDb(), {
+      groupFolder: 'main',
+      timestamp: '2026-05-29T10:00:00Z',
+      type: 'observation',
+      source: 'user',
+      content: 'kubernetes autoscaling notes',
+      importance: 5,
+    });
+    const res = routeUncuratedObservationsToSpawnedSouls(getDb(), 'main');
+    expect(res.perFolder['k8s']).toBeGreaterThan(0);
   });
 
   it('returns {routed:0} early when there are no spawned souls', () => {
