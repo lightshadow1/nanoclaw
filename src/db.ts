@@ -1,9 +1,15 @@
 import Database from 'better-sqlite3';
+import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
 import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
-import { NewMessage, RegisteredGroup, ScheduledTask, TaskRunLog } from './types.js';
+import {
+  NewMessage,
+  RegisteredGroup,
+  ScheduledTask,
+  TaskRunLog,
+} from './types.js';
 
 let db: Database.Database;
 
@@ -100,29 +106,50 @@ function createSchema(database: Database.Database): void {
       `ALTER TABLE messages ADD COLUMN is_bot_message INTEGER DEFAULT 0`,
     );
     // Backfill: mark existing bot messages that used the content prefix pattern
-    database.prepare(
-      `UPDATE messages SET is_bot_message = 1 WHERE content LIKE ?`,
-    ).run(`${ASSISTANT_NAME}:%`);
+    database
+      .prepare(`UPDATE messages SET is_bot_message = 1 WHERE content LIKE ?`)
+      .run(`${ASSISTANT_NAME}:%`);
   } catch {
     /* column already exists */
   }
 
   // Add channel and is_group columns if they don't exist (migration for existing DBs)
   try {
-    database.exec(
-      `ALTER TABLE chats ADD COLUMN channel TEXT`,
-    );
-    database.exec(
-      `ALTER TABLE chats ADD COLUMN is_group INTEGER DEFAULT 0`,
-    );
+    database.exec(`ALTER TABLE chats ADD COLUMN channel TEXT`);
+    database.exec(`ALTER TABLE chats ADD COLUMN is_group INTEGER DEFAULT 0`);
     // Backfill from JID patterns
-    database.exec(`UPDATE chats SET channel = 'whatsapp', is_group = 1 WHERE jid LIKE '%@g.us'`);
-    database.exec(`UPDATE chats SET channel = 'whatsapp', is_group = 0 WHERE jid LIKE '%@s.whatsapp.net'`);
-    database.exec(`UPDATE chats SET channel = 'discord', is_group = 1 WHERE jid LIKE 'dc:%'`);
-    database.exec(`UPDATE chats SET channel = 'telegram', is_group = 1 WHERE jid LIKE 'tg:%'`);
+    database.exec(
+      `UPDATE chats SET channel = 'whatsapp', is_group = 1 WHERE jid LIKE '%@g.us'`,
+    );
+    database.exec(
+      `UPDATE chats SET channel = 'whatsapp', is_group = 0 WHERE jid LIKE '%@s.whatsapp.net'`,
+    );
+    database.exec(
+      `UPDATE chats SET channel = 'discord', is_group = 1 WHERE jid LIKE 'dc:%'`,
+    );
+    database.exec(
+      `UPDATE chats SET channel = 'telegram', is_group = 1 WHERE jid LIKE 'tg:%'`,
+    );
   } catch {
     /* columns already exist */
   }
+
+  // Durable scheduler claims prevent a due task from being queued again while
+  // its current occurrence is waiting or running.
+  try {
+    database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN claim_token TEXT`);
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN claimed_at TEXT`);
+  } catch {
+    /* column already exists */
+  }
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_claim
+    ON scheduled_tasks(status, next_run, claim_token)
+  `);
 }
 
 export function initDatabase(): void {
@@ -143,7 +170,8 @@ export function _initTestDatabase(): void {
 }
 
 export function getDb(): Database.Database {
-  if (!db) throw new Error('Database not initialized. Call initDatabase() first.');
+  if (!db)
+    throw new Error('Database not initialized. Call initDatabase() first.');
   return db;
 }
 
@@ -429,32 +457,116 @@ export function deleteTask(id: string): void {
   db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
 }
 
-export function getDueTasks(): ScheduledTask[] {
-  const now = new Date().toISOString();
-  return db
-    .prepare(
-      `
-    SELECT * FROM scheduled_tasks
-    WHERE status = 'active' AND next_run IS NOT NULL AND next_run <= ?
-    ORDER BY next_run
-  `,
-    )
-    .all(now) as ScheduledTask[];
+export interface ClaimedTask extends ScheduledTask {
+  claim_token: string;
+  claimed_at: string;
 }
 
-export function updateTaskAfterRun(
+export function claimDueTasks(
+  now: Date = new Date(),
+  limit = 100,
+): ClaimedTask[] {
+  const nowIso = now.toISOString();
+  const boundedLimit = Math.max(1, Math.floor(limit));
+  const select = db.prepare(`
+    SELECT * FROM scheduled_tasks
+    WHERE status = 'active'
+      AND next_run IS NOT NULL
+      AND next_run <= ?
+      AND claim_token IS NULL
+    ORDER BY next_run
+    LIMIT ?
+  `);
+  const claim = db.prepare(`
+    UPDATE scheduled_tasks
+    SET claim_token = ?, claimed_at = ?
+    WHERE id = ?
+      AND status = 'active'
+      AND next_run IS NOT NULL
+      AND next_run <= ?
+      AND claim_token IS NULL
+  `);
+
+  return db
+    .transaction(() => {
+      const due = select.all(nowIso, boundedLimit) as ScheduledTask[];
+      const claimed: ClaimedTask[] = [];
+      for (const task of due) {
+        const claimToken = randomUUID();
+        const result = claim.run(claimToken, nowIso, task.id, nowIso);
+        if (result.changes === 1) {
+          claimed.push({
+            ...task,
+            claim_token: claimToken,
+            claimed_at: nowIso,
+          });
+        }
+      }
+      return claimed;
+    })
+    .immediate();
+}
+
+export function finalizeClaimedTask(
   id: string,
+  claimToken: string,
   nextRun: string | null,
   lastResult: string,
-): void {
+  runLog?: TaskRunLog,
+): boolean {
   const now = new Date().toISOString();
-  db.prepare(
-    `
+  const finalize = db.prepare(`
     UPDATE scheduled_tasks
-    SET next_run = ?, last_run = ?, last_result = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
-    WHERE id = ?
-  `,
-  ).run(nextRun, now, lastResult, nextRun, id);
+    SET next_run = ?, last_run = ?, last_result = ?,
+        status = CASE
+          WHEN ? IS NULL AND status = 'active' THEN 'completed'
+          ELSE status
+        END,
+        claim_token = NULL, claimed_at = NULL
+    WHERE id = ? AND claim_token = ?
+  `);
+  const insertLog = db.prepare(`
+    INSERT INTO task_run_logs (task_id, run_at, duration_ms, status, result, error)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+
+  return db
+    .transaction(() => {
+      const result = finalize.run(
+        nextRun,
+        now,
+        lastResult,
+        nextRun,
+        id,
+        claimToken,
+      );
+      if (result.changes !== 1) return false;
+      if (runLog) {
+        insertLog.run(
+          runLog.task_id,
+          runLog.run_at,
+          runLog.duration_ms,
+          runLog.status,
+          runLog.result,
+          runLog.error,
+        );
+      }
+      return true;
+    })
+    .immediate();
+}
+
+export function releaseInterruptedTaskClaims(): string[] {
+  const rows = db
+    .prepare(
+      `SELECT id FROM scheduled_tasks WHERE claim_token IS NOT NULL ORDER BY id`,
+    )
+    .all() as Array<{ id: string }>;
+  if (rows.length === 0) return [];
+  db.prepare(
+    `UPDATE scheduled_tasks SET claim_token = NULL, claimed_at = NULL WHERE claim_token IS NOT NULL`,
+  ).run();
+  return rows.map((row) => row.id);
 }
 
 export function logTaskRun(log: TaskRunLog): void {
@@ -542,14 +654,12 @@ export function getRegisteredGroup(
     containerConfig: row.container_config
       ? JSON.parse(row.container_config)
       : undefined,
-    requiresTrigger: row.requires_trigger === null ? undefined : row.requires_trigger === 1,
+    requiresTrigger:
+      row.requires_trigger === null ? undefined : row.requires_trigger === 1,
   };
 }
 
-export function setRegisteredGroup(
-  jid: string,
-  group: RegisteredGroup,
-): void {
+export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   db.prepare(
     `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -565,9 +675,7 @@ export function setRegisteredGroup(
 }
 
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
-  const rows = db
-    .prepare('SELECT * FROM registered_groups')
-    .all() as Array<{
+  const rows = db.prepare('SELECT * FROM registered_groups').all() as Array<{
     jid: string;
     name: string;
     folder: string;
@@ -586,7 +694,8 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       containerConfig: row.container_config
         ? JSON.parse(row.container_config)
         : undefined,
-      requiresTrigger: row.requires_trigger === null ? undefined : row.requires_trigger === 1,
+      requiresTrigger:
+        row.requires_trigger === null ? undefined : row.requires_trigger === 1,
     };
   }
   return result;

@@ -7,17 +7,21 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
+  MAX_CONCURRENT_CONTAINERS,
   SCHEDULER_POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
 import { dispatchBeforeTaskRun } from './capabilities/hooks.js';
-import { ContainerOutput, runContainerAgent, writeTasksSnapshot } from './container-runner.js';
 import {
+  ContainerOutput,
+  runContainerAgent,
+  writeTasksSnapshot,
+} from './container-runner.js';
+import {
+  ClaimedTask,
+  claimDueTasks,
+  finalizeClaimedTask,
   getAllTasks,
-  getDueTasks,
-  getTaskById,
-  logTaskRun,
-  updateTaskAfterRun,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { logger } from './logger.js';
@@ -27,12 +31,17 @@ export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
   getSessions: () => Record<string, string>;
   queue: GroupQueue;
-  onProcess: (groupJid: string, proc: ChildProcess, containerName: string, groupFolder: string) => void;
+  onProcess: (
+    groupJid: string,
+    proc: ChildProcess,
+    containerName: string,
+    groupFolder: string,
+  ) => void;
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
 
 async function runTask(
-  task: ScheduledTask,
+  task: ClaimedTask,
   deps: SchedulerDependencies,
 ): Promise<void> {
   const startTime = Date.now();
@@ -49,13 +58,25 @@ async function runTask(
   if (!allow) {
     let nextRun: string | null = null;
     if (task.schedule_type === 'cron') {
-      nextRun = CronExpressionParser.parse(task.schedule_value, { tz: TIMEZONE })
+      nextRun = CronExpressionParser.parse(task.schedule_value, {
+        tz: TIMEZONE,
+      })
         .next()
         .toISOString();
     } else if (task.schedule_type === 'interval') {
-      nextRun = new Date(Date.now() + parseInt(task.schedule_value, 10)).toISOString();
+      nextRun = new Date(
+        Date.now() + parseInt(task.schedule_value, 10),
+      ).toISOString();
     }
-    updateTaskAfterRun(task.id, nextRun, 'skipped: gated by capability hook');
+    const finalized = finalizeClaimedTask(
+      task.id,
+      task.claim_token,
+      nextRun,
+      'skipped: gated by capability hook',
+    );
+    if (!finalized) {
+      logger.error({ taskId: task.id }, 'Task claim ownership lost');
+    }
     return;
   }
 
@@ -74,19 +95,21 @@ async function runTask(
       { taskId: task.id, groupFolder: task.group_folder },
       'Group not found for task',
     );
-    logTaskRun({
+    const runLog = {
       task_id: task.id,
       run_at: new Date().toISOString(),
       duration_ms: Date.now() - startTime,
-      status: 'error',
+      status: 'error' as const,
       result: null,
       error: `Group not found: ${task.group_folder}`,
-    });
+    };
     // Advance next_run so a genuinely-orphaned task doesn't hot-loop every
     // scheduler poll (it stays due otherwise, re-firing the error forever).
     let nextRun: string | null = null;
     if (task.schedule_type === 'cron') {
-      nextRun = CronExpressionParser.parse(task.schedule_value, { tz: TIMEZONE })
+      nextRun = CronExpressionParser.parse(task.schedule_value, {
+        tz: TIMEZONE,
+      })
         .next()
         .toISOString();
     } else if (task.schedule_type === 'interval') {
@@ -94,7 +117,16 @@ async function runTask(
         Date.now() + parseInt(task.schedule_value, 10),
       ).toISOString();
     }
-    updateTaskAfterRun(task.id, nextRun, `Error: group not found`);
+    const finalized = finalizeClaimedTask(
+      task.id,
+      task.claim_token,
+      nextRun,
+      'Error: group not found',
+      runLog,
+    );
+    if (!finalized) {
+      logger.error({ taskId: task.id }, 'Task claim ownership lost');
+    }
     return;
   }
 
@@ -148,7 +180,8 @@ async function runTask(
         isMain,
         isScheduledTask: true,
       },
-      (proc, containerName) => deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
+      (proc, containerName) =>
+        deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
@@ -186,14 +219,14 @@ async function runTask(
 
   const durationMs = Date.now() - startTime;
 
-  logTaskRun({
+  const runLog = {
     task_id: task.id,
     run_at: new Date().toISOString(),
     duration_ms: durationMs,
-    status: error ? 'error' : 'success',
+    status: error ? ('error' as const) : ('success' as const),
     result,
     error,
-  });
+  };
 
   let nextRun: string | null = null;
   if (task.schedule_type === 'cron') {
@@ -212,7 +245,16 @@ async function runTask(
     : result
       ? result.slice(0, 200)
       : 'Completed';
-  updateTaskAfterRun(task.id, nextRun, resultSummary);
+  const finalized = finalizeClaimedTask(
+    task.id,
+    task.claim_token,
+    nextRun,
+    resultSummary,
+    runLog,
+  );
+  if (!finalized) {
+    logger.error({ taskId: task.id }, 'Task claim ownership lost');
+  }
 }
 
 let schedulerRunning = false;
@@ -226,31 +268,37 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   logger.info('Scheduler loop started');
 
   const loop = async () => {
-    try {
-      const dueTasks = getDueTasks();
-      if (dueTasks.length > 0) {
-        logger.info({ count: dueTasks.length }, 'Found due tasks');
-      }
-
-      for (const task of dueTasks) {
-        // Re-check task status in case it was paused/cancelled
-        const currentTask = getTaskById(task.id);
-        if (!currentTask || currentTask.status !== 'active') {
-          continue;
-        }
-
-        deps.queue.enqueueTask(
-          currentTask.chat_jid,
-          currentTask.id,
-          () => runTask(currentTask, deps),
-        );
-      }
-    } catch (err) {
-      logger.error({ err }, 'Error in scheduler loop');
-    }
+    await pollSchedulerOnce(deps);
 
     setTimeout(loop, SCHEDULER_POLL_INTERVAL);
   };
 
   loop();
+}
+
+/** One scheduler poll, exported to make claim behavior testable. */
+export async function pollSchedulerOnce(
+  deps: SchedulerDependencies,
+  now: Date = new Date(),
+): Promise<void> {
+  try {
+    const claimedTasks = claimDueTasks(now, MAX_CONCURRENT_CONTAINERS);
+    if (claimedTasks.length > 0) {
+      logger.info({ count: claimedTasks.length }, 'Found due tasks');
+    }
+
+    for (const task of claimedTasks) {
+      logger.debug(
+        {
+          taskId: task.id,
+          claimToken: task.claim_token.slice(0, 8),
+          claimedAt: task.claimed_at,
+        },
+        'Scheduled task claimed',
+      );
+      deps.queue.enqueueTask(task.chat_jid, task.id, () => runTask(task, deps));
+    }
+  } catch (err) {
+    logger.error({ err }, 'Error in scheduler loop');
+  }
 }
