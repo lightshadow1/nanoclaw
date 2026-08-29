@@ -52,6 +52,27 @@ export interface NewMessage {
   is_bot_message?: boolean;
 }
 
+export interface HistorySearchOptions {
+  query: string;
+  chatJids: string[];
+  limit?: number;
+  before?: string;
+  after?: string;
+  includeBotMessages?: boolean;
+}
+
+export interface HistorySearchResult {
+  id: string;
+  chat_jid: string;
+  sender: string;
+  sender_name: string;
+  content: string;
+  timestamp: string;
+  is_from_me: boolean;
+  is_bot_message: boolean;
+  rank: number;
+}
+
 export interface ScheduledTask {
   id: string;
   group_folder: string;

@@ -7,8 +7,16 @@ import {
   getRegisteredGroup,
   getTaskById,
   setRegisteredGroup,
+  storeChatMetadata,
+  storeMessage,
 } from './db.js';
-import { processTaskIpc, sanitizeButtons, IpcDeps, SpawnSoulRequest } from './ipc.js';
+import {
+  processHistorySearchRequest,
+  processTaskIpc,
+  sanitizeButtons,
+  IpcDeps,
+  SpawnSoulRequest,
+} from './ipc.js';
 import { RegisteredGroup } from './types.js';
 
 // Set up registered groups used across tests
@@ -68,6 +76,95 @@ beforeEach(() => {
       return { ok: true, folder: req.folder, did: `did:test:${req.folder}` };
     },
   };
+});
+
+describe('search_history authorization', () => {
+  beforeEach(() => {
+    for (const jid of Object.keys(groups)) {
+      storeChatMetadata(jid, '2024-01-01T00:00:00.000Z');
+      storeMessage({
+        id: `message-${jid}`,
+        chat_jid: jid,
+        sender: 'user',
+        sender_name: 'User',
+        content: `shared history evidence from ${jid}`,
+        timestamp: '2024-01-01T00:00:01.000Z',
+      });
+    }
+  });
+
+  it('limits non-main search to its verified source group', () => {
+    const response = processHistorySearchRequest(
+      { type: 'search_history', requestId: 'request-1', query: 'evidence' },
+      'other-group',
+      false,
+      deps,
+    );
+    expect(response.ok).toBe(true);
+    expect(response.results?.map((result) => result.groupFolder)).toEqual([
+      'other-group',
+    ]);
+  });
+
+  it('rejects a non-main target override', () => {
+    const response = processHistorySearchRequest(
+      {
+        type: 'search_history',
+        requestId: 'request-2',
+        query: 'evidence',
+        targetGroupJid: 'main@g.us',
+      },
+      'other-group',
+      false,
+      deps,
+    );
+    expect(response).toEqual({
+      ok: false,
+      error: 'Cross-group history search is not authorized',
+    });
+  });
+
+  it('allows main to search all groups or one registered target', () => {
+    const all = processHistorySearchRequest(
+      { type: 'search_history', requestId: 'request-3', query: 'evidence' },
+      'main',
+      true,
+      deps,
+    );
+    expect(new Set(all.results?.map((result) => result.groupFolder))).toEqual(
+      new Set(['main', 'other-group', 'third-group']),
+    );
+
+    const targeted = processHistorySearchRequest(
+      {
+        type: 'search_history',
+        requestId: 'request-4',
+        query: 'evidence',
+        targetGroupJid: 'third@g.us',
+      },
+      'main',
+      true,
+      deps,
+    );
+    expect(targeted.results?.map((result) => result.groupFolder)).toEqual([
+      'third-group',
+    ]);
+  });
+
+  it('rejects an unknown target', () => {
+    const response = processHistorySearchRequest(
+      {
+        type: 'search_history',
+        requestId: 'request-5',
+        query: 'evidence',
+        targetGroupJid: 'unknown@g.us',
+      },
+      'main',
+      true,
+      deps,
+    );
+    expect(response).toEqual({ ok: false, error: 'Unknown target group' });
+  });
 });
 
 // --- schedule_task authorization ---

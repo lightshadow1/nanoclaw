@@ -3,8 +3,15 @@ import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import {
+  ASSISTANT_NAME,
+  DATA_DIR,
+  HISTORY_SEARCH_ENABLED,
+  STORE_DIR,
+} from './config.js';
+import {
+  HistorySearchOptions,
+  HistorySearchResult,
   NewMessage,
   RegisteredGroup,
   ScheduledTask,
@@ -90,6 +97,40 @@ function createSchema(database: Database.Database): void {
       PRIMARY KEY (capability, version)
     );
   `);
+
+  if (HISTORY_SEARCH_ENABLED) {
+    const historyIndexExists = database
+      .prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'`,
+      )
+      .get();
+    database.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+        content,
+        sender_name,
+        content='messages',
+        content_rowid='rowid',
+        tokenize='unicode61 remove_diacritics 2'
+      );
+      CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+        INSERT INTO messages_fts(rowid, content, sender_name)
+        VALUES (new.rowid, new.content, new.sender_name);
+      END;
+      CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, content, sender_name)
+        VALUES ('delete', old.rowid, old.content, old.sender_name);
+      END;
+      CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, content, sender_name)
+        VALUES ('delete', old.rowid, old.content, old.sender_name);
+        INSERT INTO messages_fts(rowid, content, sender_name)
+        VALUES (new.rowid, new.content, new.sender_name);
+      END;
+    `);
+    if (!historyIndexExists) {
+      database.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`);
+    }
+  }
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
   try {
@@ -279,7 +320,15 @@ export function setLastGroupSync(): void {
  */
 export function storeMessage(msg: NewMessage): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id, chat_jid) DO UPDATE SET
+       sender = excluded.sender,
+       sender_name = excluded.sender_name,
+       content = excluded.content,
+       timestamp = excluded.timestamp,
+       is_from_me = excluded.is_from_me,
+       is_bot_message = excluded.is_bot_message`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -306,7 +355,15 @@ export function storeMessageDirect(msg: {
   is_bot_message?: boolean;
 }): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id, chat_jid) DO UPDATE SET
+       sender = excluded.sender,
+       sender_name = excluded.sender_name,
+       content = excluded.content,
+       timestamp = excluded.timestamp,
+       is_from_me = excluded.is_from_me,
+       is_bot_message = excluded.is_bot_message`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -317,6 +374,90 @@ export function storeMessageDirect(msg: {
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
   );
+}
+
+function parseHistoryQuery(query: string): string {
+  const trimmed = query.trim();
+  if (!trimmed) throw new Error('History search query cannot be empty');
+  if (trimmed.length > 256)
+    throw new Error('History search query exceeds 256 characters');
+
+  const parts = trimmed.match(/"[^"]+"|\S+/g) ?? [];
+  return parts
+    .map((part) => {
+      const quoted = part.startsWith('"') && part.endsWith('"');
+      const prefix = !quoted && part.endsWith('*');
+      const value = (quoted ? part.slice(1, -1) : prefix ? part.slice(0, -1) : part)
+        .replace(/"/g, '""')
+        .trim();
+      if (!value) throw new Error('History search contains an empty token');
+      return `"${value}"${prefix ? '*' : ''}`;
+    })
+    .join(' AND ');
+}
+
+export function searchMessageHistory(
+  options: HistorySearchOptions,
+): HistorySearchResult[] {
+  if (!HISTORY_SEARCH_ENABLED)
+    throw new Error('History search is disabled');
+  if (options.chatJids.length === 0) return [];
+
+  const limit = Math.min(20, Math.max(1, Math.floor(options.limit ?? 8)));
+  const validateTimestamp = (value: string | undefined, name: string) => {
+    if (value !== undefined && Number.isNaN(new Date(value).getTime()))
+      throw new Error(`Invalid history search ${name} timestamp`);
+  };
+  validateTimestamp(options.before, 'before');
+  validateTimestamp(options.after, 'after');
+
+  const placeholders = options.chatJids.map(() => '?').join(',');
+  const conditions = [
+    'messages_fts MATCH ?',
+    `m.chat_jid IN (${placeholders})`,
+  ];
+  const params: unknown[] = [parseHistoryQuery(options.query), ...options.chatJids];
+  if (options.before) {
+    conditions.push('m.timestamp < ?');
+    params.push(options.before);
+  }
+  if (options.after) {
+    conditions.push('m.timestamp > ?');
+    params.push(options.after);
+  }
+  if (!options.includeBotMessages) conditions.push('m.is_bot_message = 0');
+  params.push(limit);
+
+  const rows = db
+    .prepare(
+      `SELECT m.id, m.chat_jid, m.sender, m.sender_name,
+              substr(m.content, 1, 2000) AS content, m.timestamp,
+              m.is_from_me, m.is_bot_message, bm25(messages_fts) AS rank
+       FROM messages_fts
+       JOIN messages m ON m.rowid = messages_fts.rowid
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY rank, m.timestamp DESC
+       LIMIT ?`,
+    )
+    .all(...params) as Array<Omit<HistorySearchResult, 'is_from_me' | 'is_bot_message'> & {
+      is_from_me: number;
+      is_bot_message: number;
+    }>;
+
+  const results: HistorySearchResult[] = [];
+  let aggregateSize = 2;
+  for (const row of rows) {
+    const result = {
+      ...row,
+      is_from_me: row.is_from_me === 1,
+      is_bot_message: row.is_bot_message === 1,
+    };
+    const size = JSON.stringify(result).length;
+    if (aggregateSize + size > 20_000) break;
+    aggregateSize += size;
+    results.push(result);
+  }
+  return results;
 }
 
 export function getNewMessages(

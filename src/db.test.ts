@@ -10,8 +10,10 @@ import {
   getAllChats,
   getMessagesSince,
   getNewMessages,
+  getDb,
   getTaskById,
   releaseInterruptedTaskClaims,
+  searchMessageHistory,
   storeChatMetadata,
   storeMessage,
   updateTask,
@@ -140,6 +142,108 @@ describe('storeMessage', () => {
     );
     expect(messages).toHaveLength(1);
     expect(messages[0].content).toBe('updated');
+  });
+});
+
+describe('searchMessageHistory', () => {
+  beforeEach(() => {
+    storeChatMetadata('group-1', '2024-01-01T00:00:00.000Z');
+    storeChatMetadata('group-2', '2024-01-01T00:00:00.000Z');
+    store({
+      id: 'search-1',
+      chat_jid: 'group-1',
+      sender: 'alice',
+      sender_name: 'Alice',
+      content: 'We approved the blue deployment plan',
+      timestamp: '2024-01-01T10:00:00.000Z',
+    });
+    store({
+      id: 'search-2',
+      chat_jid: 'group-2',
+      sender: 'bob',
+      sender_name: 'Bob',
+      content: 'The deployment was postponed',
+      timestamp: '2024-01-02T10:00:00.000Z',
+    });
+    storeMessage({
+      id: 'search-bot',
+      chat_jid: 'group-1',
+      sender: 'bot',
+      sender_name: 'Andy',
+      content: 'deployment automation complete',
+      timestamp: '2024-01-03T10:00:00.000Z',
+      is_bot_message: true,
+    });
+  });
+
+  it('searches exact phrases within authorized chat JIDs', () => {
+    const results = searchMessageHistory({
+      query: '"blue deployment"',
+      chatJids: ['group-1'],
+    });
+    expect(results.map((result) => result.id)).toEqual(['search-1']);
+  });
+
+  it('supports trailing prefix queries and time bounds', () => {
+    const results = searchMessageHistory({
+      query: 'deploy*',
+      chatJids: ['group-1', 'group-2'],
+      after: '2024-01-01T12:00:00.000Z',
+    });
+    expect(results.map((result) => result.id)).toEqual(['search-2']);
+  });
+
+  it('excludes bot messages by default and includes them on request', () => {
+    expect(
+      searchMessageHistory({ query: 'automation', chatJids: ['group-1'] }),
+    ).toHaveLength(0);
+    expect(
+      searchMessageHistory({
+        query: 'automation',
+        chatJids: ['group-1'],
+        includeBotMessages: true,
+      }).map((result) => result.id),
+    ).toEqual(['search-bot']);
+  });
+
+  it('keeps the index coherent across update and delete', () => {
+    store({
+      id: 'search-1',
+      chat_jid: 'group-1',
+      sender: 'alice',
+      sender_name: 'Alice',
+      content: 'The green release replaced it',
+      timestamp: '2024-01-01T10:00:00.000Z',
+    });
+    expect(
+      searchMessageHistory({ query: 'blue', chatJids: ['group-1'] }),
+    ).toHaveLength(0);
+    expect(
+      searchMessageHistory({ query: 'green', chatJids: ['group-1'] }),
+    ).toHaveLength(1);
+
+    getDb()
+      .prepare('DELETE FROM messages WHERE id = ? AND chat_jid = ?')
+      .run('search-1', 'group-1');
+    expect(
+      searchMessageHistory({ query: 'green', chatJids: ['group-1'] }),
+    ).toHaveLength(0);
+  });
+
+  it('rejects empty, oversized, and invalid time queries', () => {
+    expect(() =>
+      searchMessageHistory({ query: ' ', chatJids: ['group-1'] }),
+    ).toThrow('cannot be empty');
+    expect(() =>
+      searchMessageHistory({ query: 'x'.repeat(257), chatJids: ['group-1'] }),
+    ).toThrow('exceeds 256');
+    expect(() =>
+      searchMessageHistory({
+        query: 'deployment',
+        chatJids: ['group-1'],
+        before: 'not-a-date',
+      }),
+    ).toThrow('Invalid history search before');
   });
 });
 

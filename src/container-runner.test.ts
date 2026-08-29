@@ -13,6 +13,7 @@ vi.mock('./config.js', () => ({
   CONTAINER_TIMEOUT: 1800000, // 30min
   DATA_DIR: '/tmp/nanoclaw-test-data',
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',
+  HISTORY_SEARCH_ENABLED: true,
   IDLE_TIMEOUT: 1800000, // 30min
 }));
 

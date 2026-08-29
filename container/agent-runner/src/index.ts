@@ -26,6 +26,7 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  historySearchEnabled?: boolean;
   secrets?: Record<string, string>;
 }
 
@@ -446,6 +447,7 @@ async function runQuery(
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
             NANOCLAW_IS_SCHEDULED_TASK: containerInput.isScheduledTask ? '1' : '0',
+            NANOCLAW_HISTORY_SEARCH_ENABLED: containerInput.historySearchEnabled ? '1' : '0',
           },
         },
       },

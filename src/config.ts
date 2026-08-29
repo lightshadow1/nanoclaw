@@ -11,6 +11,7 @@ const envConfig = readEnvFile([
   'ASSISTANT_HAS_OWN_NUMBER',
   'CHANNELS',
   'TELEGRAM_BOT_TOKEN',
+  'HISTORY_SEARCH_ENABLED',
 ]);
 
 export const ASSISTANT_NAME =
@@ -25,6 +26,9 @@ export const CHANNELS = (process.env.CHANNELS || envConfig.CHANNELS || 'whatsapp
 // Telegram bot token — required when CHANNELS includes 'telegram'
 export const TELEGRAM_BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN || envConfig.TELEGRAM_BOT_TOKEN || '';
+export const HISTORY_SEARCH_ENABLED =
+  (process.env.HISTORY_SEARCH_ENABLED || envConfig.HISTORY_SEARCH_ENABLED) !==
+  'false';
 
 export const SCHEDULER_POLL_INTERVAL = 60000;
 

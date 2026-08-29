@@ -5,12 +5,19 @@ import { CronExpressionParser } from 'cron-parser';
 
 import {
   DATA_DIR,
+  HISTORY_SEARCH_ENABLED,
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   TIMEZONE,
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import {
+  createTask,
+  deleteTask,
+  getTaskById,
+  searchMessageHistory,
+  updateTask,
+} from './db.js';
 import { logger } from './logger.js';
 import { MessageButton, RegisteredGroup, SendOptions } from './types.js';
 
@@ -60,6 +67,119 @@ export interface IpcDeps {
     content: string,
     caption?: string,
   ) => Promise<void>;
+}
+
+export interface HistorySearchIpcRequest {
+  type: 'search_history';
+  requestId: string;
+  query: string;
+  limit?: number;
+  before?: string;
+  after?: string;
+  includeBotMessages?: boolean;
+  targetGroupJid?: string;
+}
+
+export interface HistorySearchIpcResponse {
+  ok: boolean;
+  results?: Array<{
+    groupName: string;
+    groupFolder: string;
+    timestamp: string;
+    senderName: string;
+    messageId: string;
+    direction: 'user' | 'assistant';
+    content: string;
+  }>;
+  error?: string;
+}
+
+export function processHistorySearchRequest(
+  data: HistorySearchIpcRequest,
+  sourceGroup: string,
+  isMain: boolean,
+  deps: IpcDeps,
+): HistorySearchIpcResponse {
+  if (!HISTORY_SEARCH_ENABLED)
+    return { ok: false, error: 'History search is disabled' };
+
+  const groups = deps.registeredGroups();
+  let authorizedJids: string[];
+  if (isMain) {
+    if (data.targetGroupJid) {
+      if (!groups[data.targetGroupJid])
+        return { ok: false, error: 'Unknown target group' };
+      authorizedJids = [data.targetGroupJid];
+    } else {
+      authorizedJids = Object.keys(groups);
+    }
+  } else {
+    if (data.targetGroupJid)
+      return { ok: false, error: 'Cross-group history search is not authorized' };
+    authorizedJids = Object.entries(groups)
+      .filter(([, group]) => group.folder === sourceGroup)
+      .map(([jid]) => jid);
+  }
+
+  try {
+    const mappedResults = searchMessageHistory({
+      query: data.query,
+      chatJids: authorizedJids,
+      limit: data.limit,
+      before: data.before,
+      after: data.after,
+      includeBotMessages: data.includeBotMessages,
+    }).map((result) => {
+      const group = groups[result.chat_jid];
+      return {
+        groupName: group?.name ?? 'Unknown',
+        groupFolder: group?.folder ?? 'unknown',
+        timestamp: result.timestamp,
+        senderName: result.sender_name,
+        messageId: result.id,
+        direction:
+          result.is_from_me || result.is_bot_message
+            ? ('assistant' as const)
+            : ('user' as const),
+        content: result.content,
+      };
+    });
+    const results = [];
+    let responseSize = 2;
+    for (const result of mappedResults) {
+      const resultSize = JSON.stringify(result).length;
+      if (responseSize + resultSize > 20_000) break;
+      responseSize += resultSize;
+      results.push(result);
+    }
+    return { ok: true, results };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message.slice(0, 300) : 'Search failed',
+    };
+  }
+}
+
+function writeJsonAtomic(filePath: string, data: object): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(data));
+  fs.renameSync(tempPath, filePath);
+}
+
+function removeStaleIpcFiles(dir: string, now = Date.now()): void {
+  if (!fs.existsSync(dir)) return;
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.endsWith('.json') && !file.endsWith('.tmp')) continue;
+    const filePath = path.join(dir, file);
+    try {
+      if (now - fs.statSync(filePath).mtimeMs > 60 * 60 * 1000)
+        fs.unlinkSync(filePath);
+    } catch {
+      // Another process may have removed it.
+    }
+  }
 }
 
 // Sanitize container-supplied inline buttons. Caps keep a compromised or
@@ -131,6 +251,56 @@ export function startIpcWatcher(deps: IpcDeps): void {
       const isMain = sourceGroup === MAIN_GROUP_FOLDER;
       const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
       const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
+      const requestsDir = path.join(ipcBaseDir, sourceGroup, 'requests');
+      const responsesDir = path.join(ipcBaseDir, sourceGroup, 'responses');
+
+      removeStaleIpcFiles(requestsDir);
+      removeStaleIpcFiles(responsesDir);
+
+      if (HISTORY_SEARCH_ENABLED && fs.existsSync(requestsDir)) {
+        const requestFiles = fs
+          .readdirSync(requestsDir)
+          .filter((file) => file.endsWith('.json'));
+        for (const file of requestFiles) {
+          const filePath = path.join(requestsDir, file);
+          try {
+            const data = JSON.parse(
+              fs.readFileSync(filePath, 'utf-8'),
+            ) as HistorySearchIpcRequest;
+            if (
+              data.type !== 'search_history' ||
+              typeof data.requestId !== 'string' ||
+              !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+                data.requestId,
+              ) ||
+              file !== `${data.requestId}.json`
+            ) {
+              throw new Error('Invalid history search request');
+            }
+            const response = processHistorySearchRequest(
+              data,
+              sourceGroup,
+              isMain,
+              deps,
+            );
+            writeJsonAtomic(
+              path.join(responsesDir, `${data.requestId}.json`),
+              response,
+            );
+            fs.unlinkSync(filePath);
+          } catch (err) {
+            logger.warn(
+              { sourceGroup, file, err },
+              'Invalid history search IPC request',
+            );
+            try {
+              fs.unlinkSync(filePath);
+            } catch {
+              // Already removed.
+            }
+          }
+        }
+      }
 
       // Process messages from this group's IPC directory
       try {

@@ -13,6 +13,7 @@ import {
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
+  HISTORY_SEARCH_ENABLED,
   IDLE_TIMEOUT,
 } from './config.js';
 import { readEnvFile } from './env.js';
@@ -42,6 +43,7 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  historySearchEnabled?: boolean;
   secrets?: Record<string, string>;
 }
 
@@ -149,6 +151,8 @@ function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'requests'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'responses'), { recursive: true });
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -266,6 +270,7 @@ export async function runContainerAgent(
     let stderrTruncated = false;
 
     // Pass secrets via stdin (never written to disk or mounted as files)
+    input.historySearchEnabled = HISTORY_SEARCH_ENABLED;
     input.secrets = readSecrets();
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
