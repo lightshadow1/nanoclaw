@@ -25,6 +25,7 @@ import {
   resolveTaskCapabilityProfile,
   TaskCapabilityProfileName,
 } from './task-capability-profiles.js';
+import type { ResolvedSkillBinding } from './skill-catalog.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -49,6 +50,7 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   historySearchEnabled?: boolean;
   capabilityProfile?: TaskCapabilityProfileName;
+  skills?: ResolvedSkillBinding[];
   secrets?: Record<string, string>;
 }
 
@@ -625,6 +627,7 @@ export function writeTasksSnapshot(
     status: string;
     next_run: string | null;
     capability_profile: string;
+    skills: string[];
   }>,
 ): void {
   // Write filtered tasks to the group's IPC directory

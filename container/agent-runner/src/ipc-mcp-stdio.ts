@@ -191,6 +191,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     schedule_value: z.string().describe('cron: "*/5 * * * *" | interval: milliseconds like "300000" | once: local timestamp like "2026-02-01T15:30:00" (no Z suffix!)'),
     context_mode: z.enum(['group', 'isolated']).default('group').describe('group=runs with chat history and memory, isolated=fresh session (include context in prompt)'),
     capability_profile: z.enum(['full', 'research', 'read-only']).default('full'),
+    skills: z.array(z.string()).max(8).default([]).describe('Installed skills the task must load in this order'),
     target_group_jid: z.string().optional().describe('(Main group only) JID of the group to schedule the task for. Defaults to the current group.'),
   },
   async (args) => {
@@ -232,6 +233,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       schedule_value: args.schedule_value,
       context_mode: args.context_mode || 'group',
       capability_profile: args.capability_profile,
+      skills: args.skills,
       targetJid,
       createdBy: groupFolder,
       executionContext,
@@ -270,8 +272,8 @@ if (canUseMcpTool('list_tasks')) server.tool(
 
       const formatted = tasks
         .map(
-          (t: { id: string; prompt: string; schedule_type: string; schedule_value: string; status: string; next_run: string; capability_profile?: string }) =>
-            `- [${t.id}] ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, profile: ${t.capability_profile || 'full'}, next: ${t.next_run || 'N/A'}`,
+          (t: { id: string; prompt: string; schedule_type: string; schedule_value: string; status: string; next_run: string; capability_profile?: string; skills?: string[] }) =>
+            `- [${t.id}] ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, profile: ${t.capability_profile || 'full'}, skills: ${t.skills?.join(', ') || 'none'}, next: ${t.next_run || 'N/A'}`,
         )
         .join('\n');
 

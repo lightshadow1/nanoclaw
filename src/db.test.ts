@@ -460,6 +460,20 @@ describe('task CRUD', () => {
     expect(task!.prompt).toBe('do something');
     expect(task!.status).toBe('active');
     expect(task!.capability_profile).toBe('full');
+    expect(task!.skills).toEqual([]);
+  });
+
+  it('round-trips ordered skill bindings and rejects malformed stored JSON', () => {
+    createTask({
+      id: 'task-skills', group_folder: 'main', chat_jid: 'group@g.us',
+      prompt: 'use procedures', schedule_type: 'once',
+      schedule_value: '2024-06-01T00:00:00.000Z', context_mode: 'isolated',
+      skills: ['agent-browser', 'second-skill'], next_run: null,
+      status: 'active', created_at: '2024-01-01T00:00:00.000Z',
+    });
+    expect(getTaskById('task-skills')!.skills).toEqual(['agent-browser', 'second-skill']);
+    getDb().prepare(`UPDATE scheduled_tasks SET skills_json = 'not-json' WHERE id = ?`).run('task-skills');
+    expect(() => getTaskById('task-skills')).toThrow('malformed JSON');
   });
 
   it('updates task status', () => {

@@ -22,11 +22,23 @@ import {
   claimDueTasks,
   finalizeClaimedTask,
   getAllTasks,
+  getLatestTaskExecutionContext,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 import { resolveTaskCapabilityProfile } from './task-capability-profiles.js';
+import { resolveSkillBindings } from './skill-catalog.js';
+
+function nextRunFor(task: ScheduledTask): string | null {
+  if (task.schedule_type === 'cron') {
+    return CronExpressionParser.parse(task.schedule_value, { tz: TIMEZONE }).next().toISOString();
+  }
+  if (task.schedule_type === 'interval') {
+    return new Date(Date.now() + parseInt(task.schedule_value, 10)).toISOString();
+  }
+  return null;
+}
 
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
@@ -46,6 +58,18 @@ async function runTask(
   deps: SchedulerDependencies,
 ): Promise<void> {
   const startTime = Date.now();
+  if (task.skill_validation_error) {
+    const error = task.skill_validation_error;
+    finalizeClaimedTask(task.id, task.claim_token, nextRunFor(task), `Error: ${error}`, {
+      task_id: task.id, run_at: new Date().toISOString(), duration_ms: Date.now() - startTime,
+      status: 'error', result: null, error,
+      execution_context: JSON.stringify({
+        capability_profile: task.capability_profile, skills_declared: null,
+        skill_validation_error: error,
+      }),
+    });
+    return;
+  }
   let profile;
   try {
     profile = resolveTaskCapabilityProfile(task.capability_profile);
@@ -66,7 +90,9 @@ async function runTask(
       status: 'error',
       result: null,
       error,
-      execution_context: JSON.stringify({ capability_profile: task.capability_profile }),
+      execution_context: JSON.stringify({
+        capability_profile: task.capability_profile, skills_declared: task.skills,
+      }),
     });
     return;
   }
@@ -108,6 +134,7 @@ async function runTask(
         execution_context: JSON.stringify({
           capability_profile: profile.name,
           profile_version: profile.version,
+          skills_declared: task.skills,
           skipped: true,
         }),
       },
@@ -116,6 +143,45 @@ async function runTask(
       logger.error({ taskId: task.id }, 'Task claim ownership lost');
     }
     return;
+  }
+
+  let resolvedSkills;
+  try {
+    if (task.skills.length > 0 && !profile.skillAccess) {
+      throw new Error(`Capability profile ${profile.name} does not permit skills`);
+    }
+    resolvedSkills = resolveSkillBindings(task.skills);
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    const finalized = finalizeClaimedTask(
+      task.id, task.claim_token, nextRunFor(task), `Error: ${error}`,
+      {
+        task_id: task.id, run_at: new Date().toISOString(), duration_ms: Date.now() - startTime,
+        status: 'error', result: null, error,
+        execution_context: JSON.stringify({
+          capability_profile: profile.name, profile_version: profile.version,
+          skills_declared: task.skills, skill_validation_error: error,
+        }),
+      },
+    );
+    if (!finalized) logger.error({ taskId: task.id }, 'Task claim ownership lost');
+    return;
+  }
+
+  const previousContext = getLatestTaskExecutionContext(task.id);
+  if (previousContext) {
+    try {
+      const previous = JSON.parse(previousContext) as { skills?: Array<{ name: string; sha256: string }> };
+      for (const skill of resolvedSkills) {
+        const oldHash = previous.skills?.find((item) => item.name === skill.name)?.sha256;
+        if (oldHash && oldHash !== skill.contentHash) {
+          logger.info(
+            { taskId: task.id, skill: skill.name, previousHash: oldHash, contentHash: skill.contentHash },
+            'Scheduled task skill changed',
+          );
+        }
+      }
+    } catch { /* Historical context is diagnostic only. */ }
   }
 
   logger.info(
@@ -143,6 +209,7 @@ async function runTask(
       execution_context: JSON.stringify({
         capability_profile: profile.name,
         profile_version: profile.version,
+        skills: resolvedSkills.map((skill) => ({ name: skill.name, sha256: skill.contentHash })),
       }),
     };
     // Advance next_run so a genuinely-orphaned task doesn't hot-loop every
@@ -187,6 +254,7 @@ async function runTask(
       status: t.status,
       next_run: t.next_run,
       capability_profile: t.capability_profile,
+      skills: t.skills,
     })),
   );
 
@@ -223,6 +291,7 @@ async function runTask(
         isMain,
         isScheduledTask: true,
         capabilityProfile: profile.name,
+        skills: resolvedSkills,
       },
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
@@ -273,6 +342,7 @@ async function runTask(
     execution_context: JSON.stringify({
       capability_profile: profile.name,
       profile_version: profile.version,
+      skills: resolvedSkills.map((skill) => ({ name: skill.name, sha256: skill.contentHash })),
     }),
   };
 

@@ -24,6 +24,7 @@ import {
   resolveTaskCapabilityProfile,
   TaskCapabilityProfileName,
 } from './task-capability-profiles.js';
+import { resolveSkillBindings, validateSkillNames } from './skill-catalog.js';
 
 export interface SpawnSoulRequest {
   folder: string;
@@ -408,6 +409,7 @@ export async function processTaskIpc(
     schedule_value?: string;
     context_mode?: string;
     capability_profile?: string;
+    skills?: string[];
     groupFolder?: string;
     chatJid?: string;
     targetJid?: string;
@@ -550,6 +552,23 @@ export async function processTaskIpc(
           );
           break;
         }
+        let skills: string[];
+        try {
+          skills = validateSkillNames(data.skills ?? []);
+          if (skills.length > 0) {
+            const profile = resolveTaskCapabilityProfile(capabilityProfile);
+            if (!profile.skillAccess) {
+              throw new Error(`Capability profile ${capabilityProfile} does not permit skills`);
+            }
+            resolveSkillBindings(skills);
+          }
+        } catch (error) {
+          logger.warn(
+            { sourceGroup, error: error instanceof Error ? error.message : String(error) },
+            'Invalid scheduled task skill binding',
+          );
+          break;
+        }
         createTask({
           id: taskId,
           group_folder: targetFolder,
@@ -559,6 +578,7 @@ export async function processTaskIpc(
           schedule_value: data.schedule_value,
           context_mode: contextMode,
           capability_profile: capabilityProfile,
+          skills,
           next_run: nextRun,
           status: 'active',
           created_at: new Date().toISOString(),

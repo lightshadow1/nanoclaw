@@ -18,6 +18,8 @@ describe('task capability profiles', () => {
     expect(profile.groupAccess).toBe('read-only');
     expect(profile.additionalMountAccess).toBe('read-only');
     expect(profile.persistentSessionAccess).toBe(false);
+    expect(profile.skillAccess).toBe(false);
+    expect(resolveTaskCapabilityProfile('research').skillAccess).toBe(true);
   });
 
   it('rejects unknown persisted profiles', () => {

@@ -290,6 +290,7 @@ async function runAgent(
       status: t.status,
       next_run: t.next_run,
       capability_profile: t.capability_profile,
+      skills: t.skills,
     })),
   );
 

@@ -18,6 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import { buildScheduledTaskPrompt } from './scheduled-task-prompt.js';
 
 interface ContainerInput {
   prompt: string;
@@ -28,6 +29,7 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   historySearchEnabled?: boolean;
   capabilityProfile?: 'full' | 'soul-maintenance' | 'research' | 'read-only';
+  skills?: Array<{ name: string; contentHash: string }>;
   secrets?: Record<string, string>;
 }
 
@@ -547,7 +549,7 @@ async function main(): Promise<void> {
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
   if (containerInput.isScheduledTask) {
-    prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
+    prompt = buildScheduledTaskPrompt(prompt, containerInput.skills);
   }
   const pending = drainIpcInput();
   if (pending.length > 0) {

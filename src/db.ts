@@ -17,6 +17,7 @@ import {
   ScheduledTask,
   TaskRunLog,
 } from './types.js';
+import { parseStoredSkillNames, validateSkillNames } from './skill-catalog.js';
 
 let db: Database.Database;
 
@@ -149,6 +150,13 @@ function createSchema(database: Database.Database): void {
   }
   try {
     database.exec(`ALTER TABLE task_run_logs ADD COLUMN execution_context TEXT`);
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(
+      `ALTER TABLE scheduled_tasks ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]'`,
+    );
   } catch {
     /* column already exists */
   }
@@ -522,14 +530,15 @@ export function getMessagesSince(
 }
 
 export function createTask(
-  task: Omit<ScheduledTask, 'last_run' | 'last_result' | 'capability_profile'> & {
+  task: Omit<ScheduledTask, 'last_run' | 'last_result' | 'capability_profile' | 'skills'> & {
     capability_profile?: ScheduledTask['capability_profile'];
+    skills?: string[];
   },
 ): void {
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, capability_profile, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, capability_profile, skills_json, next_run, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -540,30 +549,40 @@ export function createTask(
     task.schedule_value,
     task.context_mode || 'isolated',
     task.capability_profile || 'full',
+    JSON.stringify(validateSkillNames(task.skills ?? [])),
     task.next_run,
     task.status,
     task.created_at,
   );
 }
 
+type ScheduledTaskRow = Omit<ScheduledTask, 'skills'> & { skills_json: string };
+
+function parseTaskRow(row: ScheduledTaskRow): ScheduledTask {
+  const { skills_json, ...task } = row;
+  return { ...task, skills: parseStoredSkillNames(skills_json) };
+}
+
 export function getTaskById(id: string): ScheduledTask | undefined {
-  return db.prepare('SELECT * FROM scheduled_tasks WHERE id = ?').get(id) as
-    | ScheduledTask
-    | undefined;
+  const row = db.prepare('SELECT * FROM scheduled_tasks WHERE id = ?').get(id) as
+    | ScheduledTaskRow | undefined;
+  return row ? parseTaskRow(row) : undefined;
 }
 
 export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
-  return db
+  const rows = db
     .prepare(
       'SELECT * FROM scheduled_tasks WHERE group_folder = ? ORDER BY created_at DESC',
     )
-    .all(groupFolder) as ScheduledTask[];
+    .all(groupFolder) as ScheduledTaskRow[];
+  return rows.map(parseTaskRow);
 }
 
 export function getAllTasks(): ScheduledTask[] {
-  return db
+  const rows = db
     .prepare('SELECT * FROM scheduled_tasks ORDER BY created_at DESC')
-    .all() as ScheduledTask[];
+    .all() as ScheduledTaskRow[];
+  return rows.map(parseTaskRow);
 }
 
 export function updateTask(
@@ -625,6 +644,7 @@ export function deleteTask(id: string): void {
 export interface ClaimedTask extends ScheduledTask {
   claim_token: string;
   claimed_at: string;
+  skill_validation_error?: string;
 }
 
 export function claimDueTasks(
@@ -654,17 +674,21 @@ export function claimDueTasks(
 
   return db
     .transaction(() => {
-      const due = select.all(nowIso, boundedLimit) as ScheduledTask[];
+      const due = select.all(nowIso, boundedLimit) as ScheduledTaskRow[];
       const claimed: ClaimedTask[] = [];
-      for (const task of due) {
+      for (const row of due) {
         const claimToken = randomUUID();
-        const result = claim.run(claimToken, nowIso, task.id, nowIso);
+        const result = claim.run(claimToken, nowIso, row.id, nowIso);
         if (result.changes === 1) {
-          claimed.push({
-            ...task,
-            claim_token: claimToken,
-            claimed_at: nowIso,
-          });
+          try {
+            claimed.push({ ...parseTaskRow(row), claim_token: claimToken, claimed_at: nowIso });
+          } catch (error) {
+            const { skills_json: _skillsJson, ...task } = row;
+            claimed.push({
+              ...task, skills: [], claim_token: claimToken, claimed_at: nowIso,
+              skill_validation_error: error instanceof Error ? error.message : String(error),
+            });
+          }
         }
       }
       return claimed;
@@ -738,8 +762,8 @@ export function releaseInterruptedTaskClaims(): string[] {
 export function logTaskRun(log: TaskRunLog): void {
   db.prepare(
     `
-    INSERT INTO task_run_logs (task_id, run_at, duration_ms, status, result, error)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO task_run_logs (task_id, run_at, duration_ms, status, result, error, execution_context)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     log.task_id,
@@ -748,7 +772,15 @@ export function logTaskRun(log: TaskRunLog): void {
     log.status,
     log.result,
     log.error,
+    log.execution_context ?? null,
   );
+}
+
+export function getLatestTaskExecutionContext(taskId: string): string | null {
+  const row = db.prepare(
+    `SELECT execution_context FROM task_run_logs WHERE task_id = ? ORDER BY run_at DESC, id DESC LIMIT 1`,
+  ).get(taskId) as { execution_context: string | null } | undefined;
+  return row?.execution_context ?? null;
 }
 
 // --- Router state accessors ---

@@ -182,6 +182,37 @@ describe('schedule_task authorization', () => {
     expect(getAllTasks()[0].capability_profile).toBe('research');
   });
 
+  it('validates and persists ordered installed skill bindings', async () => {
+    await processTaskIpc(
+      {
+        type: 'schedule_task', prompt: 'browse carefully',
+        schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z',
+        targetJid: 'main@g.us', capability_profile: 'research',
+        skills: ['agent-browser'],
+      },
+      'main', true, deps,
+    );
+    expect(getAllTasks()[0].skills).toEqual(['agent-browser']);
+  });
+
+  it('rejects missing, duplicate, and profile-disallowed skill bindings', async () => {
+    for (const request of [
+      { capability_profile: 'research', skills: ['missing-skill'] },
+      { capability_profile: 'research', skills: ['agent-browser', 'agent-browser'] },
+      { capability_profile: 'read-only', skills: ['agent-browser'] },
+    ]) {
+      await processTaskIpc(
+        {
+          type: 'schedule_task', prompt: 'invalid skill task',
+          schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z',
+          targetJid: 'main@g.us', ...request,
+        },
+        'main', true, deps,
+      );
+    }
+    expect(getAllTasks()).toHaveLength(0);
+  });
+
   it('rejects reserved and unknown profiles', async () => {
     for (const capability_profile of ['soul-maintenance', 'custom']) {
       await processTaskIpc(
