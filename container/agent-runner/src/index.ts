@@ -27,6 +27,7 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   historySearchEnabled?: boolean;
+  capabilityProfile?: 'full' | 'soul-maintenance' | 'research' | 'read-only';
   secrets?: Record<string, string>;
 }
 
@@ -414,6 +415,31 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  const fullTools = [
+    'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
+    'Task', 'TaskOutput', 'TaskStop', 'TeamCreate', 'TeamDelete', 'SendMessage',
+    'TodoWrite', 'ToolSearch', 'Skill', 'NotebookEdit', 'mcp__nanoclaw__*',
+  ];
+  const profileTools: Record<string, string[]> = {
+    full: fullTools,
+    'soul-maintenance': [
+      'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
+      'TodoWrite', 'ToolSearch', 'Skill', 'NotebookEdit', 'mcp__nanoclaw__*',
+    ],
+    research: [
+      'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
+      'TodoWrite', 'ToolSearch', 'Skill', 'mcp__nanoclaw__*',
+    ],
+    'read-only': [
+      'Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch', 'ToolSearch',
+      'mcp__nanoclaw__*',
+    ],
+  };
+  const allowedTools = containerInput.isScheduledTask
+    ? profileTools[containerInput.capabilityProfile || '']
+    : fullTools;
+  if (!allowedTools) throw new Error('Unknown scheduled task capability profile');
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -424,16 +450,7 @@ async function runQuery(
       systemPrompt: globalClaudeMd
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
         : undefined,
-      allowedTools: [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*'
-      ],
+      allowedTools,
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
@@ -448,6 +465,7 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
             NANOCLAW_IS_SCHEDULED_TASK: containerInput.isScheduledTask ? '1' : '0',
             NANOCLAW_HISTORY_SEARCH_ENABLED: containerInput.historySearchEnabled ? '1' : '0',
+            NANOCLAW_CAPABILITY_PROFILE: containerInput.capabilityProfile || 'interactive',
           },
         },
       },

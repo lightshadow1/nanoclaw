@@ -20,6 +20,10 @@ import {
 } from './db.js';
 import { logger } from './logger.js';
 import { MessageButton, RegisteredGroup, SendOptions } from './types.js';
+import {
+  resolveTaskCapabilityProfile,
+  TaskCapabilityProfileName,
+} from './task-capability-profiles.js';
 
 export interface SpawnSoulRequest {
   folder: string;
@@ -403,6 +407,7 @@ export async function processTaskIpc(
     schedule_type?: string;
     schedule_value?: string;
     context_mode?: string;
+    capability_profile?: string;
     groupFolder?: string;
     chatJid?: string;
     targetJid?: string;
@@ -526,6 +531,25 @@ export async function processTaskIpc(
           data.context_mode === 'group' || data.context_mode === 'isolated'
             ? data.context_mode
             : 'isolated';
+        const capabilityProfile =
+          (data.capability_profile as TaskCapabilityProfileName | undefined) ??
+          'full';
+        try {
+          resolveTaskCapabilityProfile(capabilityProfile);
+        } catch {
+          logger.warn(
+            { sourceGroup, capabilityProfile },
+            'Unknown task capability profile',
+          );
+          break;
+        }
+        if (capabilityProfile === 'soul-maintenance') {
+          logger.warn(
+            { sourceGroup },
+            'Reserved task capability profile blocked',
+          );
+          break;
+        }
         createTask({
           id: taskId,
           group_folder: targetFolder,
@@ -534,6 +558,7 @@ export async function processTaskIpc(
           schedule_type: scheduleType,
           schedule_value: data.schedule_value,
           context_mode: contextMode,
+          capability_profile: capabilityProfile,
           next_run: nextRun,
           status: 'active',
           created_at: new Date().toISOString(),

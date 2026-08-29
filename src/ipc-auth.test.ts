@@ -170,6 +170,32 @@ describe('search_history authorization', () => {
 // --- schedule_task authorization ---
 
 describe('schedule_task authorization', () => {
+  it('persists an allowed capability profile', async () => {
+    await processTaskIpc(
+      {
+        type: 'schedule_task', prompt: 'research safely',
+        schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z',
+        targetJid: 'other@g.us', capability_profile: 'research',
+      },
+      'main', true, deps,
+    );
+    expect(getAllTasks()[0].capability_profile).toBe('research');
+  });
+
+  it('rejects reserved and unknown profiles', async () => {
+    for (const capability_profile of ['soul-maintenance', 'custom']) {
+      await processTaskIpc(
+        {
+          type: 'schedule_task', prompt: 'too privileged',
+          schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z',
+          targetJid: 'main@g.us', capability_profile,
+        },
+        'main', true, deps,
+      );
+    }
+    expect(getAllTasks()).toHaveLength(0);
+  });
+
   it('rejects a scheduled execution before creating a task', async () => {
     await processTaskIpc(
       {

@@ -26,6 +26,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
+import { resolveTaskCapabilityProfile } from './task-capability-profiles.js';
 
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
@@ -45,6 +46,30 @@ async function runTask(
   deps: SchedulerDependencies,
 ): Promise<void> {
   const startTime = Date.now();
+  let profile;
+  try {
+    profile = resolveTaskCapabilityProfile(task.capability_profile);
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    let nextRun: string | null = null;
+    if (task.schedule_type === 'cron') {
+      nextRun = CronExpressionParser.parse(task.schedule_value, { tz: TIMEZONE })
+        .next()
+        .toISOString();
+    } else if (task.schedule_type === 'interval') {
+      nextRun = new Date(Date.now() + parseInt(task.schedule_value, 10)).toISOString();
+    }
+    finalizeClaimedTask(task.id, task.claim_token, nextRun, `Error: ${error}`, {
+      task_id: task.id,
+      run_at: new Date().toISOString(),
+      duration_ms: Date.now() - startTime,
+      status: 'error',
+      result: null,
+      error,
+      execution_context: JSON.stringify({ capability_profile: task.capability_profile }),
+    });
+    return;
+  }
   const groupDir = path.join(GROUPS_DIR, task.group_folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
@@ -73,6 +98,19 @@ async function runTask(
       task.claim_token,
       nextRun,
       'skipped: gated by capability hook',
+      {
+        task_id: task.id,
+        run_at: new Date().toISOString(),
+        duration_ms: Date.now() - startTime,
+        status: 'success',
+        result: 'skipped: gated by capability hook',
+        error: null,
+        execution_context: JSON.stringify({
+          capability_profile: profile.name,
+          profile_version: profile.version,
+          skipped: true,
+        }),
+      },
     );
     if (!finalized) {
       logger.error({ taskId: task.id }, 'Task claim ownership lost');
@@ -102,6 +140,10 @@ async function runTask(
       status: 'error' as const,
       result: null,
       error: `Group not found: ${task.group_folder}`,
+      execution_context: JSON.stringify({
+        capability_profile: profile.name,
+        profile_version: profile.version,
+      }),
     };
     // Advance next_run so a genuinely-orphaned task doesn't hot-loop every
     // scheduler poll (it stays due otherwise, re-firing the error forever).
@@ -144,6 +186,7 @@ async function runTask(
       schedule_value: t.schedule_value,
       status: t.status,
       next_run: t.next_run,
+      capability_profile: t.capability_profile,
     })),
   );
 
@@ -179,6 +222,7 @@ async function runTask(
         chatJid: task.chat_jid,
         isMain,
         isScheduledTask: true,
+        capabilityProfile: profile.name,
       },
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
@@ -226,6 +270,10 @@ async function runTask(
     status: error ? ('error' as const) : ('success' as const),
     result,
     error,
+    execution_context: JSON.stringify({
+      capability_profile: profile.name,
+      profile_version: profile.version,
+    }),
   };
 
   let nextRun: string | null = null;

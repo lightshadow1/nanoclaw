@@ -289,6 +289,7 @@ async function runAgent(
       schedule_value: t.schedule_value,
       status: t.status,
       next_run: t.next_run,
+      capability_profile: t.capability_profile,
     })),
   );
 

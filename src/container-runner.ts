@@ -21,6 +21,10 @@ import { logger } from './logger.js';
 import { CONTAINER_RUNTIME_BIN, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+import {
+  resolveTaskCapabilityProfile,
+  TaskCapabilityProfileName,
+} from './task-capability-profiles.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -44,6 +48,7 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   historySearchEnabled?: boolean;
+  capabilityProfile?: TaskCapabilityProfileName;
   secrets?: Record<string, string>;
 }
 
@@ -63,31 +68,37 @@ interface VolumeMount {
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  capabilityProfile?: TaskCapabilityProfileName,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const homeDir = getHomeDir();
   const projectRoot = process.cwd();
+  const profile = capabilityProfile
+    ? resolveTaskCapabilityProfile(capabilityProfile)
+    : null;
+  const projectAccess = profile?.projectAccess ?? (isMain ? 'read-write' : 'none');
+  const groupReadOnly = profile?.groupAccess === 'read-only';
 
-  if (isMain) {
+  if (projectAccess !== 'none') {
     // Main gets the entire project root mounted
     mounts.push({
       hostPath: projectRoot,
       containerPath: '/workspace/project',
-      readonly: false,
+      readonly: projectAccess === 'read-only',
     });
 
     // Main also gets its group folder as the working directory
     mounts.push({
       hostPath: path.join(GROUPS_DIR, group.folder),
       containerPath: '/workspace/group',
-      readonly: false,
+      readonly: groupReadOnly,
     });
   } else {
     // Other groups only get their own folder
     mounts.push({
       hostPath: path.join(GROUPS_DIR, group.folder),
       containerPath: '/workspace/group',
-      readonly: false,
+      readonly: groupReadOnly,
     });
 
     // Global memory directory (read-only for non-main)
@@ -104,12 +115,12 @@ function buildVolumeMounts(
 
   // Per-group Claude sessions directory (isolated from other groups)
   // Each group gets their own .claude/ to prevent cross-group session access
-  const groupSessionsDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    '.claude',
-  );
+  const ephemeralSessionsDir = path.join(DATA_DIR, 'ephemeral-sessions');
+  if (profile && !profile.persistentSessionAccess)
+    fs.mkdirSync(ephemeralSessionsDir, { recursive: true });
+  const groupSessionsDir = profile && !profile.persistentSessionAccess
+    ? fs.mkdtempSync(path.join(ephemeralSessionsDir, `${group.folder}-`))
+    : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
@@ -131,7 +142,7 @@ function buildVolumeMounts(
   // Sync skills from container/skills/ into each group's .claude/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
+  if (profile?.name !== 'read-only' && fs.existsSync(skillsSrc)) {
     for (const skillDir of fs.readdirSync(skillsSrc)) {
       const srcDir = path.join(skillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
@@ -175,7 +186,17 @@ function buildVolumeMounts(
       group.name,
       isMain,
     );
-    mounts.push(...validatedMounts);
+    if (profile?.additionalMountAccess !== 'none') {
+      mounts.push(
+        ...validatedMounts.map((mount) => ({
+          ...mount,
+          readonly:
+            profile?.additionalMountAccess === 'read-only'
+              ? true
+              : mount.readonly,
+        })),
+      );
+    }
   }
 
   return mounts;
@@ -226,7 +247,14 @@ export async function runContainerAgent(
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  if (input.isScheduledTask && !input.capabilityProfile) {
+    throw new Error('Scheduled task capability profile is required');
+  }
+  const mounts = buildVolumeMounts(
+    group,
+    input.isMain,
+    input.isScheduledTask ? input.capabilityProfile : undefined,
+  );
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
@@ -596,6 +624,7 @@ export function writeTasksSnapshot(
     schedule_value: string;
     status: string;
     next_run: string | null;
+    capability_profile: string;
   }>,
 ): void {
   // Write filtered tasks to the group's IPC directory

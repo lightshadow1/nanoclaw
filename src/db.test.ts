@@ -459,6 +459,7 @@ describe('task CRUD', () => {
     expect(task).toBeDefined();
     expect(task!.prompt).toBe('do something');
     expect(task!.status).toBe('active');
+    expect(task!.capability_profile).toBe('full');
   });
 
   it('updates task status', () => {

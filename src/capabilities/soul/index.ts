@@ -519,12 +519,14 @@ function upsertSoulTask(spec: SoulTaskSpec): void {
     if (
       existing.prompt !== spec.prompt ||
       existing.schedule_value !== spec.schedule_value ||
-      existing.schedule_type !== spec.schedule_type
+      existing.schedule_type !== spec.schedule_type ||
+      existing.capability_profile !== 'soul-maintenance'
     ) {
       updateTask(spec.id, {
         prompt: spec.prompt,
         schedule_type: spec.schedule_type,
         schedule_value: spec.schedule_value,
+        capability_profile: 'soul-maintenance',
       });
       logger.info({ taskId: spec.id }, 'Soul task updated');
     }
@@ -538,6 +540,7 @@ function upsertSoulTask(spec: SoulTaskSpec): void {
     schedule_type: spec.schedule_type,
     schedule_value: spec.schedule_value,
     context_mode: 'isolated',
+    capability_profile: 'soul-maintenance',
     next_run: computeNextRun(spec.schedule_type, spec.schedule_value),
     status: 'active',
     created_at: new Date().toISOString(),

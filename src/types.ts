@@ -81,6 +81,7 @@ export interface ScheduledTask {
   schedule_type: 'cron' | 'interval' | 'once';
   schedule_value: string;
   context_mode: 'group' | 'isolated';
+  capability_profile: import('./task-capability-profiles.js').TaskCapabilityProfileName;
   next_run: string | null;
   last_run: string | null;
   last_result: string | null;
@@ -97,6 +98,7 @@ export interface TaskRunLog {
   status: 'success' | 'error';
   result: string | null;
   error: string | null;
+  execution_context?: string | null;
 }
 
 // --- Channel abstraction ---
