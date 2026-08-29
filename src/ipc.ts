@@ -236,6 +236,7 @@ export async function processTaskIpc(
     groupFolder?: string;
     chatJid?: string;
     targetJid?: string;
+    executionContext?: 'interactive' | 'scheduled';
     // For register_group
     jid?: string;
     name?: string;
@@ -262,6 +263,24 @@ export async function processTaskIpc(
   deps: IpcDeps,
 ): Promise<void> {
   const registeredGroups = deps.registeredGroups();
+
+  if (
+    data.executionContext === 'scheduled' &&
+    ['schedule_task', 'pause_task', 'resume_task', 'cancel_task'].includes(
+      data.type,
+    )
+  ) {
+    logger.warn(
+      {
+        type: data.type,
+        sourceGroup,
+        taskId: data.taskId,
+        targetJid: data.targetJid,
+      },
+      'Unauthorized scheduled task mutation blocked',
+    );
+    return;
+  }
 
   switch (data.type) {
     case 'schedule_task':

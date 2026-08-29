@@ -73,6 +73,24 @@ beforeEach(() => {
 // --- schedule_task authorization ---
 
 describe('schedule_task authorization', () => {
+  it('rejects a scheduled execution before creating a task', async () => {
+    await processTaskIpc(
+      {
+        type: 'schedule_task',
+        prompt: 'recursive task',
+        schedule_type: 'once',
+        schedule_value: '2025-06-01T00:00:00.000Z',
+        targetJid: 'main@g.us',
+        executionContext: 'scheduled',
+      },
+      'main',
+      true,
+      deps,
+    );
+
+    expect(getAllTasks()).toHaveLength(0);
+  });
+
   it('main group can schedule for another group', async () => {
     await processTaskIpc(
       {
@@ -184,6 +202,16 @@ describe('pause_task authorization', () => {
     expect(getTaskById('task-other')!.status).toBe('paused');
   });
 
+  it('rejects a scheduled execution', async () => {
+    await processTaskIpc(
+      { type: 'pause_task', taskId: 'task-other', executionContext: 'scheduled' },
+      'main',
+      true,
+      deps,
+    );
+    expect(getTaskById('task-other')!.status).toBe('active');
+  });
+
   it('non-main group can pause its own task', async () => {
     await processTaskIpc({ type: 'pause_task', taskId: 'task-other' }, 'other-group', false, deps);
     expect(getTaskById('task-other')!.status).toBe('paused');
@@ -218,6 +246,16 @@ describe('resume_task authorization', () => {
     expect(getTaskById('task-paused')!.status).toBe('active');
   });
 
+  it('rejects a scheduled execution', async () => {
+    await processTaskIpc(
+      { type: 'resume_task', taskId: 'task-paused', executionContext: 'scheduled' },
+      'main',
+      true,
+      deps,
+    );
+    expect(getTaskById('task-paused')!.status).toBe('paused');
+  });
+
   it('non-main group can resume its own task', async () => {
     await processTaskIpc({ type: 'resume_task', taskId: 'task-paused' }, 'other-group', false, deps);
     expect(getTaskById('task-paused')!.status).toBe('active');
@@ -232,6 +270,33 @@ describe('resume_task authorization', () => {
 // --- cancel_task authorization ---
 
 describe('cancel_task authorization', () => {
+  it('rejects a scheduled execution', async () => {
+    createTask({
+      id: 'task-scheduled-cancel',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'keep me',
+      schedule_type: 'once',
+      schedule_value: '2025-06-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: null,
+      status: 'active',
+      created_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    await processTaskIpc(
+      {
+        type: 'cancel_task',
+        taskId: 'task-scheduled-cancel',
+        executionContext: 'scheduled',
+      },
+      'main',
+      true,
+      deps,
+    );
+    expect(getTaskById('task-scheduled-cancel')).toBeDefined();
+  });
+
   it('main group can cancel any task', async () => {
     createTask({
       id: 'task-to-cancel',

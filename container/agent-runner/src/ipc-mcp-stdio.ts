@@ -19,6 +19,8 @@ const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
 const groupFolder = process.env.NANOCLAW_GROUP_FOLDER!;
 const isMain = process.env.NANOCLAW_IS_MAIN === '1';
+const isScheduledTask = process.env.NANOCLAW_IS_SCHEDULED_TASK === '1';
+const executionContext = isScheduledTask ? 'scheduled' : 'interactive';
 
 function writeIpcFile(dir: string, data: object): string {
   fs.mkdirSync(dir, { recursive: true });
@@ -126,7 +128,7 @@ The file arrives as a downloadable attachment named by \`filename\`. \`caption\`
   },
 );
 
-server.tool(
+if (!isScheduledTask) server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools.
 
@@ -196,6 +198,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       context_mode: args.context_mode || 'group',
       targetJid,
       createdBy: groupFolder,
+      executionContext,
       timestamp: new Date().toISOString(),
     };
 
@@ -245,7 +248,7 @@ server.tool(
   },
 );
 
-server.tool(
+if (!isScheduledTask) server.tool(
   'pause_task',
   'Pause a scheduled task. It will not run until resumed.',
   { task_id: z.string().describe('The task ID to pause') },
@@ -255,6 +258,7 @@ server.tool(
       taskId: args.task_id,
       groupFolder,
       isMain,
+      executionContext,
       timestamp: new Date().toISOString(),
     };
 
@@ -264,7 +268,7 @@ server.tool(
   },
 );
 
-server.tool(
+if (!isScheduledTask) server.tool(
   'resume_task',
   'Resume a paused task.',
   { task_id: z.string().describe('The task ID to resume') },
@@ -274,6 +278,7 @@ server.tool(
       taskId: args.task_id,
       groupFolder,
       isMain,
+      executionContext,
       timestamp: new Date().toISOString(),
     };
 
@@ -283,7 +288,7 @@ server.tool(
   },
 );
 
-server.tool(
+if (!isScheduledTask) server.tool(
   'cancel_task',
   'Cancel and delete a scheduled task.',
   { task_id: z.string().describe('The task ID to cancel') },
@@ -293,6 +298,7 @@ server.tool(
       taskId: args.task_id,
       groupFolder,
       isMain,
+      executionContext,
       timestamp: new Date().toISOString(),
     };
 
