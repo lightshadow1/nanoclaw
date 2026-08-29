@@ -30,6 +30,8 @@ interface ContainerInput {
   historySearchEnabled?: boolean;
   capabilityProfile?: 'full' | 'soul-maintenance' | 'research' | 'read-only';
   skills?: Array<{ name: string; contentHash: string }>;
+  absoluteTimeoutMs?: number;
+  taskId?: string;
   secrets?: Record<string, string>;
 }
 
@@ -549,7 +551,11 @@ async function main(): Promise<void> {
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
   if (containerInput.isScheduledTask) {
-    prompt = buildScheduledTaskPrompt(prompt, containerInput.skills);
+    prompt = buildScheduledTaskPrompt(
+      prompt,
+      containerInput.skills,
+      containerInput.absoluteTimeoutMs,
+    );
   }
   const pending = drainIpcInput();
   if (pending.length > 0) {

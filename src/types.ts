@@ -83,6 +83,7 @@ export interface ScheduledTask {
   context_mode: 'group' | 'isolated';
   capability_profile: import('./task-capability-profiles.js').TaskCapabilityProfileName;
   skills: string[];
+  max_runtime_ms: number | null;
   next_run: string | null;
   last_run: string | null;
   last_result: string | null;
@@ -96,7 +97,7 @@ export interface TaskRunLog {
   task_id: string;
   run_at: string;
   duration_ms: number;
-  status: 'success' | 'error';
+  status: 'success' | 'error' | 'timed_out';
   result: string | null;
   error: string | null;
   execution_context?: string | null;

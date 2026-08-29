@@ -65,6 +65,7 @@ async function runTask(
       status: 'error', result: null, error,
       execution_context: JSON.stringify({
         capability_profile: task.capability_profile, skills_declared: null,
+        max_runtime_ms: task.max_runtime_ms,
         skill_validation_error: error,
       }),
     });
@@ -92,6 +93,7 @@ async function runTask(
       error,
       execution_context: JSON.stringify({
         capability_profile: task.capability_profile, skills_declared: task.skills,
+        max_runtime_ms: task.max_runtime_ms,
       }),
     });
     return;
@@ -135,6 +137,7 @@ async function runTask(
           capability_profile: profile.name,
           profile_version: profile.version,
           skills_declared: task.skills,
+          max_runtime_ms: task.max_runtime_ms,
           skipped: true,
         }),
       },
@@ -161,6 +164,7 @@ async function runTask(
         execution_context: JSON.stringify({
           capability_profile: profile.name, profile_version: profile.version,
           skills_declared: task.skills, skill_validation_error: error,
+          max_runtime_ms: task.max_runtime_ms,
         }),
       },
     );
@@ -210,6 +214,7 @@ async function runTask(
         capability_profile: profile.name,
         profile_version: profile.version,
         skills: resolvedSkills.map((skill) => ({ name: skill.name, sha256: skill.contentHash })),
+        max_runtime_ms: task.max_runtime_ms,
       }),
     };
     // Advance next_run so a genuinely-orphaned task doesn't hot-loop every
@@ -255,11 +260,14 @@ async function runTask(
       next_run: t.next_run,
       capability_profile: t.capability_profile,
       skills: t.skills,
+      max_runtime_ms: t.max_runtime_ms,
     })),
   );
 
   let result: string | null = null;
   let error: string | null = null;
+  let terminationReason: ContainerOutput['errorKind'];
+  let hadStreamedOutput = false;
 
   // For group context mode, use the group's current session
   const sessions = deps.getSessions();
@@ -292,10 +300,13 @@ async function runTask(
         isScheduledTask: true,
         capabilityProfile: profile.name,
         skills: resolvedSkills,
+        absoluteTimeoutMs: task.max_runtime_ms ?? undefined,
+        taskId: task.id,
       },
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
       async (streamedOutput: ContainerOutput) => {
+        hadStreamedOutput = true;
         if (streamedOutput.result) {
           result = streamedOutput.result;
           // Forward result to user (sendMessage handles formatting)
@@ -315,6 +326,9 @@ async function runTask(
 
     if (output.status === 'error') {
       error = output.error || 'Unknown error';
+      terminationReason = output.errorKind;
+      hadStreamedOutput = hadStreamedOutput || !!output.hadStreamingOutput;
+      if (output.result) result = output.result;
     } else if (output.result) {
       // Messages are sent via MCP tool (IPC), result text is just logged
       result = output.result;
@@ -336,13 +350,21 @@ async function runTask(
     task_id: task.id,
     run_at: new Date().toISOString(),
     duration_ms: durationMs,
-    status: error ? ('error' as const) : ('success' as const),
+    status:
+      terminationReason === 'absolute_timeout'
+        ? ('timed_out' as const)
+        : error
+          ? ('error' as const)
+          : ('success' as const),
     result,
     error,
     execution_context: JSON.stringify({
       capability_profile: profile.name,
       profile_version: profile.version,
       skills: resolvedSkills.map((skill) => ({ name: skill.name, sha256: skill.contentHash })),
+      max_runtime_ms: task.max_runtime_ms,
+      termination_reason: terminationReason ?? null,
+      had_streamed_output: hadStreamedOutput,
     }),
   };
 
@@ -358,8 +380,10 @@ async function runTask(
   }
   // 'once' tasks have no next run
 
-  const resultSummary = error
-    ? `Error: ${error}`
+  const resultSummary = terminationReason === 'absolute_timeout'
+    ? `Timed out: ${error}`
+    : error
+      ? `Error: ${error}`
     : result
       ? result.slice(0, 200)
       : 'Completed';

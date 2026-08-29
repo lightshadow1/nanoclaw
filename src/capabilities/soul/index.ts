@@ -16,6 +16,10 @@ import {
 import { logger } from '../../logger.js';
 import { createTask, getTaskById, updateTask } from '../../db.js';
 import {
+  SOUL_DEFAULT_RUNTIME_MS,
+  SOUL_PRODUCTION_RUNTIME_MS,
+} from '../../task-runtime-budget.js';
+import {
   betsMigration,
   experimentMigration,
   memoryStreamMigration,
@@ -493,6 +497,7 @@ interface SoulTaskSpec {
   prompt: string;
   schedule_type: 'cron' | 'interval';
   schedule_value: string;
+  max_runtime_ms: number;
 }
 
 function computeNextRun(
@@ -520,13 +525,15 @@ function upsertSoulTask(spec: SoulTaskSpec): void {
       existing.prompt !== spec.prompt ||
       existing.schedule_value !== spec.schedule_value ||
       existing.schedule_type !== spec.schedule_type ||
-      existing.capability_profile !== 'soul-maintenance'
+      existing.capability_profile !== 'soul-maintenance' ||
+      existing.max_runtime_ms !== spec.max_runtime_ms
     ) {
       updateTask(spec.id, {
         prompt: spec.prompt,
         schedule_type: spec.schedule_type,
         schedule_value: spec.schedule_value,
         capability_profile: 'soul-maintenance',
+        max_runtime_ms: spec.max_runtime_ms,
       });
       logger.info({ taskId: spec.id }, 'Soul task updated');
     }
@@ -541,6 +548,7 @@ function upsertSoulTask(spec: SoulTaskSpec): void {
     schedule_value: spec.schedule_value,
     context_mode: 'isolated',
     capability_profile: 'soul-maintenance',
+    max_runtime_ms: spec.max_runtime_ms,
     next_run: computeNextRun(spec.schedule_type, spec.schedule_value),
     status: 'active',
     created_at: new Date().toISOString(),
@@ -569,6 +577,7 @@ function ensureSoulTasks(ctx: CapabilityContext): void {
     prompt: buildWikiCurationPrompt(MAIN_GROUP_FOLDER),
     schedule_type: 'interval',
     schedule_value: '7200000', // 2 hours — the beforeTaskRun gate skips empty passes for free
+    max_runtime_ms: SOUL_DEFAULT_RUNTIME_MS,
   });
 
   upsertSoulTask({
@@ -578,6 +587,7 @@ function ensureSoulTasks(ctx: CapabilityContext): void {
     prompt: buildEveningJournalPrompt(MAIN_GROUP_FOLDER),
     schedule_type: 'cron',
     schedule_value: '0 22 * * *',
+    max_runtime_ms: SOUL_DEFAULT_RUNTIME_MS,
   });
 
   upsertSoulTask({
@@ -587,6 +597,7 @@ function ensureSoulTasks(ctx: CapabilityContext): void {
     prompt: buildMorningPlanPrompt(MAIN_GROUP_FOLDER),
     schedule_type: 'cron',
     schedule_value: '0 6 * * *',
+    max_runtime_ms: SOUL_DEFAULT_RUNTIME_MS,
   });
 
   upsertSoulTask({
@@ -596,6 +607,7 @@ function ensureSoulTasks(ctx: CapabilityContext): void {
     prompt: buildCheckInPrompt(MAIN_GROUP_FOLDER),
     schedule_type: 'interval',
     schedule_value: '7200000',
+    max_runtime_ms: SOUL_DEFAULT_RUNTIME_MS,
   });
 
   // Phase 6: weekly production pass — each soul turns accumulated knowledge
@@ -608,6 +620,7 @@ function ensureSoulTasks(ctx: CapabilityContext): void {
     prompt: buildProductionPrompt(MAIN_GROUP_FOLDER),
     schedule_type: 'cron',
     schedule_value: '0 9 * * 1', // Monday 9 AM local
+    max_runtime_ms: SOUL_PRODUCTION_RUNTIME_MS,
   });
 }
 

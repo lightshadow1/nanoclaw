@@ -461,6 +461,18 @@ describe('task CRUD', () => {
     expect(task!.status).toBe('active');
     expect(task!.capability_profile).toBe('full');
     expect(task!.skills).toEqual([]);
+    expect(task!.max_runtime_ms).toBeNull();
+  });
+
+  it('round-trips an explicit runtime budget', () => {
+    createTask({
+      id: 'task-budget', group_folder: 'main', chat_jid: 'group@g.us',
+      prompt: 'bounded', schedule_type: 'once',
+      schedule_value: '2024-06-01T00:00:00.000Z', context_mode: 'isolated',
+      max_runtime_ms: 3600000, next_run: null, status: 'active',
+      created_at: '2024-01-01T00:00:00.000Z',
+    });
+    expect(getTaskById('task-budget')!.max_runtime_ms).toBe(3600000);
   });
 
   it('round-trips ordered skill bindings and rejects malformed stored JSON', () => {

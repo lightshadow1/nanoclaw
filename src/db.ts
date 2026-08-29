@@ -160,6 +160,11 @@ function createSchema(database: Database.Database): void {
   } catch {
     /* column already exists */
   }
+  try {
+    database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN max_runtime_ms INTEGER`);
+  } catch {
+    /* column already exists */
+  }
 
   // Add is_bot_message column if it doesn't exist (migration for existing DBs)
   try {
@@ -530,15 +535,16 @@ export function getMessagesSince(
 }
 
 export function createTask(
-  task: Omit<ScheduledTask, 'last_run' | 'last_result' | 'capability_profile' | 'skills'> & {
+  task: Omit<ScheduledTask, 'last_run' | 'last_result' | 'capability_profile' | 'skills' | 'max_runtime_ms'> & {
     capability_profile?: ScheduledTask['capability_profile'];
     skills?: string[];
+    max_runtime_ms?: number | null;
   },
 ): void {
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, capability_profile, skills_json, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, capability_profile, skills_json, max_runtime_ms, next_run, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -550,6 +556,7 @@ export function createTask(
     task.context_mode || 'isolated',
     task.capability_profile || 'full',
     JSON.stringify(validateSkillNames(task.skills ?? [])),
+    task.max_runtime_ms ?? null,
     task.next_run,
     task.status,
     task.created_at,
@@ -596,6 +603,7 @@ export function updateTask(
       | 'next_run'
       | 'status'
       | 'capability_profile'
+      | 'max_runtime_ms'
     >
   >,
 ): void {
@@ -625,6 +633,10 @@ export function updateTask(
   if (updates.capability_profile !== undefined) {
     fields.push('capability_profile = ?');
     values.push(updates.capability_profile);
+  }
+  if (updates.max_runtime_ms !== undefined) {
+    fields.push('max_runtime_ms = ?');
+    values.push(updates.max_runtime_ms);
   }
 
   if (fields.length === 0) return;

@@ -192,6 +192,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     context_mode: z.enum(['group', 'isolated']).default('group').describe('group=runs with chat history and memory, isolated=fresh session (include context in prompt)'),
     capability_profile: z.enum(['full', 'research', 'read-only']).default('full'),
     skills: z.array(z.string()).max(8).default([]).describe('Installed skills the task must load in this order'),
+    max_runtime_ms: z.number().int().min(60000).max(21600000).nullable().optional().describe('Absolute wall-clock runtime budget in milliseconds; null is main-only'),
     target_group_jid: z.string().optional().describe('(Main group only) JID of the group to schedule the task for. Defaults to the current group.'),
   },
   async (args) => {
@@ -234,6 +235,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       context_mode: args.context_mode || 'group',
       capability_profile: args.capability_profile,
       skills: args.skills,
+      max_runtime_ms: args.max_runtime_ms,
       targetJid,
       createdBy: groupFolder,
       executionContext,
@@ -272,8 +274,8 @@ if (canUseMcpTool('list_tasks')) server.tool(
 
       const formatted = tasks
         .map(
-          (t: { id: string; prompt: string; schedule_type: string; schedule_value: string; status: string; next_run: string; capability_profile?: string; skills?: string[] }) =>
-            `- [${t.id}] ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, profile: ${t.capability_profile || 'full'}, skills: ${t.skills?.join(', ') || 'none'}, next: ${t.next_run || 'N/A'}`,
+          (t: { id: string; prompt: string; schedule_type: string; schedule_value: string; status: string; next_run: string; capability_profile?: string; skills?: string[]; max_runtime_ms?: number | null }) =>
+            `- [${t.id}] ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, profile: ${t.capability_profile || 'full'}, skills: ${t.skills?.join(', ') || 'none'}, budget: ${t.max_runtime_ms == null ? 'unbounded' : `${t.max_runtime_ms}ms`}, next: ${t.next_run || 'N/A'}`,
         )
         .join('\n');
 

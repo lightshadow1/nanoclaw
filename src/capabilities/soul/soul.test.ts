@@ -626,6 +626,7 @@ describe('ensureSoulTasks', () => {
     expect(curation!.context_mode).toBe('isolated');
     expect(curation!.status).toBe('active');
     expect(curation!.next_run).toBeTruthy();
+    expect(curation!.max_runtime_ms).toBe(3600000);
     expect(curation!.prompt).toContain('memory_stream');
 
     expect(journal).toBeDefined();
@@ -647,6 +648,7 @@ describe('ensureSoulTasks', () => {
     expect(production).toBeDefined();
     expect(production!.schedule_type).toBe('cron');
     expect(production!.schedule_value).toBe('0 9 * * 1');
+    expect(production!.max_runtime_ms).toBe(7200000);
     expect(production!.prompt).toContain('INSERT INTO bets');
 
     await soulCapability.teardown!();
@@ -681,6 +683,9 @@ describe('ensureSoulTasks', () => {
       dataDir: tmpDir,
     });
     const firstNextRun = getTaskById('soul-wiki-curation-main')!.next_run;
+    getDb()
+      .prepare('UPDATE scheduled_tasks SET max_runtime_ms = NULL WHERE id = ?')
+      .run('soul-wiki-curation-main');
     await soulCapability.teardown!();
 
     await soulCapability.init({
@@ -700,6 +705,7 @@ describe('ensureSoulTasks', () => {
 
     // next_run was preserved (cadence not reset on re-init)
     expect(getTaskById('soul-wiki-curation-main')!.next_run).toBe(firstNextRun);
+    expect(getTaskById('soul-wiki-curation-main')!.max_runtime_ms).toBe(3600000);
 
     await soulCapability.teardown!();
   });

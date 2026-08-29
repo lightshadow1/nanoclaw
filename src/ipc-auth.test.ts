@@ -170,6 +170,41 @@ describe('search_history authorization', () => {
 // --- schedule_task authorization ---
 
 describe('schedule_task authorization', () => {
+  it('defaults new tasks to a one-hour absolute runtime budget', async () => {
+    await processTaskIpc(
+      {
+        type: 'schedule_task', prompt: 'bounded by default',
+        schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z',
+        targetJid: 'other@g.us',
+      },
+      'main', true, deps,
+    );
+    expect(getAllTasks()[0].max_runtime_ms).toBe(3600000);
+  });
+
+  it('allows main unbounded tasks but rejects invalid and non-main unbounded budgets', async () => {
+    await processTaskIpc(
+      {
+        type: 'schedule_task', prompt: 'explicitly unbounded',
+        schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z',
+        targetJid: 'main@g.us', max_runtime_ms: null,
+      },
+      'main', true, deps,
+    );
+    expect(getAllTasks()[0].max_runtime_ms).toBeNull();
+
+    for (const max_runtime_ms of [null, 59999, 21600001, 60000.5]) {
+      await processTaskIpc(
+        {
+          type: 'schedule_task', prompt: 'invalid budget',
+          schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z',
+          targetJid: 'other@g.us', max_runtime_ms,
+        },
+        'other-group', false, deps,
+      );
+    }
+    expect(getAllTasks()).toHaveLength(1);
+  });
   it('persists an allowed capability profile', async () => {
     await processTaskIpc(
       {

@@ -51,6 +51,8 @@ export interface ContainerInput {
   historySearchEnabled?: boolean;
   capabilityProfile?: TaskCapabilityProfileName;
   skills?: ResolvedSkillBinding[];
+  absoluteTimeoutMs?: number;
+  taskId?: string;
   secrets?: Record<string, string>;
 }
 
@@ -59,6 +61,8 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  errorKind?: 'activity_timeout' | 'absolute_timeout' | 'process_error';
+  hadStreamingOutput?: boolean;
 }
 
 interface VolumeMount {
@@ -310,6 +314,7 @@ export async function runContainerAgent(
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';
     let newSessionId: string | undefined;
+    let lastStreamingResult: string | null = null;
     let outputChain = Promise.resolve();
 
     container.stdout.on('data', (data) => {
@@ -348,6 +353,7 @@ export async function runContainerAgent(
             if (parsed.newSessionId) {
               newSessionId = parsed.newSessionId;
             }
+            if (parsed.result) lastStreamingResult = parsed.result;
             hadStreamingOutput = true;
             // Activity detected — reset the hard timeout
             resetTimeout();
@@ -386,37 +392,75 @@ export async function runContainerAgent(
       }
     });
 
-    let timedOut = false;
     let hadStreamingOutput = false;
+    type TerminationReason = 'activity_timeout' | 'absolute_timeout' | 'host_stop';
+    let terminationReason: TerminationReason | null = null;
+    let settled = false;
     const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
     // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
     // graceful _close sentinel has time to trigger before the hard kill fires.
     const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
 
-    const killOnTimeout = () => {
-      timedOut = true;
-      logger.error({ group: group.name, containerName }, 'Container timeout, stopping gracefully');
+    let activityTimer: ReturnType<typeof setTimeout>;
+    let absoluteTimer: ReturnType<typeof setTimeout> | null = null;
+    let forceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearTerminationTimers = () => {
+      clearTimeout(activityTimer);
+      if (absoluteTimer) clearTimeout(absoluteTimer);
+      if (forceTimer) clearTimeout(forceTimer);
+    };
+
+    const requestTermination = (reason: TerminationReason) => {
+      if (terminationReason || settled) return;
+      terminationReason = reason;
+      clearTimeout(activityTimer);
+      if (absoluteTimer) clearTimeout(absoluteTimer);
+      logger.error(
+        { taskId: input.taskId, group: group.name, containerName, reason },
+        'Container termination requested',
+      );
+      forceTimer = setTimeout(() => {
+        if (!settled) container.kill('SIGKILL');
+      }, 15_000);
       exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
         if (err) {
-          logger.warn({ group: group.name, containerName, err }, 'Graceful stop failed, force killing');
-          container.kill('SIGKILL');
+          logger.warn(
+            { taskId: input.taskId, group: group.name, containerName, reason, err },
+            'Graceful container stop failed',
+          );
         }
       });
     };
 
-    let timeout = setTimeout(killOnTimeout, timeoutMs);
+    activityTimer = setTimeout(
+      () => requestTermination('activity_timeout'),
+      timeoutMs,
+    );
+    if (input.isScheduledTask && input.absoluteTimeoutMs !== undefined) {
+      absoluteTimer = setTimeout(
+        () => requestTermination('absolute_timeout'),
+        input.absoluteTimeoutMs,
+      );
+    }
 
     // Reset the timeout whenever there's activity (streaming output)
     const resetTimeout = () => {
-      clearTimeout(timeout);
-      timeout = setTimeout(killOnTimeout, timeoutMs);
+      if (terminationReason || settled) return;
+      clearTimeout(activityTimer);
+      activityTimer = setTimeout(
+        () => requestTermination('activity_timeout'),
+        timeoutMs,
+      );
     };
 
     container.on('close', (code) => {
-      clearTimeout(timeout);
+      if (settled) return;
+      settled = true;
+      clearTerminationTimers();
       const duration = Date.now() - startTime;
 
-      if (timedOut) {
+      if (terminationReason === 'activity_timeout' || terminationReason === 'absolute_timeout') {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
         const timeoutLog = path.join(logsDir, `container-${ts}.log`);
         fs.writeFileSync(timeoutLog, [
@@ -429,7 +473,25 @@ export async function runContainerAgent(
           `Had Streaming Output: ${hadStreamingOutput}`,
         ].join('\n'));
 
-        // Timeout after output = idle cleanup, not failure.
+        if (terminationReason === 'absolute_timeout') {
+          logger.error(
+            { taskId: input.taskId, group: group.name, containerName, duration, code, hadStreamingOutput, budgetMs: input.absoluteTimeoutMs },
+            'Container exceeded absolute task runtime budget',
+          );
+          outputChain.then(() => {
+            resolve({
+              status: 'error',
+              result: lastStreamingResult,
+              newSessionId,
+              error: `Scheduled task exceeded absolute runtime budget of ${input.absoluteTimeoutMs}ms after ${duration}ms`,
+              errorKind: 'absolute_timeout',
+              hadStreamingOutput,
+            });
+          });
+          return;
+        }
+
+        // Activity timeout after output = idle cleanup, not failure.
         // The agent already sent its response; this is just the
         // container being reaped after the idle period expired.
         if (hadStreamingOutput) {
@@ -456,6 +518,8 @@ export async function runContainerAgent(
           status: 'error',
           result: null,
           error: `Container timed out after ${configTimeout}ms`,
+          errorKind: 'activity_timeout',
+          hadStreamingOutput,
         });
         return;
       }
@@ -534,6 +598,7 @@ export async function runContainerAgent(
           status: 'error',
           result: null,
           error: `Container exited with code ${code}: ${stderr.slice(-200)}`,
+          errorKind: 'process_error',
         });
         return;
       }
@@ -599,17 +664,21 @@ export async function runContainerAgent(
           status: 'error',
           result: null,
           error: `Failed to parse container output: ${err instanceof Error ? err.message : String(err)}`,
+          errorKind: 'process_error',
         });
       }
     });
 
     container.on('error', (err) => {
-      clearTimeout(timeout);
+      if (settled) return;
+      settled = true;
+      clearTerminationTimers();
       logger.error({ group: group.name, containerName, error: err }, 'Container spawn error');
       resolve({
         status: 'error',
         result: null,
         error: `Container spawn error: ${err.message}`,
+        errorKind: 'process_error',
       });
     });
   });
@@ -628,6 +697,7 @@ export function writeTasksSnapshot(
     next_run: string | null;
     capability_profile: string;
     skills: string[];
+    max_runtime_ms: number | null;
   }>,
 ): void {
   // Write filtered tasks to the group's IPC directory

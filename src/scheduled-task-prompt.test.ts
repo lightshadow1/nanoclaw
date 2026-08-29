@@ -24,4 +24,11 @@ describe('scheduled task prompt skill binding', () => {
       '[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\ndo the work',
     );
   });
+
+  it('places a non-resetting deadline notice before the task prompt', async () => {
+    const { buildScheduledTaskPrompt } = await import(promptModule);
+    const prompt = buildScheduledTaskPrompt('do the work', [], 60000);
+    expect(prompt).toContain('absolute wall-clock budget of 60000ms');
+    expect(prompt.indexOf('60000ms')).toBeLessThan(prompt.indexOf('do the work'));
+  });
 });

@@ -291,6 +291,7 @@ async function runAgent(
       next_run: t.next_run,
       capability_profile: t.capability_profile,
       skills: t.skills,
+      max_runtime_ms: t.max_runtime_ms,
     })),
   );
 

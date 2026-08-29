@@ -138,4 +138,20 @@ describe('scheduled task skill execution', () => {
     expect(runContainerAgent).not.toHaveBeenCalled();
     expect(latestRun().error).toContain('does not permit skills');
   });
+
+  it('passes the budget and records absolute timeout as timed_out despite partial output', async () => {
+    addDueTask({ max_runtime_ms: 60000 });
+    runContainerAgent.mockResolvedValue({
+      status: 'error', result: 'partial result',
+      error: 'Scheduled task exceeded absolute runtime budget',
+      errorKind: 'absolute_timeout', hadStreamingOutput: true,
+    });
+    await executeClaimedTask();
+    expect(runContainerAgent.mock.calls[0][1].absoluteTimeoutMs).toBe(60000);
+    const run = latestRun();
+    expect(run.status).toBe('timed_out');
+    const context = JSON.parse(run.execution_context);
+    expect(context.max_runtime_ms).toBe(60000);
+    expect(context.termination_reason).toBe('absolute_timeout');
+  });
 });

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
+import { exec } from 'child_process';
 
 // Sentinel markers must match container-runner.ts
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -108,6 +109,7 @@ describe('container-runner timeout behavior', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     fakeProc = createFakeProcess();
+    vi.mocked(exec).mockClear();
   });
 
   afterEach(() => {
@@ -199,5 +201,75 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not apply an absolute budget to interactive execution', async () => {
+    const resultPromise = runContainerAgent(
+      testGroup,
+      { ...testInput, absoluteTimeoutMs: 100 },
+      () => {},
+      async () => {},
+    );
+    await vi.advanceTimersByTimeAsync(100);
+    expect(vi.mocked(exec)).not.toHaveBeenCalled();
+    emitOutputMarker(fakeProc, { status: 'success', result: 'done' });
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await resultPromise).status).toBe('success');
+  });
+
+  it('continuous output does not reset the absolute scheduled-task deadline', async () => {
+    const onOutput = vi.fn(async () => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      {
+        ...testInput,
+        isScheduledTask: true,
+        capabilityProfile: 'research' as const,
+        absoluteTimeoutMs: 100,
+      },
+      () => {},
+      onOutput,
+    );
+
+    await vi.advanceTimersByTimeAsync(50);
+    emitOutputMarker(fakeProc, { status: 'success', result: 'partial' });
+    await vi.advanceTimersByTimeAsync(50);
+    fakeProc.emit('close', 137);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('error');
+    expect(result.errorKind).toBe('absolute_timeout');
+    expect(result.result).toBe('partial');
+    expect(result.hadStreamingOutput).toBe(true);
+  });
+
+  it('uses the first timeout reason and force-kills only after the grace period', async () => {
+    const resultPromise = runContainerAgent(
+      testGroup,
+      {
+        ...testInput,
+        isScheduledTask: true,
+        capabilityProfile: 'research' as const,
+        absoluteTimeoutMs: 100,
+      },
+      () => {},
+    );
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(vi.mocked(exec)).toHaveBeenCalledTimes(1);
+    expect(fakeProc.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(14999);
+    expect(fakeProc.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fakeProc.kill).toHaveBeenCalledWith('SIGKILL');
+
+    fakeProc.emit('close', 137);
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await resultPromise).errorKind).toBe('absolute_timeout');
+    expect(vi.mocked(exec)).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
