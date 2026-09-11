@@ -60,6 +60,9 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 
 ## Usage
 
+Fork additions: [local document ingestion](docs/document-ingestion.md) and a
+[read-only operations dashboard](docs/dashboard.md).
+
 Talk to your assistant with the trigger word (default: `@Andy`):
 
 ```
