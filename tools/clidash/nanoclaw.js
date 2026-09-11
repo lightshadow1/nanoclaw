@@ -1,13 +1,21 @@
-// Fork-specific launcher: fixed read-only commands and loopback-only networking.
+// Fork-specific launcher: fixed read-only commands and configurable networking.
+import { hostname, networkInterfaces } from 'node:os';
+import { isIP } from 'node:net';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { createApp } from './server.js';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
-export function forkConfig(projectRoot = root) {
+export function forkConfig(projectRoot = root, bind = '127.0.0.1') {
+  if (!isIP(bind)) throw new Error('BIND must be an IP address');
+  const allowedHosts = ['localhost', '127.0.0.1', '[::1]'];
+  if (bind !== '127.0.0.1' && bind !== '::1') {
+    allowedHosts.push(hostname().toLowerCase(), ...Object.values(networkInterfaces()).flat().filter(Boolean).map((entry) => entry.family === 'IPv6' ? `[${entry.address}]` : entry.address));
+  }
   return {
     privateOnly: true,
+    allowedHosts,
     refreshSeconds: 60,
     clis: {
       nanoclaw: {
@@ -31,6 +39,7 @@ export function forkConfig(projectRoot = root) {
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const port = Number(process.env.PORT || 4690);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('PORT must be between 1024 and 65535');
-  const server = createApp(forkConfig());
-  server.listen(port, '127.0.0.1', () => console.log(`NanoClaw dashboard: http://127.0.0.1:${port}`));
+  const bind = process.env.BIND || '127.0.0.1';
+  const server = createApp(forkConfig(root, bind));
+  server.listen(port, bind, () => console.log(`NanoClaw dashboard listening on ${bind}:${port}`));
 }

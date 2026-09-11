@@ -9,7 +9,11 @@ npm run dashboard
 
 Open http://127.0.0.1:4690. Node 22.5+ is required by the upstream dashboard.
 Use `PORT=4691 npm run dashboard` if the default port is busy. The fork launcher
-always binds localhost; `BIND` and `CLIDASH_CONFIG` do not override it.
+defaults to localhost. Set `BIND=0.0.0.0` to listen on all IPv4 interfaces.
+In that mode, Host headers may use any IP assigned to the server or its hostname;
+cross-origin browser requests remain rejected. `CLIDASH_CONFIG` does not override
+the fork configuration. There is no login: anyone with network access to the
+port can read the operational dashboard.
 For a remote installation, use an SSH tunnel to the chosen deployment host:
 
 ```sh
@@ -35,7 +39,7 @@ The data CLI uses this checkout's `store/messages.db`, opens it read-only, and
 never imports the host bootstrap or initializes a database. It exposes no SQL,
 mutation commands, prompts, credentials, claim tokens, full results, or raw
 errors. Bet titles and operational metadata are still private information.
-Localhost binding plus Host/Origin checks are the access boundary, not user
+Network reachability plus Host/Origin checks are the access boundary, not user
 authentication. Do not expose it through a public reverse proxy.
 
 Generic upstream log/file/activity/command features are not configured in this

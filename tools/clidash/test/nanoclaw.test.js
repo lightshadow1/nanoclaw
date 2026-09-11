@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { request } from 'node:http';
+import { hostname } from 'node:os';
 import { createApp } from '../server.js';
 import { forkConfig } from '../nanoclaw.js';
 
@@ -11,6 +12,24 @@ test('fork config exposes only fixed resources and no file or command controls',
   assert.deepEqual(config.clis.nanoclaw.list, ['/test-root/dist/dashboard-cli.js','{resource}']);
   for (const key of ['logs','docs','activity']) assert.equal(config[key], undefined);
   assert.equal(config.clis.nanoclaw.commands, undefined);
+});
+
+test('all-interface mode accepts the server hostname while retaining origin checks', async () => {
+  const config = forkConfig('/test-root', '0.0.0.0');
+  assert.ok(config.allowedHosts.includes(hostname().toLowerCase()));
+  assert.throws(() => forkConfig('/test-root', 'invalid'), /BIND/);
+  const server = createApp(config);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    for (const [origin, expected] of [[`http://${hostname()}`, 200], ['https://unrelated.example', 403]]) {
+      const status = await new Promise((resolve, reject) => {
+        const req = request(base + '/api/clis', { headers: { host: hostname(), origin } }, (res) => { res.resume(); resolve(res.statusCode); });
+        req.on('error', reject); req.end();
+      });
+      assert.equal(status, expected);
+    }
+  } finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
 test('fork perimeter rejects cross-origin, non-local Host, mutations and file browsing', async () => {

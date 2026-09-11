@@ -261,10 +261,13 @@ export function createApp(userConfig) {
     try {
       if (config.privateOnly) {
         const host = req.headers.host ?? '';
-        if (!/^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host) ||
+        let hostname;
+        try { hostname = new URL(`http://${host}`).hostname; } catch { hostname = ''; }
+        const allowedHosts = config.allowedHosts ?? ['localhost', '127.0.0.1'];
+        if (!/^[a-zA-Z0-9.:[\]-]+$/.test(host) || !allowedHosts.includes(hostname) ||
             (req.headers.origin && req.headers.origin !== `http://${host}`) ||
             req.headers['sec-fetch-site'] === 'cross-site') {
-          sendJson(res, 403, { ok: false, error: 'Local dashboard access only' });
+          sendJson(res, 403, { ok: false, error: 'Dashboard host or origin not allowed' });
           return;
         }
         res.setHeader('Cache-Control', 'no-store');
