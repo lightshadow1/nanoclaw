@@ -37,6 +37,12 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # Install agent-browser and claude-code globally
 RUN npm install -g agent-browser @anthropic-ai/claude-code
 
+# Local document conversion, adapted from upstream add-anydoc (74224f62).
+# Exact version; native bindings are prebuilt, no package lifecycle scripts.
+RUN npm install -g --ignore-scripts @firecrawl/anydoc@0.1.6
+COPY tools/convert-document /usr/local/bin/convert-document
+RUN chmod 755 /usr/local/bin/convert-document
+
 # Create app directory
 WORKDIR /app
 

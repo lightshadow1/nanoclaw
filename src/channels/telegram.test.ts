@@ -87,6 +87,8 @@ vi.mock('grammy', () => ({
 }));
 
 import { TelegramChannel, TelegramChannelOpts } from './telegram.js';
+import { downloadDocument } from '../document-inbox.js';
+vi.mock('../document-inbox.js', () => ({ downloadDocument: vi.fn() }));
 
 // --- Test helpers ---
 
@@ -198,6 +200,7 @@ async function triggerMediaMessage(
 describe('TelegramChannel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(downloadDocument).mockReset().mockResolvedValue('/workspace/inbox/generated.pdf');
   });
 
   afterEach(() => {
@@ -632,7 +635,7 @@ describe('TelegramChannel', () => {
 
       expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',
-        expect.objectContaining({ content: '[Document: report.pdf]' }),
+        expect.objectContaining({ content: '[Document: report.pdf] Local attachment: /workspace/inbox/generated.pdf' }),
       );
     });
 
@@ -646,8 +649,26 @@ describe('TelegramChannel', () => {
 
       expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',
-        expect.objectContaining({ content: '[Document: file]' }),
+        expect.objectContaining({ content: '[Document: file] Local attachment: /workspace/inbox/generated.pdf' }),
       );
+    });
+
+    it('does not download documents from unregistered chats', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      await triggerMediaMessage('message:document', createMediaCtx({ chatId: 999, extra: { document: { file_name: 'report.pdf' } } }));
+      expect(downloadDocument).not.toHaveBeenCalled();
+    });
+
+    it('preserves caption mentions and surfaces download failure without a path', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+      vi.mocked(downloadDocument).mockRejectedValue(new Error('Document exceeds the 20 MiB limit'));
+      await triggerMediaMessage('message:document', createMediaCtx({ caption: '@andy_ai_bot summarize', extra: {
+        document: { file_name: 'report.pdf' }, caption_entities: [{ type: 'mention', offset: 0, length: 12 }],
+      } }));
+      expect(opts.onMessage).toHaveBeenCalledWith('tg:100200300', expect.objectContaining({ content: '@Andy [Document: report.pdf] Attachment unavailable: Document exceeds the 20 MiB limit @andy_ai_bot summarize' }));
     });
 
     it('stores sticker with emoji', async () => {

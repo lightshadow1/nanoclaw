@@ -1,0 +1,42 @@
+#!/bin/bash
+set -euo pipefail
+if [ "$#" -ne 1 ]; then
+  echo 'Usage: convert-document /absolute/path/to/document' >&2
+  exit 2
+fi
+input="$1"
+case "$input" in
+  /*) ;;
+  *) echo 'Use an absolute local document path' >&2; exit 2 ;;
+esac
+if [ ! -f "$input" ]; then
+  echo 'Document is unavailable or expired' >&2
+  exit 1
+fi
+if [ "$(stat -Lc %s -- "$input")" -gt 20971520 ]; then
+  echo 'Document exceeds the 20 MiB input limit' >&2
+  exit 1
+fi
+# Bound converter V8 heap, output file size (1024-byte blocks in Bash),
+# and wall time, independently of model compliance.
+export NODE_OPTIONS=--max-old-space-size=256
+ulimit -f 20480
+output_root=/workspace/group/converted
+mkdir -p "$output_root"
+# Only this wrapper's generated directories expire. Never follow symlinks.
+find "$output_root" -maxdepth 1 -type d -name 'anydoc.*' -mtime +7 -exec rm -rf -- {} +
+output_dir=$(mktemp -d "$output_root/anydoc.XXXXXXXX")
+command=(anydoc -o "$output_dir/document.md" -- "$input")
+# AnyDoc 0.1.6 does not parse plain text; preserve it directly under the same limits.
+if [[ "${input,,}" == *.txt ]]; then command=(cp -- "$input" "$output_dir/document.md"); fi
+if ! timeout --kill-after=5s 60s "${command[@]}"; then
+  rm -rf -- "$output_dir"
+  echo 'Conversion failed: unsupported, encrypted, malformed, or resource limit reached. No external upload was attempted.' >&2
+  exit 1
+fi
+if [ ! -s "$output_dir/document.md" ]; then
+  rm -rf -- "$output_dir"
+  echo 'No text extracted; scanned PDFs require OCR' >&2
+  exit 1
+fi
+printf '%s\n' "$output_dir/document.md"

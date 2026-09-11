@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
 import { exec } from 'child_process';
+vi.mock('./document-inbox.js', () => ({ ensureDocumentInbox: (group: string) => `/host-inbox/${group}` }));
 
 // Sentinel markers must match container-runner.ts
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -37,6 +38,7 @@ vi.mock('fs', async () => {
       ...actual,
       existsSync: vi.fn(() => false),
       mkdirSync: vi.fn(),
+      mkdtempSync: vi.fn(() => '/tmp/nanoclaw-test-data/ephemeral-sessions/test-group-fixture'),
       writeFileSync: vi.fn(),
       readFileSync: vi.fn(() => ''),
       readdirSync: vi.fn(() => []),
@@ -83,7 +85,7 @@ vi.mock('child_process', async () => {
   };
 });
 
-import { runContainerAgent, ContainerOutput } from './container-runner.js';
+import { buildVolumeMounts, runContainerAgent, ContainerOutput } from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
 
 const testGroup: RegisteredGroup = {
@@ -92,6 +94,14 @@ const testGroup: RegisteredGroup = {
   trigger: '@Andy',
   added_at: new Date().toISOString(),
 };
+
+it('mounts only the selected group inbox read-only, even before the first document', () => {
+  for (const profile of ['full', 'research', 'read-only'] as const) {
+    expect(buildVolumeMounts(testGroup, false, profile)).toContainEqual({
+      hostPath: '/host-inbox/test-group', containerPath: '/workspace/inbox', readonly: true,
+    });
+  }
+});
 
 const testInput = {
   prompt: 'Hello',

@@ -1,6 +1,7 @@
 import { Bot, InlineKeyboard, InputFile } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { downloadDocument } from '../document-inbox.js';
 import { logger } from '../logger.js';
 import {
   Channel,
@@ -138,6 +139,13 @@ export class TelegramChannel implements Channel {
         ctx.from?.id?.toString() ||
         'Unknown';
       const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+      let content = `${placeholder}${caption}`;
+      const botUsername = ctx.me?.username?.toLowerCase();
+      const mentioned = botUsername && (ctx.message.caption_entities || []).some(
+        (entity: { type: string; offset: number; length: number }) =>
+          entity.type === 'mention' && ctx.message.caption?.substring(entity.offset, entity.offset + entity.length).toLowerCase() === `@${botUsername}`,
+      );
+      if (mentioned || TRIGGER_PATTERN.test(ctx.message.caption || '')) content = `@${ASSISTANT_NAME} ${content}`;
 
       this.opts.onChatMetadata(chatJid, timestamp);
       this.opts.onMessage(chatJid, {
@@ -145,7 +153,7 @@ export class TelegramChannel implements Channel {
         chat_jid: chatJid,
         sender: ctx.from?.id?.toString() || '',
         sender_name: senderName,
-        content: `${placeholder}${caption}`,
+        content,
         timestamp,
         is_from_me: false,
       });
@@ -157,9 +165,31 @@ export class TelegramChannel implements Channel {
       storeNonText(ctx, '[Voice message]'),
     );
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
-    this.bot.on('message:document', (ctx) => {
-      const name = ctx.message.document?.file_name || 'file';
-      storeNonText(ctx, `[Document: ${name}]`);
+    this.bot.on('message:document', async (ctx) => {
+      const group = this.opts.registeredGroups()[`tg:${ctx.chat.id}`];
+      if (!group) return;
+      const document = ctx.message.document;
+      const name = document.file_name || 'file';
+      try {
+        const localPath = await downloadDocument({
+          group: group.folder,
+          identity: `${ctx.chat.id}:${ctx.message.message_id}:${document.file_unique_id}`,
+          filename: name,
+          size: document.file_size,
+          load: async (signal) => {
+            // Grammy types its AbortSignal against the legacy polyfill; Node's
+            // native signal implements the cancellation interface at runtime.
+            const file = await ctx.api.getFile(document.file_id, signal as unknown as Parameters<typeof ctx.api.getFile>[1]);
+            if (!file.file_path || !/^[a-zA-Z0-9_./-]+$/.test(file.file_path) || file.file_path.split('/').includes('..')) throw new Error('Invalid Telegram file path');
+            return fetch(`https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`, { signal, redirect: 'error' });
+          },
+        });
+        storeNonText(ctx, `[Document: ${name}] Local attachment: ${localPath}`);
+      } catch (error) {
+        // Only our sanitized inbox errors are surfaced; no API error object is logged.
+        const reason = error instanceof Error ? error.message : 'Document unavailable';
+        storeNonText(ctx, `[Document: ${name}] Attachment unavailable: ${reason}`);
+      }
     });
     this.bot.on('message:sticker', (ctx) => {
       const emoji = ctx.message.sticker?.emoji || '';

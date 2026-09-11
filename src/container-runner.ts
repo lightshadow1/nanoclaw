@@ -6,6 +6,7 @@ import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { ensureDocumentInbox } from './document-inbox.js';
 
 import {
   CONTAINER_IMAGE,
@@ -71,12 +72,14 @@ interface VolumeMount {
   readonly: boolean;
 }
 
-function buildVolumeMounts(
+export function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
   capabilityProfile?: TaskCapabilityProfileName,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
+  const inbox = ensureDocumentInbox(group.folder);
+  mounts.push({ hostPath: inbox, containerPath: '/workspace/inbox', readonly: true });
   const homeDir = getHomeDir();
   const projectRoot = process.cwd();
   const profile = capabilityProfile
