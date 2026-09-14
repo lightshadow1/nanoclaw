@@ -12,6 +12,7 @@ const envConfig = readEnvFile([
   'CHANNELS',
   'TELEGRAM_BOT_TOKEN',
   'HISTORY_SEARCH_ENABLED',
+  'CONTAINER_DNS_SERVERS',
 ]);
 
 export const ASSISTANT_NAME =
@@ -50,6 +51,10 @@ export const MAIN_GROUP_FOLDER = 'main';
 
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
+// Optional ordered DNS overrides for agent containers; empty uses Docker defaults.
+export const CONTAINER_DNS_SERVERS = (
+  process.env.CONTAINER_DNS_SERVERS ?? envConfig.CONTAINER_DNS_SERVERS ?? ''
+).split(',').map((server) => server.trim()).filter(Boolean);
 export const CONTAINER_TIMEOUT = parseInt(
   process.env.CONTAINER_TIMEOUT || '1800000',
   10,

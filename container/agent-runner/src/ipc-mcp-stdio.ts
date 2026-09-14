@@ -11,6 +11,7 @@ import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 import { randomUUID } from 'crypto';
+import { classifyFindings, findingsSchema } from './classify-findings.js';
 
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
@@ -74,6 +75,25 @@ const server = new McpServer({
   name: 'nanoclaw',
   version: '1.0.0',
 });
+
+if (isScheduledTask && process.env.NANOCLAW_CLASSIFICATION_MODEL &&
+    ['full', 'research', 'soul-maintenance', 'read-only'].includes(capabilityProfile)) server.tool(
+  'classify_findings',
+  'Classify a batch of researched findings using the configured Scout model. Returns validated material-change and flag judgments. Supply evidence and known facts; independently verify flagged claims before publishing.',
+  { findings: findingsSchema },
+  async ({ findings }) => {
+    try {
+      const result = await classifyFindings(findings, {
+        model: process.env.NANOCLAW_CLASSIFICATION_MODEL!,
+        baseUrl: process.env.NANOCLAW_CLASSIFICATION_BASE_URL!,
+        usagePath: process.env.NANOCLAW_CLASSIFICATION_USAGE_PATH!,
+      });
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { isError: true, content: [{ type: 'text' as const, text: `Classification failed: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  },
+);
 
 if (canUseMcpTool('send_message')) server.tool(
   'send_message',

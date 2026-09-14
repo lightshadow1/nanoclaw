@@ -9,6 +9,7 @@ import path from 'path';
 import { ensureDocumentInbox } from './document-inbox.js';
 
 import {
+  CONTAINER_DNS_SERVERS,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -22,6 +23,8 @@ import { logger } from './logger.js';
 import { CONTAINER_RUNTIME_BIN, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+import type { ModelRoute } from './model-routing.js';
+import { appendModelUsage, type UsageReport } from './model-usage.js';
 import {
   resolveTaskCapabilityProfile,
   TaskCapabilityProfileName,
@@ -54,10 +57,13 @@ export interface ContainerInput {
   skills?: ResolvedSkillBinding[];
   absoluteTimeoutMs?: number;
   taskId?: string;
+  modelRoute?: ModelRoute;
   secrets?: Record<string, string>;
 }
 
 export interface ContainerOutput {
+  usage?: UsageReport;
+  classificationUsage?: UsageReport[];
   status: 'success' | 'error';
   result: string | null;
   newSessionId?: string;
@@ -221,6 +227,9 @@ function readSecrets(): Record<string, string> {
 
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+  for (const server of CONTAINER_DNS_SERVERS) {
+    args.push('--dns', server);
+  }
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
@@ -308,7 +317,7 @@ export async function runContainerAgent(
 
     // Pass secrets via stdin (never written to disk or mounted as files)
     input.historySearchEnabled = HISTORY_SEARCH_ENABLED;
-    input.secrets = readSecrets();
+    input.secrets = input.modelRoute ? {} : readSecrets();
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
     // Remove secrets from input so they don't appear in logs
@@ -339,7 +348,7 @@ export async function runContainerAgent(
       }
 
       // Stream-parse for output markers
-      if (onOutput) {
+      {
         parseBuffer += chunk;
         let startIdx: number;
         while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
@@ -353,6 +362,18 @@ export async function runContainerAgent(
 
           try {
             const parsed: ContainerOutput = JSON.parse(jsonStr);
+            for (const report of [parsed.usage, ...(parsed.classificationUsage || [])]) {
+              if (!report) continue;
+              try {
+                appendModelUsage(path.resolve('runs'), report, {
+                  runId: containerName, taskId: input.taskId, group: group.folder,
+                  role: input.modelRoute?.role,
+                  requestedModel: report.source ? input.modelRoute?.classificationModel : input.modelRoute?.model,
+                });
+              } catch (err) {
+                logger.error({ err, containerName }, 'Failed to persist model usage');
+              }
+            }
             if (parsed.newSessionId) {
               newSessionId = parsed.newSessionId;
             }
@@ -362,7 +383,7 @@ export async function runContainerAgent(
             resetTimeout();
             // Call onOutput for all markers (including null results)
             // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
+            if (onOutput) outputChain = outputChain.then(() => onOutput(parsed));
           } catch (err) {
             logger.warn(
               { group: group.name, error: err },

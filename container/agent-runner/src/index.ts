@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'crypto';
 import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 import { buildScheduledTaskPrompt } from './scheduled-task-prompt.js';
@@ -32,10 +33,16 @@ interface ContainerInput {
   skills?: Array<{ name: string; contentHash: string }>;
   absoluteTimeoutMs?: number;
   taskId?: string;
+  modelRoute?: { role: string; model: string; baseUrl: string; classificationModel?: string };
   secrets?: Record<string, string>;
 }
 
 interface ContainerOutput {
+  classificationUsage?: Array<NonNullable<ContainerOutput['usage']> & { source?: 'provider_reported' | 'provider_usage_without_cost' }>;
+  usage?: { resultId: string; models: Record<string, {
+    inputTokens: number; outputTokens: number; cacheReadInputTokens: number;
+    cacheCreationInputTokens: number; costUSD: number;
+  }> };
   status: 'success' | 'error';
   result: string | null;
   newSessionId?: string;
@@ -63,6 +70,15 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+const classificationUsagePath = `/tmp/nanoclaw-classification-${randomUUID()}.jsonl`;
+let classificationUsageLines = 0;
+function readClassificationUsage(): ContainerOutput['classificationUsage'] {
+  if (!fs.existsSync(classificationUsagePath)) return [];
+  const lines = fs.readFileSync(classificationUsagePath, 'utf8').trim().split('\n').filter(Boolean);
+  const reports = lines.slice(classificationUsageLines).map(line => JSON.parse(line));
+  classificationUsageLines = lines.length;
+  return reports;
+}
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -447,6 +463,7 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
+      model: containerInput.modelRoute?.model,
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
@@ -470,6 +487,9 @@ async function runQuery(
             NANOCLAW_IS_SCHEDULED_TASK: containerInput.isScheduledTask ? '1' : '0',
             NANOCLAW_HISTORY_SEARCH_ENABLED: containerInput.historySearchEnabled ? '1' : '0',
             NANOCLAW_CAPABILITY_PROFILE: containerInput.capabilityProfile || 'interactive',
+            NANOCLAW_CLASSIFICATION_MODEL: containerInput.modelRoute?.classificationModel || '',
+            NANOCLAW_CLASSIFICATION_BASE_URL: containerInput.modelRoute?.baseUrl || '',
+            NANOCLAW_CLASSIFICATION_USAGE_PATH: classificationUsagePath,
           },
         },
       },
@@ -502,9 +522,12 @@ async function runQuery(
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
       writeOutput({
-        status: 'success',
+        status: message.is_error ? 'error' : 'success',
+        error: message.is_error ? (textResult || ('errors' in message ? message.errors.join('; ') : 'Agent query failed')) : undefined,
         result: textResult || null,
-        newSessionId
+        newSessionId,
+        usage: { resultId: message.uuid, models: message.modelUsage },
+        classificationUsage: readClassificationUsage(),
       });
     }
   }
@@ -538,6 +561,15 @@ async function main(): Promise<void> {
   for (const [key, value] of Object.entries(containerInput.secrets || {})) {
     sdkEnv[key] = value;
   }
+  if (containerInput.modelRoute) {
+    // Routed tasks use gateway identity, never the direct Claude subscription.
+    delete sdkEnv.CLAUDE_CODE_OAUTH_TOKEN;
+    delete sdkEnv.ANTHROPIC_AUTH_TOKEN;
+    sdkEnv.ANTHROPIC_API_KEY = 'aperture-managed';
+    sdkEnv.ANTHROPIC_BASE_URL = containerInput.modelRoute.baseUrl;
+    sdkEnv.ANTHROPIC_MODEL = containerInput.modelRoute.model;
+    sdkEnv.CLAUDE_CODE_SUBAGENT_MODEL = containerInput.modelRoute.model;
+  }
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
@@ -550,6 +582,9 @@ async function main(): Promise<void> {
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
+  if (containerInput.modelRoute?.classificationModel) {
+    prompt += '\n\n## Scout classification routing\nAfter researching candidate findings, use the classify_findings MCP tool to batch material-change and flag classification against known facts and explicit flag triggers. This uses the configured Scout model. Verify flagged claims before updating knowledge or notifying the owner. If classification fails, report the failure; do not silently replace it with your own classification. Keep research, tool use, and final editorial judgment in this agent.';
+  }
   if (containerInput.isScheduledTask) {
     prompt = buildScheduledTaskPrompt(
       prompt,
@@ -607,7 +642,8 @@ async function main(): Promise<void> {
       status: 'error',
       result: null,
       newSessionId: sessionId,
-      error: errorMessage
+      error: errorMessage,
+      classificationUsage: readClassificationUsage(),
     });
     process.exit(1);
   }

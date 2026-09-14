@@ -29,6 +29,7 @@ import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 import { resolveTaskCapabilityProfile } from './task-capability-profiles.js';
 import { resolveSkillBindings } from './skill-catalog.js';
+import { resolveTaskModelRoute, type ModelRoute } from './model-routing.js';
 
 function nextRunFor(task: ScheduledTask): string | null {
   if (task.schedule_type === 'cron') {
@@ -268,6 +269,11 @@ async function runTask(
   let error: string | null = null;
   let terminationReason: ContainerOutput['errorKind'];
   let hadStreamedOutput = false;
+  let modelRoute: ModelRoute | undefined;
+  let estimatedCostUsd = 0;
+  let usageResults = 0;
+  let classificationCalls = 0;
+  let classificationCallsWithoutCost = 0;
 
   // For group context mode, use the group's current session
   const sessions = deps.getSessions();
@@ -289,11 +295,13 @@ async function runTask(
   };
 
   try {
+    modelRoute = resolveTaskModelRoute(task.id);
     const output = await runContainerAgent(
       group,
       {
         prompt: task.prompt,
-        sessionId,
+        sessionId: modelRoute ? undefined : sessionId,
+        modelRoute,
         groupFolder: task.group_folder,
         chatJid: task.chat_jid,
         isMain,
@@ -306,6 +314,18 @@ async function runTask(
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
       async (streamedOutput: ContainerOutput) => {
+        if (streamedOutput.usage) {
+          usageResults++;
+          estimatedCostUsd += Object.values(streamedOutput.usage.models)
+            .reduce((sum, usage) => sum + usage.costUSD, 0);
+        }
+        for (const usage of streamedOutput.classificationUsage || []) {
+          classificationCalls++;
+          if (usage.source === 'provider_usage_without_cost') classificationCallsWithoutCost++;
+          if (usage.source !== 'provider_usage_without_cost') {
+            estimatedCostUsd += Object.values(usage.models).reduce((sum, model) => sum + model.costUSD, 0);
+          }
+        }
         hadStreamedOutput = true;
         if (streamedOutput.result) {
           result = streamedOutput.result;
@@ -365,6 +385,12 @@ async function runTask(
       max_runtime_ms: task.max_runtime_ms,
       termination_reason: terminationReason ?? null,
       had_streamed_output: hadStreamedOutput,
+      model_route: modelRoute ?? null,
+      usage_results: usageResults,
+      classification_calls: classificationCalls,
+      classification_calls_without_cost: classificationCallsWithoutCost,
+      estimated_cost_usd: usageResults || classificationCalls > classificationCallsWithoutCost ? estimatedCostUsd : null,
+      cost_source: 'sdk_estimate_plus_available_classification_cost',
     }),
   };
 
