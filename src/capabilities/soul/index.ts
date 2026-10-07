@@ -704,6 +704,167 @@ function ensureClaudeMdSection(groupsDirectory: string, folder: string): void {
   logger.info({ folder }, 'Refreshed soul section in CLAUDE.md');
 }
 
+// --- Idle gates for the morning plan and evening journal ---------------------
+//
+// Both tasks cost a container run and, on a quiet day, produce nothing. The
+// host decides from cheap local signals whether there is anything to act on.
+
+const JOURNAL_DEEP_REVIEW_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Skipped runs are logged by the scheduler with a 'skipped: ...' result, so
+// "last run" must exclude them. Failed/timed-out runs don't count either:
+// they didn't consume their inputs.
+function lastExecutedRunAt(
+  database: Database.Database,
+  taskId: string,
+): Date | null {
+  const row = database
+    .prepare(
+      `SELECT run_at FROM task_run_logs
+        WHERE task_id = ? AND status = 'success'
+          AND (result IS NULL OR result NOT LIKE 'skipped:%')
+        ORDER BY run_at DESC, id DESC LIMIT 1`,
+    )
+    .get(taskId) as { run_at: string } | undefined;
+  if (!row) return null;
+  const t = new Date(row.run_at);
+  return Number.isNaN(t.getTime()) ? null : t;
+}
+
+// Main plus every active spawned soul — the scope the prompts query.
+const SOUL_SCOPE_SQL = `(group_folder = ?
+  OR group_folder IN (SELECT folder FROM souls WHERE state = 'active' AND folder != ?))`;
+
+function hasPendingInterventions(database: Database.Database): boolean {
+  return (
+    database
+      .prepare(
+        `SELECT 1 FROM memory_stream
+          WHERE ${SOUL_SCOPE_SQL} AND type = 'intervention'
+            AND json_extract(metadata, '$.status') = 'pending'
+          LIMIT 1`,
+      )
+      .get(MAIN_GROUP_FOLDER, MAIN_GROUP_FOLDER) !== undefined
+  );
+}
+
+function hasUncuratedMemory(database: Database.Database): boolean {
+  return (
+    database
+      .prepare(
+        `SELECT 1 FROM memory_stream
+          WHERE curated = 0 AND ${SOUL_SCOPE_SQL} LIMIT 1`,
+      )
+      .get(MAIN_GROUP_FOLDER, MAIN_GROUP_FOLDER) !== undefined
+  );
+}
+
+function hasNewInputSince(database: Database.Database, since: Date): boolean {
+  return (
+    database
+      .prepare(
+        `SELECT 1 FROM memory_stream
+          WHERE ${SOUL_SCOPE_SQL}
+            AND type IN ('observation', 'intervention')
+            AND datetime(timestamp) > datetime(?)
+          LIMIT 1`,
+      )
+      .get(MAIN_GROUP_FOLDER, MAIN_GROUP_FOLDER, since.toISOString()) !==
+    undefined
+  );
+}
+
+function todayLocalString(now: Date): string {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(
+    2,
+    '0',
+  )}-${String(now.getDate()).padStart(2, '0')}`;
+}
+
+// The host-written plan matches the shape the morning-plan prompt asks for.
+function writeEmptyDailyPlan(planPath: string, now: Date): void {
+  fs.mkdirSync(path.dirname(planPath), { recursive: true });
+  fs.writeFileSync(
+    planPath,
+    JSON.stringify(
+      {
+        date: todayLocalString(now),
+        generated_at: now.toISOString(),
+        items: [],
+        notes: '',
+      },
+      null,
+      2,
+    ),
+    'utf-8',
+  );
+}
+
+// Returns true when the morning plan has something to act on (or the check
+// itself failed — callers fail open).
+function morningPlanHasWork(
+  database: Database.Database,
+  groupsRoot: string,
+): boolean {
+  const lastRun = lastExecutedRunAt(
+    database,
+    `soul-morning-plan-${MAIN_GROUP_FOLDER}`,
+  );
+  if (!lastRun) return true;
+  const proposed = database
+    .prepare(`SELECT 1 FROM bets WHERE status = 'proposed' LIMIT 1`)
+    .get();
+  if (proposed !== undefined) return true;
+  if (hasPendingInterventions(database)) return true;
+  if (hasNewInputSince(database, lastRun)) return true;
+  // The prompt also reads dated items from this wiki page.
+  const tasksPage = path.join(
+    groupsRoot,
+    MAIN_GROUP_FOLDER,
+    'soul',
+    'wiki',
+    'tasks-and-projects.md',
+  );
+  try {
+    if (fs.statSync(tasksPage).mtimeMs > lastRun.getTime()) return true;
+  } catch {
+    // no page — nothing to read
+  }
+  return false;
+}
+
+// Returns true when the evening journal should run.
+function eveningJournalHasWork(
+  database: Database.Database,
+  groupsRoot: string,
+  now: Date,
+): boolean {
+  const lastRun = lastExecutedRunAt(
+    database,
+    `soul-evening-journal-${MAIN_GROUP_FOLDER}`,
+  );
+  if (!lastRun) return true;
+  if (now.getTime() - lastRun.getTime() >= JOURNAL_DEEP_REVIEW_INTERVAL_MS) {
+    return true;
+  }
+  if (hasUncuratedMemory(database)) return true;
+  if (hasPendingInterventions(database)) return true;
+  const planPath = path.join(
+    groupsRoot,
+    MAIN_GROUP_FOLDER,
+    'soul',
+    'daily-plan.json',
+  );
+  if (fs.existsSync(planPath)) {
+    // Malformed plan throws → caller fails open.
+    const plan = JSON.parse(fs.readFileSync(planPath, 'utf-8')) as {
+      items?: unknown[];
+    };
+    if ((plan.items ?? []).length > 0) return true;
+  }
+  return false;
+}
+
 export const soulCapability: Capability = {
   name: 'soul',
 
@@ -1000,7 +1161,7 @@ export const soulCapability: Capability = {
 
       // Morning plan: process any resolved+approved spawn_soul interventions
       // so newly-spawned souls are visible to today's plan, then skip if
-      // today's plan is already written. (Phase 6 dropped the experiment
+      // today's plan is already written or there is nothing to act on. (Phase 6 dropped the experiment
       // state refresh — the timing bandit no longer drives planning.)
       if (task.id === `soul-morning-plan-${MAIN_GROUP_FOLDER}`) {
         if (!groupsDir) return true;
@@ -1037,22 +1198,46 @@ export const soulCapability: Capability = {
           'soul',
           'daily-plan.json',
         );
-        if (!fs.existsSync(planPath)) return true;
+        const today = new Date();
+        if (fs.existsSync(planPath)) {
+          try {
+            const plan = JSON.parse(fs.readFileSync(planPath, 'utf-8')) as {
+              date?: string;
+            };
+            if (plan.date === todayLocalString(today)) return false;
+          } catch {
+            return true; // malformed — let the task regenerate
+          }
+        }
+        // No plan for today. Skip the container when there is nothing to
+        // act on, writing the zero-item plan ourselves so the check-in gate
+        // and evening journal still find a plan for today.
+        if (!db) return true;
         try {
-          const plan = JSON.parse(fs.readFileSync(planPath, 'utf-8')) as {
-            date?: string;
-          };
-          const today = new Date();
-          const todayStr = `${today.getFullYear()}-${String(
-            today.getMonth() + 1,
-          ).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-          return plan.date !== todayStr;
-        } catch {
-          return true; // malformed — let the task regenerate
+          if (morningPlanHasWork(db, groupsDir)) return true;
+          writeEmptyDailyPlan(planPath, today);
+          logger.info('Morning plan idle; wrote empty plan without container');
+          return false;
+        } catch (err) {
+          logger.error({ err }, 'Morning plan gate failed; failing open');
+          return true;
         }
       }
 
-      // The evening journal and unrelated tasks run unconditionally.
+      // Evening journal: skip on idle days (no uncurated rows, no planned
+      // items, no pending interventions) unless the weekly deep staleness
+      // review is due.
+      if (task.id === `soul-evening-journal-${MAIN_GROUP_FOLDER}`) {
+        if (!db || !groupsDir) return true;
+        try {
+          return eveningJournalHasWork(db, groupsDir, new Date());
+        } catch (err) {
+          logger.error({ err }, 'Evening journal gate failed; failing open');
+          return true;
+        }
+      }
+
+      // Unrelated tasks run unconditionally.
       return true;
     },
 

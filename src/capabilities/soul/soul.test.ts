@@ -5443,3 +5443,307 @@ describe('cross-soul integration', () => {
     ).toBe(false);
   });
 });
+
+describe('soul morning-plan / evening-journal idle gates', () => {
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+  });
+
+  const NOW = new Date(2026, 9, 6, 6, 0, 0); // Oct 6, 2026 6:00 AM local
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  function ctx() {
+    return {
+      db: getDb(),
+      registeredGroups: () => ({
+        'g@g.us': { name: 'Main', folder: 'main' },
+      }),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+    };
+  }
+
+  const morningTask = {
+    id: 'soul-morning-plan-main',
+    group_folder: 'main',
+    schedule_type: 'cron' as const,
+  };
+  const journalTask = {
+    id: 'soul-evening-journal-main',
+    group_folder: 'main',
+    schedule_type: 'cron' as const,
+  };
+
+  function todayLocal(): string {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
+      d.getDate(),
+    ).padStart(2, '0')}`;
+  }
+
+  function planPath(): string {
+    return path.join(tmpDir, 'main', 'soul', 'daily-plan.json');
+  }
+
+  function writePlanFile(date: string, items: unknown[] = []): void {
+    fs.mkdirSync(path.dirname(planPath()), { recursive: true });
+    fs.writeFileSync(planPath(), JSON.stringify({ date, items }), 'utf-8');
+  }
+
+  // A real (executed) run, or a skipped one when `skipped` is set. Skipped
+  // runs are logged by the scheduler with this exact result string.
+  function logRun(
+    taskId: string,
+    runAt: Date,
+    opts: { skipped?: boolean; status?: string } = {},
+  ): void {
+    getDb()
+      .prepare(
+        `INSERT INTO task_run_logs (task_id, run_at, duration_ms, status, result, error)
+         VALUES (?, ?, 1, ?, ?, NULL)`,
+      )
+      .run(
+        taskId,
+        runAt.toISOString(),
+        opts.status ?? 'success',
+        opts.skipped ? 'skipped: gated by capability hook' : 'done',
+      );
+  }
+
+  function insertActiveSoul(folder: string): void {
+    getDb()
+      .prepare(
+        `INSERT INTO souls
+           (folder, owner, channel_jid, agent_name, description, state,
+            spawned_at, state_changed_at, did, parent_folder, spawn_reason)
+         VALUES (?, 'self', NULL, ?, NULL, 'active',
+            '2026-04-24T00:00:00Z', '2026-04-24T00:00:00Z', ?, 'main', 'x')`,
+      )
+      .run(folder, folder, `did:wba:host:agent:${folder}`);
+  }
+
+  function addObservation(folder: string, at: Date): void {
+    addMemory(getDb(), {
+      groupFolder: folder,
+      timestamp: at.toISOString(),
+      type: 'observation',
+      source: 'telegram',
+      content: 'remind me to renew the passport',
+      importance: 5,
+    });
+  }
+
+  function addPendingIntervention(folder = 'main'): void {
+    addMemory(getDb(), {
+      groupFolder: folder,
+      timestamp: new Date(NOW.getTime() - 3 * DAY_MS).toISOString(),
+      type: 'intervention',
+      source: 'agent',
+      content: 'approve?',
+      importance: 8,
+      metadata: { status: 'pending' },
+    });
+  }
+
+  function insertProposedBet(): void {
+    getDb()
+      .prepare(
+        `INSERT INTO bets (id, group_folder, title, body, status, created_at, window_days)
+         VALUES ('b1', 'main', 'T', 'B', 'proposed', datetime('now'), 7)`,
+      )
+      .run();
+  }
+
+  function setTasksPageMtime(at: Date): void {
+    const wiki = path.join(tmpDir, 'main', 'soul', 'wiki');
+    fs.mkdirSync(wiki, { recursive: true });
+    const p = path.join(wiki, 'tasks-and-projects.md');
+    fs.writeFileSync(p, '# Tasks\n');
+    fs.utimesSync(p, at, at);
+  }
+
+  async function run(task: typeof morningTask) {
+    return soulCapability.hooks!.beforeTaskRun!(task);
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
+  });
+  afterEach(async () => {
+    await soulCapability.teardown!();
+    vi.useRealTimers();
+  });
+
+  describe('morning plan', () => {
+    it('skips and writes a zero-item plan for today when nothing is pending', async () => {
+      await soulCapability.init(ctx());
+      logRun(morningTask.id, new Date(NOW.getTime() - DAY_MS));
+      expect(await run(morningTask)).toBe(false);
+      const plan = JSON.parse(fs.readFileSync(planPath(), 'utf-8'));
+      expect(plan.date).toBe(todayLocal());
+      expect(plan.items).toEqual([]);
+      expect(typeof plan.generated_at).toBe('string');
+      expect(typeof plan.notes).toBe('string');
+    });
+
+    it('runs when a proposed bet exists', async () => {
+      await soulCapability.init(ctx());
+      logRun(morningTask.id, new Date(NOW.getTime() - DAY_MS));
+      insertProposedBet();
+      expect(await run(morningTask)).toBe(true);
+      expect(fs.existsSync(planPath())).toBe(false);
+    });
+
+    it('runs when an active soul has a pending intervention', async () => {
+      await soulCapability.init(ctx());
+      logRun(morningTask.id, new Date(NOW.getTime() - DAY_MS));
+      insertActiveSoul('proj-x');
+      addPendingIntervention('proj-x');
+      expect(await run(morningTask)).toBe(true);
+    });
+
+    it('runs when a new observation arrived since the last real run', async () => {
+      await soulCapability.init(ctx());
+      logRun(morningTask.id, new Date(NOW.getTime() - DAY_MS));
+      addObservation('main', new Date(NOW.getTime() - 3 * 60 * 60 * 1000));
+      expect(await run(morningTask)).toBe(true);
+    });
+
+    it('skips when the only observation predates the last real run', async () => {
+      await soulCapability.init(ctx());
+      addObservation('main', new Date(NOW.getTime() - 5 * DAY_MS));
+      logRun(morningTask.id, new Date(NOW.getTime() - DAY_MS));
+      expect(await run(morningTask)).toBe(false);
+    });
+
+    it('runs when tasks-and-projects.md changed since the last real run', async () => {
+      await soulCapability.init(ctx());
+      logRun(morningTask.id, new Date(NOW.getTime() - DAY_MS));
+      setTasksPageMtime(new Date(NOW.getTime() - 60 * 60 * 1000));
+      expect(await run(morningTask)).toBe(true);
+    });
+
+    it('skips when tasks-and-projects.md is older than the last real run', async () => {
+      await soulCapability.init(ctx());
+      setTasksPageMtime(new Date(NOW.getTime() - 5 * DAY_MS));
+      logRun(morningTask.id, new Date(NOW.getTime() - DAY_MS));
+      expect(await run(morningTask)).toBe(false);
+    });
+
+    it('runs when the task has never really executed', async () => {
+      await soulCapability.init(ctx());
+      expect(await run(morningTask)).toBe(true);
+    });
+
+    it('ignores skipped log rows when finding the last real run', async () => {
+      await soulCapability.init(ctx());
+      logRun(morningTask.id, new Date(NOW.getTime() - 10 * DAY_MS));
+      // Observation after the real run but before the (skipped) run row:
+      // a skipped row must not swallow it.
+      addObservation('main', new Date(NOW.getTime() - 3 * DAY_MS));
+      logRun(morningTask.id, new Date(NOW.getTime() - DAY_MS), {
+        skipped: true,
+      });
+      expect(await run(morningTask)).toBe(true);
+    });
+
+    it("still skips without rewriting when today's plan already exists", async () => {
+      await soulCapability.init(ctx());
+      writePlanFile(todayLocal(), [{ type: 'reminder', status: 'pending' }]);
+      insertProposedBet();
+      expect(await run(morningTask)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(planPath(), 'utf-8')).items).toHaveLength(1);
+    });
+
+    it('fails open when the gate query throws', async () => {
+      await soulCapability.init(ctx());
+      logRun(morningTask.id, new Date(NOW.getTime() - DAY_MS));
+      getDb().exec('DROP TABLE bets');
+      expect(await run(morningTask)).toBe(true);
+    });
+  });
+
+  describe('evening journal', () => {
+    it('skips when idle and the last real run was under 7 days ago', async () => {
+      await soulCapability.init(ctx());
+      logRun(journalTask.id, new Date(NOW.getTime() - 2 * DAY_MS));
+      writePlanFile(todayLocal(), []);
+      expect(await run(journalTask)).toBe(false);
+    });
+
+    it('skips when idle and no plan file exists', async () => {
+      await soulCapability.init(ctx());
+      logRun(journalTask.id, new Date(NOW.getTime() - 2 * DAY_MS));
+      expect(await run(journalTask)).toBe(false);
+    });
+
+    it('runs when main has uncurated rows', async () => {
+      await soulCapability.init(ctx());
+      logRun(journalTask.id, new Date(NOW.getTime() - 2 * DAY_MS));
+      addObservation('main', new Date(NOW.getTime() - 60 * 1000));
+      expect(await run(journalTask)).toBe(true);
+    });
+
+    it('runs when an active spawned soul has uncurated rows', async () => {
+      await soulCapability.init(ctx());
+      logRun(journalTask.id, new Date(NOW.getTime() - 2 * DAY_MS));
+      insertActiveSoul('proj-x');
+      addObservation('proj-x', new Date(NOW.getTime() - 60 * 1000));
+      expect(await run(journalTask)).toBe(true);
+    });
+
+    it("runs when today's plan has items", async () => {
+      await soulCapability.init(ctx());
+      logRun(journalTask.id, new Date(NOW.getTime() - 2 * DAY_MS));
+      writePlanFile(todayLocal(), [{ type: 'project_work', status: 'pending' }]);
+      expect(await run(journalTask)).toBe(true);
+    });
+
+    it('runs when the plan file is malformed', async () => {
+      await soulCapability.init(ctx());
+      logRun(journalTask.id, new Date(NOW.getTime() - 2 * DAY_MS));
+      fs.mkdirSync(path.dirname(planPath()), { recursive: true });
+      fs.writeFileSync(planPath(), '{nope', 'utf-8');
+      expect(await run(journalTask)).toBe(true);
+    });
+
+    it('runs when a pending intervention exists', async () => {
+      await soulCapability.init(ctx());
+      logRun(journalTask.id, new Date(NOW.getTime() - 2 * DAY_MS));
+      addPendingIntervention();
+      expect(await run(journalTask)).toBe(true);
+    });
+
+    it('runs for the periodic deep review when the last real run was 7+ days ago', async () => {
+      await soulCapability.init(ctx());
+      logRun(journalTask.id, new Date(NOW.getTime() - 7 * DAY_MS));
+      expect(await run(journalTask)).toBe(true);
+    });
+
+    it('does not count skipped rows as a real run for the 7-day rule', async () => {
+      await soulCapability.init(ctx());
+      logRun(journalTask.id, new Date(NOW.getTime() - 9 * DAY_MS));
+      logRun(journalTask.id, new Date(NOW.getTime() - DAY_MS), {
+        skipped: true,
+      });
+      expect(await run(journalTask)).toBe(true);
+    });
+
+    it('runs when the task has never really executed', async () => {
+      await soulCapability.init(ctx());
+      logRun(journalTask.id, new Date(NOW.getTime() - DAY_MS), {
+        skipped: true,
+      });
+      expect(await run(journalTask)).toBe(true);
+    });
+
+    it('fails open when the gate query throws', async () => {
+      await soulCapability.init(ctx());
+      logRun(journalTask.id, new Date(NOW.getTime() - 2 * DAY_MS));
+      getDb().exec('DROP TABLE memory_stream');
+      expect(await run(journalTask)).toBe(true);
+    });
+  });
+});
