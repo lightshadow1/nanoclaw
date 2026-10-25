@@ -5,7 +5,31 @@
 // data (DB rows, wiki files) itself on each run. The host never builds a
 // per-run prompt and never calls the LLM directly.
 
-export function buildWikiCurationPrompt(folder: string): string {
+import {
+  type JournalPromptOptions,
+  todayCommand,
+} from './research-journal-prompts.js';
+
+// Part 3 of the curation pass, present only when the notes vault is mounted.
+// The host gate lists the unanswered comments in vault-comments.json; this
+// pass answers them in the note and records steers for the next run.
+function buildCommentPass(journal: JournalPromptOptions): string {
+  return `# Part 3 — Answer the owner's vault comments
+
+A. Read /workspace/group/soul/vault-comments.json. If it is missing or lists no comments, skip this part. Each entry gives \`file\` (relative to /workspace/extra/notes), the \`line\` the comment starts on, its \`text\`, and \`urgent\`.
+B. For each comment, open the note and find it. Skip it if a \`{>> [author=claude] … <<}\` reply already follows it. Otherwise:
+   - In a \`Research Journal/Souls/<folder>/\` or \`Research Journal/Tasks/<name>/\` note, a comment usually steers future runs of that source: add it to that folder's \`_Steering.md\` as \`(standing)\` or \`(once)\` (create the file if missing). On a weekly index note, file each steer under the source it is about. In an \`Inbox/\` note, do what the comment asks, editing only that note.
+   - If it is urgent (text starts with \`!\`), do the work now, research included, and append \`## Follow-up <today>\` to the note with the result.
+   - Reply immediately after the comment: \`{>> [author=claude] <one line: what you did, or what the next run will do> <<}\`. Never delete or reword the owner's comment.
+C. Today is \`${todayCommand(journal)}\`. The reply in the note is the answer: leave comment handling out of your Output and don't message the owner about it.
+
+`;
+}
+
+export function buildWikiCurationPrompt(
+  folder: string,
+  journal?: JournalPromptOptions,
+): string {
   return `You are performing a wiki curation pass. You are the MAIN soul, and
 you are the only soul with database access — so you curate BOTH your own
 memory AND the memory of every spawned soul into their wikis.
@@ -61,7 +85,7 @@ them. Their observations were routed into their memory_stream by the host.
     e. Mark that soul's processed entries curated:
        sqlite3 /workspace/project/store/messages.db "UPDATE memory_stream SET curated = 1 WHERE id IN ('id1','id2',...)"
 
-# Output
+${journal ? buildCommentPass(journal) : ''}# Output
 
 13. Output a 1-2 sentence summary of what changed across yourself and the spawned souls (this goes to the user's chat). If nothing changed (other than marking entries curated), wrap your final output in <internal>...</internal> so nothing is sent.
 `;

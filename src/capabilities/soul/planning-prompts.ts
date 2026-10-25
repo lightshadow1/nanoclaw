@@ -19,6 +19,10 @@ import {
   PROACTIVE_QUIET_START,
 } from './proactive-budget.js';
 import { BET_WINDOW_DAYS, MAX_OPEN_BETS } from './bet-store.js';
+import {
+  type JournalPromptOptions,
+  todayCommand,
+} from './research-journal-prompts.js';
 
 // Render an integer hour (0-23) as a 12-hour clock string ("7 AM", "10 PM").
 function formatHour(h: number): string {
@@ -173,7 +177,38 @@ your output in <internal>...</internal>. Quiet check-ins are the norm.
 `;
 }
 
-export function buildProductionPrompt(folder: string): string {
+export function buildProductionPrompt(
+  folder: string,
+  journal?: JournalPromptOptions,
+): string {
+  // With the notes vault mounted, every soul is researched and written up
+  // each week; bet capacity only limits which souls may get a new bet.
+  const capacityRules = journal
+    ? `   - A soul that already has an open (proposed or sent) bet gets no new bet
+     this week, but is still researched and written up.
+   - If ${MAX_OPEN_BETS} or more bets are open in total, insert no bets this
+     week. Still research and write up every soul.`
+    : `   - Skip any soul that already has an open (proposed or sent) bet.
+   - Global cap: if ${MAX_OPEN_BETS} or more bets are open in total, stop —
+     ledger is full.`;
+  const soulsHeading = journal ? 'For EACH soul' : 'For EACH remaining soul';
+  const steeringStep = journal
+    ? `   0. Read /workspace/extra/notes/Research Journal/Souls/SOUL/_Steering.md
+      if it exists and apply its unchecked steers.
+`
+    : '';
+  const betCondition = journal
+    ? 'If this soul may get a bet this week (step 2) — and only if something\n      clears the bar —'
+    : 'If — and only if — something clears the bar,';
+  const journalStep = journal
+    ? `   e. Write SOUL's journal note at
+      /workspace/extra/notes/Research Journal/Souls/SOUL/<today>.md (today:
+      \`${todayCommand(journal)}\`), following the Research Journal rules in
+      CLAUDE.md, with source: SOUL. flags = the findings worth the owner's
+      attention this week (a proposed bet counts as one). Write it even when
+      nothing cleared the bar.
+`
+    : '';
   return `You are doing the weekly production pass: each soul gets one chance
 to turn its accumulated knowledge plus fresh research into AT MOST ONE bet —
 a decision-ready finding worth interrupting the owner for.
@@ -203,12 +238,10 @@ sqlite3 /workspace/project/store/messages.db "SELECT group_folder, title, resolu
 
 2. Check capacity:
    sqlite3 /workspace/project/store/messages.db "SELECT group_folder, COUNT(*) FROM bets WHERE status IN ('proposed', 'sent') GROUP BY group_folder"
-   - Skip any soul that already has an open (proposed or sent) bet.
-   - Global cap: if ${MAX_OPEN_BETS} or more bets are open in total, stop —
-     ledger is full.
+${capacityRules}
 
-3. For EACH remaining soul (its folder below is SOUL):
-   a. Read its wiki: /workspace/project/groups/SOUL/soul/wiki/_index.md and
+3. ${soulsHeading} (its folder below is SOUL):
+${steeringStep}   a. Read its wiki: /workspace/project/groups/SOUL/soul/wiki/_index.md and
       the pages relevant to its spawn_reason. (Your own wiki is at
       /workspace/group/soul/wiki/.)
    b. Research the domain with your available tools (web search, browser).
@@ -216,12 +249,12 @@ sqlite3 /workspace/project/store/messages.db "SELECT group_folder, title, resolu
       that change a decision the owner faces.
    c. Update that soul's wiki with what you learned (same rules as curation:
       rewrite sections, refresh <!-- last_confirmed: YYYY-MM-DD -->, prune).
-   d. If — and only if — something clears the bar, insert ONE bet. Use single
+   d. ${betCondition} insert ONE bet. Use single
       quotes doubled ('') to escape any quotes inside text:
       sqlite3 /workspace/project/store/messages.db "INSERT INTO bets (id, group_folder, title, body, recommendation, prediction, status, created_at, window_days) VALUES (lower(hex(randomblob(16))), 'SOUL', '<TITLE max ~80 chars>', '<BODY: the finding + pros/cons + concrete action, a few short paragraphs>', '<RECOMMENDATION: one sentence>', '<PREDICTION: what you expect the owner to do with it>', 'proposed', datetime('now'), ${BET_WINDOW_DAYS})"
       The check-in task publishes it later — do NOT send it to the chat
       yourself, and do not publish more than the single best bet per soul.
-
+${journalStep}
 ## Output
 
 <internal>One line per soul: bet proposed (title) or nothing cleared the

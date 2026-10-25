@@ -11,6 +11,9 @@ import {
 } from '../../db.js';
 import { runMigrations } from '../lifecycle.js';
 import { soulCapability } from './index.js';
+import { buildWikiCurationPrompt } from './curator-prompts.js';
+import { buildProductionPrompt } from './planning-prompts.js';
+import { buildNotesVaultSection } from './research-journal-prompts.js';
 import {
   betsProposedOn,
   collectOutcomes,
@@ -514,5 +517,67 @@ describe('research digest', () => {
       expect(await runResearchDigest(deps(at(12, 15), ok))).toBe('sent');
       expect(ok).toHaveBeenCalledOnce();
     });
+  });
+});
+
+// --- Journal rules and prompt text ---
+
+describe('research journal prompts', () => {
+  const o = { timezone: 'America/Toronto' };
+
+  it('vault section carries the vault, chat-vs-note, comment and journal rules', () => {
+    const s = buildNotesVaultSection(o);
+    expect(s.startsWith('<!-- notes-vault-section -->')).toBe(true);
+    expect(s.trimEnd().endsWith('<!-- /notes-vault-section -->')).toBe(true);
+    for (const needle of [
+      'TZ=America/Toronto date +%F',
+      '/workspace/extra/notes',
+      '.livesync/',
+      'source: telegram',
+      'status: draft',
+      '[author=claude]',
+      'Never delete',
+      'type: research-journal',
+      'summary:',
+      '_Steering.md',
+      '## Re-run',
+      'Following your steer',
+      'Quiet this week',
+      '<internal>',
+    ]) {
+      expect(s).toContain(needle);
+    }
+    expect(s).not.toContain('delete the comment');
+  });
+
+  it('curation prompt gains the comment pass only with the journal', () => {
+    expect(buildWikiCurationPrompt('main')).not.toContain(
+      'vault-comments.json',
+    );
+    const p = buildWikiCurationPrompt('main', o);
+    for (const needle of [
+      '/workspace/group/soul/vault-comments.json',
+      '{>> [author=claude]',
+      '_Steering.md',
+      '## Follow-up',
+      'TZ=America/Toronto date +%F',
+    ]) {
+      expect(p).toContain(needle);
+    }
+  });
+
+  it('production prompt writes a note per soul and keeps the bet rules', () => {
+    expect(buildProductionPrompt('main')).not.toContain('Research Journal');
+    const p = buildProductionPrompt('main', o);
+    for (const needle of [
+      '/workspace/extra/notes/Research Journal/Souls/SOUL/',
+      '_Steering.md',
+      'still researched and written up',
+      'INSERT INTO bets',
+      'never messages the owner directly',
+    ]) {
+      expect(p).toContain(needle);
+    }
+    expect(p).not.toContain('Skip any soul that already has an open');
   });
 });
