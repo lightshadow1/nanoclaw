@@ -38,6 +38,22 @@ import {
   buildProductionPrompt,
 } from './planning-prompts.js';
 import {
+  type JournalConfig,
+  loadJournalConfig,
+  localDateString,
+  resolveVaultPath,
+  RESEARCH_DIGEST_SCHEDULE,
+  runResearchDigest,
+  scanVaultComments,
+  writeVaultCommentsFile,
+} from './research-journal.js';
+import {
+  buildNotesVaultSection,
+  NOTES_VAULT_END_MARKER,
+  NOTES_VAULT_MARKER,
+  RESEARCH_DIGEST_TASK_PROMPT,
+} from './research-journal-prompts.js';
+import {
   canSendProactive,
   readBudget,
   recordProactiveSend,
@@ -49,7 +65,6 @@ import {
   getBetById,
   getOpenBets,
   markBetSent,
-  MAX_OPEN_BETS,
   parseBetButton,
   renderLedger,
   resolveBetById,
@@ -117,6 +132,10 @@ let mainChatJid: string | null = null;
 let loopbackTransport: LoopbackTransport | null = null;
 let lifecycleCtx: LifecycleContext | null = null;
 let mainSoulDid: string | null = null;
+
+// Research journal: set at init when main has a writable `notes` mount (the
+// owner's Obsidian vault). Null means the journal is off everywhere.
+let journal: { vaultPath: string; config: JournalConfig } | null = null;
 
 function discoverSkills(projectRoot: string): string[] {
   const skillsDir = path.join(projectRoot, '.claude', 'skills');
@@ -569,12 +588,13 @@ function ensureSoulTasks(ctx: CapabilityContext): void {
     return;
   }
   const [mainJid] = mainEntry;
+  const journalPrompts = journal ? { timezone: TIMEZONE } : undefined;
 
   upsertSoulTask({
     id: `soul-wiki-curation-${MAIN_GROUP_FOLDER}`,
     group_folder: MAIN_GROUP_FOLDER,
     chat_jid: mainJid,
-    prompt: buildWikiCurationPrompt(MAIN_GROUP_FOLDER),
+    prompt: buildWikiCurationPrompt(MAIN_GROUP_FOLDER, journalPrompts),
     schedule_type: 'interval',
     schedule_value: '7200000', // 2 hours — the beforeTaskRun gate skips empty passes for free
     max_runtime_ms: SOUL_DEFAULT_RUNTIME_MS,
@@ -617,11 +637,26 @@ function ensureSoulTasks(ctx: CapabilityContext): void {
     id: `soul-production-${MAIN_GROUP_FOLDER}`,
     group_folder: MAIN_GROUP_FOLDER,
     chat_jid: mainJid,
-    prompt: buildProductionPrompt(MAIN_GROUP_FOLDER),
+    prompt: buildProductionPrompt(MAIN_GROUP_FOLDER, journalPrompts),
     schedule_type: 'cron',
     schedule_value: '0 9 * * 1', // Monday 9 AM local
     max_runtime_ms: SOUL_PRODUCTION_RUNTIME_MS,
   });
+
+  // Research journal digest: runs entirely in the beforeTaskRun gate (index
+  // note + one Telegram message once every Monday source has run). It never
+  // starts a container; the prompt is only a stub.
+  if (journal) {
+    upsertSoulTask({
+      id: `soul-research-digest-${MAIN_GROUP_FOLDER}`,
+      group_folder: MAIN_GROUP_FOLDER,
+      chat_jid: mainJid,
+      prompt: RESEARCH_DIGEST_TASK_PROMPT,
+      schedule_type: 'cron',
+      schedule_value: RESEARCH_DIGEST_SCHEDULE,
+      max_runtime_ms: SOUL_DEFAULT_RUNTIME_MS,
+    });
+  }
 }
 
 const SOUL_CLAUDE_MD_MARKER = '<!-- soul-section -->';
@@ -656,52 +691,55 @@ ${SOUL_CLAUDE_MD_END_MARKER}
 // pick up updated section content. Legacy installs (only the opening marker,
 // no closing marker — Phase 2/3 era) are migrated by replacing from the start
 // marker through EOF on the assumption the old section was appended last.
-function ensureClaudeMdSection(groupsDirectory: string, folder: string): void {
-  const claudePath = path.join(groupsDirectory, folder, 'CLAUDE.md');
-
+function ensureMarkedSection(
+  claudePath: string,
+  startMarker: string,
+  endMarker: string,
+  section: string,
+): void {
   if (!fs.existsSync(claudePath)) {
     fs.mkdirSync(path.dirname(claudePath), { recursive: true });
-    fs.writeFileSync(claudePath, SOUL_CLAUDE_MD_SECTION, 'utf-8');
-    logger.info({ folder }, 'Created CLAUDE.md with soul section');
+    fs.writeFileSync(claudePath, section, 'utf-8');
+    logger.info({ claudePath, startMarker }, 'Created CLAUDE.md with section');
     return;
   }
 
   const existing = fs.readFileSync(claudePath, 'utf-8');
-  const startIdx = existing.indexOf(SOUL_CLAUDE_MD_MARKER);
+  const startIdx = existing.indexOf(startMarker);
 
   if (startIdx === -1) {
     // No marker yet — append the section.
     const separator = existing.endsWith('\n') ? '' : '\n';
-    fs.writeFileSync(
-      claudePath,
-      existing + separator + SOUL_CLAUDE_MD_SECTION,
-      'utf-8',
-    );
-    logger.info({ folder }, 'Appended soul section to CLAUDE.md');
+    fs.writeFileSync(claudePath, existing + separator + section, 'utf-8');
+    logger.info({ claudePath, startMarker }, 'Appended section to CLAUDE.md');
     return;
   }
 
   // Marker exists. Pair it with an end marker if present (Phase 4+);
   // otherwise treat from start marker to EOF as the legacy section.
-  const endMarkerSearchFrom = startIdx + SOUL_CLAUDE_MD_MARKER.length;
-  const endMarkerIdx = existing.indexOf(
-    SOUL_CLAUDE_MD_END_MARKER,
-    endMarkerSearchFrom,
-  );
+  const endMarkerSearchFrom = startIdx + startMarker.length;
+  const endMarkerIdx = existing.indexOf(endMarker, endMarkerSearchFrom);
   const replaceEnd =
-    endMarkerIdx === -1
-      ? existing.length
-      : endMarkerIdx + SOUL_CLAUDE_MD_END_MARKER.length;
+    endMarkerIdx === -1 ? existing.length : endMarkerIdx + endMarker.length;
 
   const before = existing.slice(0, startIdx).replace(/\n*$/, '\n');
   const after = existing.slice(replaceEnd).replace(/^\n*/, '\n');
-  const insert = SOUL_CLAUDE_MD_SECTION.replace(/^\n+/, '').replace(/\n+$/, '');
+  const insert = section.replace(/^\n+/, '').replace(/\n+$/, '');
   const proposed = before + insert + after;
 
   if (proposed === existing) return; // no-op — content already current
 
   fs.writeFileSync(claudePath, proposed, 'utf-8');
-  logger.info({ folder }, 'Refreshed soul section in CLAUDE.md');
+  logger.info({ claudePath, startMarker }, 'Refreshed section in CLAUDE.md');
+}
+
+function ensureClaudeMdSection(groupsDirectory: string, folder: string): void {
+  ensureMarkedSection(
+    path.join(groupsDirectory, folder, 'CLAUDE.md'),
+    SOUL_CLAUDE_MD_MARKER,
+    SOUL_CLAUDE_MD_END_MARKER,
+    SOUL_CLAUDE_MD_SECTION,
+  );
 }
 
 // --- Idle gates for the morning plan and evening journal ---------------------
@@ -774,13 +812,6 @@ function hasNewInputSince(database: Database.Database, since: Date): boolean {
   );
 }
 
-function todayLocalString(now: Date): string {
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(
-    2,
-    '0',
-  )}-${String(now.getDate()).padStart(2, '0')}`;
-}
-
 // The host-written plan matches the shape the morning-plan prompt asks for.
 function writeEmptyDailyPlan(planPath: string, now: Date): void {
   fs.mkdirSync(path.dirname(planPath), { recursive: true });
@@ -788,7 +819,7 @@ function writeEmptyDailyPlan(planPath: string, now: Date): void {
     planPath,
     JSON.stringify(
       {
-        date: todayLocalString(now),
+        date: localDateString(now),
         generated_at: now.toISOString(),
         items: [],
         notes: '',
@@ -910,6 +941,38 @@ export const soulCapability: Capability = {
       }
     }
 
+    // Research journal: on only when main has a writable `notes` mount.
+    const vaultPath = hasMainGroup
+      ? resolveVaultPath(ctx.db, MAIN_GROUP_FOLDER, os.homedir())
+      : null;
+    if (vaultPath) {
+      journal = {
+        vaultPath,
+        config: loadJournalConfig(
+          path.join(
+            os.homedir(),
+            '.config',
+            'nanoclaw',
+            'research-journal.json',
+          ),
+        ),
+      };
+      try {
+        ensureMarkedSection(
+          path.join(ctx.groupsDir, MAIN_GROUP_FOLDER, 'CLAUDE.md'),
+          NOTES_VAULT_MARKER,
+          NOTES_VAULT_END_MARKER,
+          buildNotesVaultSection({ timezone: TIMEZONE }),
+        );
+      } catch (err) {
+        logger.error({ err }, 'Failed to ensure notes vault section');
+      }
+      logger.info(
+        { vaultPath, tasks: Object.keys(journal.config.tasks).length },
+        'Research journal enabled',
+      );
+    }
+
     try {
       ensureSoulTasks(ctx);
     } catch (err) {
@@ -959,6 +1022,7 @@ export const soulCapability: Capability = {
     loopbackTransport = null;
     lifecycleCtx = null;
     mainSoulDid = null;
+    journal = null;
     db = null;
     groupsDir = null;
     capCtx = null;
@@ -1014,7 +1078,7 @@ export const soulCapability: Capability = {
       }
     },
 
-    beforeTaskRun: (task) => {
+    beforeTaskRun: async (task) => {
       // Wiki curation: main is the sole curator for every soul (only it has
       // DB access). Route main's uncurated observations out to spawned
       // souls first, then run the pass if EITHER main or any active spawned
@@ -1032,7 +1096,10 @@ export const soulCapability: Capability = {
               Object.keys(routed.perFolder),
             );
             if (woke.length > 0) {
-              logger.info({ woke }, 'Resurrected dormant souls on new routed memory');
+              logger.info(
+                { woke },
+                'Resurrected dormant souls on new routed memory',
+              );
             }
           }
         } catch (err) {
@@ -1049,7 +1116,24 @@ export const soulCapability: Capability = {
               LIMIT 1`,
           )
           .get(MAIN_GROUP_FOLDER, MAIN_GROUP_FOLDER);
-        return pending !== undefined;
+        // Research journal: unanswered owner comments in the vault also wake
+        // the pass (Part 3 of its prompt). A scan failure counts as no
+        // comments, so a broken vault never starts a container every 2 hours.
+        let comments: ReturnType<typeof scanVaultComments> = [];
+        if (journal && groupsDir) {
+          try {
+            comments = scanVaultComments(journal.vaultPath);
+            writeVaultCommentsFile(
+              path.join(groupsDir, MAIN_GROUP_FOLDER, 'soul'),
+              comments,
+              new Date(),
+            );
+          } catch (err) {
+            logger.error({ err }, 'Vault comment scan failed');
+            comments = [];
+          }
+        }
+        return pending !== undefined || comments.length > 0;
       }
 
       // Check-in (Phase 6): expire overdue bets host-side first (that's
@@ -1147,16 +1231,34 @@ export const soulCapability: Capability = {
         );
       }
 
-      // Production pass: skip the weekly run entirely when the ledger is
-      // already at capacity — the prompt would just no-op.
-      if (task.id === `soul-production-${MAIN_GROUP_FOLDER}`) {
-        if (!db) return true;
-        try {
-          return getOpenBets(db).length < MAX_OPEN_BETS;
-        } catch (err) {
-          logger.error({ err }, 'Failed to check bet capacity; failing open');
-          return true;
+      // Production pass: always runs. Bet capacity is enforced in its prompt,
+      // and the pass still researches and writes up every soul when the
+      // ledger is full.
+
+      // Research digest: entirely host-side. Writes the weekly index and
+      // sends at most one digest once every Monday source has run (or at the
+      // deadline). Never starts a container, whatever happens.
+      if (task.id === `soul-research-digest-${MAIN_GROUP_FOLDER}`) {
+        const send = capCtx?.sendMessage;
+        if (!journal || !db || !groupsDir || !send || !mainChatJid) {
+          return false;
         }
+        const chatJid = mainChatJid;
+        try {
+          const result = await runResearchDigest({
+            db,
+            vaultPath: journal.vaultPath,
+            soulDir: path.join(groupsDir, MAIN_GROUP_FOLDER, 'soul'),
+            config: journal.config,
+            mainFolder: MAIN_GROUP_FOLDER,
+            now: new Date(),
+            send: (text) => send(chatJid, text),
+          });
+          logger.info({ result }, 'Research digest pass');
+        } catch (err) {
+          logger.error({ err }, 'Research digest failed; will retry');
+        }
+        return false;
       }
 
       // Morning plan: process any resolved+approved spawn_soul interventions
@@ -1204,7 +1306,7 @@ export const soulCapability: Capability = {
             const plan = JSON.parse(fs.readFileSync(planPath, 'utf-8')) as {
               date?: string;
             };
-            if (plan.date === todayLocalString(today)) return false;
+            if (plan.date === localDateString(today)) return false;
           } catch {
             return true; // malformed — let the task regenerate
           }

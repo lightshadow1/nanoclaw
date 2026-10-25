@@ -4,7 +4,12 @@ import fs from 'fs';
 import http from 'http';
 import os from 'os';
 import path from 'path';
-import { _initTestDatabase, getDb, getTaskById } from '../../db.js';
+import {
+  _initTestDatabase,
+  getDb,
+  getTaskById,
+  setRegisteredGroup,
+} from '../../db.js';
 import { runMigrations, rollbackCapability } from '../lifecycle.js';
 import { clearHooks } from '../hooks.js';
 import { heuristicScore } from './heuristic-score.js';
@@ -705,7 +710,9 @@ describe('ensureSoulTasks', () => {
 
     // next_run was preserved (cadence not reset on re-init)
     expect(getTaskById('soul-wiki-curation-main')!.next_run).toBe(firstNextRun);
-    expect(getTaskById('soul-wiki-curation-main')!.max_runtime_ms).toBe(3600000);
+    expect(getTaskById('soul-wiki-curation-main')!.max_runtime_ms).toBe(
+      3600000,
+    );
 
     await soulCapability.teardown!();
   });
@@ -1035,8 +1042,14 @@ describe('soulCapability beforeTaskRun gate', () => {
       const allow = await soulCapability.hooks!.beforeTaskRun!(checkInTask());
       expect(allow).toBe(false); // nothing left to do once expired
       const row = getDb()
-        .prepare('SELECT status, resolution, resolution_source FROM bets WHERE id = ?')
-        .get(overdue) as { status: string; resolution: string; resolution_source: string };
+        .prepare(
+          'SELECT status, resolution, resolution_source FROM bets WHERE id = ?',
+        )
+        .get(overdue) as {
+        status: string;
+        resolution: string;
+        resolution_source: string;
+      };
       expect(row.status).toBe('expired');
       expect(row.resolution).toBe('expired');
       expect(row.resolution_source).toBe('timeout');
@@ -1117,7 +1130,7 @@ describe('soulCapability beforeTaskRun gate', () => {
     }
   });
 
-  it('runs the production pass when below bet capacity and skips at capacity', async () => {
+  it('always runs the production pass, even at bet capacity', async () => {
     await soulCapability.init(ctx());
     const productionTask = {
       id: 'soul-production-main',
@@ -1131,7 +1144,7 @@ describe('soulCapability beforeTaskRun gate', () => {
     insertBet({ status: 'sent', sentAt: new Date().toISOString() });
     insertBet({ status: 'proposed' });
     expect(await soulCapability.hooks!.beforeTaskRun!(productionTask)).toBe(
-      false,
+      true,
     );
     await soulCapability.teardown!();
   });
@@ -1242,8 +1255,14 @@ describe('bet ledger: channel events + publish (Phase 6)', () => {
     });
 
     const row = getDb()
-      .prepare('SELECT status, resolution, resolution_source FROM bets WHERE id = ?')
-      .get(id) as { status: string; resolution: string; resolution_source: string };
+      .prepare(
+        'SELECT status, resolution, resolution_source FROM bets WHERE id = ?',
+      )
+      .get(id) as {
+      status: string;
+      resolution: string;
+      resolution_source: string;
+    };
     expect(row.status).toBe('resolved');
     expect(row.resolution).toBe('acted');
     expect(row.resolution_source).toBe('button');
@@ -1268,9 +1287,11 @@ describe('bet ledger: channel events + publish (Phase 6)', () => {
     });
 
     expect(
-      (getDb().prepare('SELECT status FROM bets WHERE id = ?').get(id) as {
-        status: string;
-      }).status,
+      (
+        getDb().prepare('SELECT status FROM bets WHERE id = ?').get(id) as {
+          status: string;
+        }
+      ).status,
     ).toBe('sent');
     expect(setLedger).not.toHaveBeenCalled();
     await soulCapability.teardown!();
@@ -1382,9 +1403,11 @@ describe('bet ledger: channel events + publish (Phase 6)', () => {
       expect(result.ok).toBe(false);
       expect(sendMessage).not.toHaveBeenCalled();
       expect(
-        (getDb().prepare('SELECT status FROM bets WHERE id = ?').get(id) as {
-          status: string;
-        }).status,
+        (
+          getDb().prepare('SELECT status FROM bets WHERE id = ?').get(id) as {
+            status: string;
+          }
+        ).status,
       ).toBe('proposed');
 
       await soulCapability.teardown!();
@@ -1473,6 +1496,158 @@ describe('planning-prompts', () => {
     expect(prompt).toContain('scout/drafts/');
     expect(prompt).toContain('send_document');
     expect(prompt).toContain('VERIFY BEFORE PUBLISHING');
+  });
+});
+
+describe('research journal wiring', () => {
+  let vault: string;
+
+  function mainGroupWith(containerConfig?: object) {
+    return {
+      name: 'Main',
+      folder: 'main',
+      trigger: '@Andy',
+      added_at: '2026-01-01T00:00:00Z',
+      ...(containerConfig ? { containerConfig } : {}),
+    };
+  }
+
+  beforeEach(() => {
+    runMigrations(getDb(), soulCapability);
+    // Never read the real ~/.config/nanoclaw/research-journal.json (or keys).
+    vi.spyOn(os, 'homedir').mockReturnValue(tmpDir);
+    vault = path.join(tmpDir, 'vault');
+    fs.mkdirSync(vault);
+    setRegisteredGroup(
+      'g@g.us',
+      mainGroupWith({
+        additionalMounts: [
+          { hostPath: vault, containerPath: 'notes', readonly: false },
+        ],
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function ctx(send?: (jid: string, text: string) => Promise<string | null>) {
+    return {
+      db: getDb(),
+      registeredGroups: () => ({
+        'g@g.us': { name: 'Main', folder: 'main' },
+      }),
+      projectRoot: tmpDir,
+      groupsDir: tmpDir,
+      dataDir: tmpDir,
+      sendMessage: send,
+    };
+  }
+
+  function curationTask() {
+    return {
+      id: 'soul-wiki-curation-main',
+      group_folder: 'main',
+      schedule_type: 'interval' as const,
+    };
+  }
+
+  function writeVault(rel: string, content: string): void {
+    const full = path.join(vault, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, content, 'utf-8');
+  }
+
+  function logRun(taskId: string, when: Date): void {
+    getDb()
+      .prepare(
+        `INSERT INTO task_run_logs (task_id, run_at, duration_ms, status, result, error)
+         VALUES (?, ?, 1000, 'success', 'done', NULL)`,
+      )
+      .run(taskId, when.toISOString());
+  }
+
+  it('adds the vault section once and journal prompts when the vault is mounted', async () => {
+    await soulCapability.init(ctx());
+    await soulCapability.teardown!();
+    await soulCapability.init(ctx());
+    const md = fs.readFileSync(path.join(tmpDir, 'main', 'CLAUDE.md'), 'utf-8');
+    expect(md.match(/<!-- notes-vault-section -->/g)).toHaveLength(1);
+    expect(md.match(/<!-- soul-section -->/g)).toHaveLength(1);
+    expect(getTaskById('soul-wiki-curation-main')!.prompt).toContain(
+      'vault-comments.json',
+    );
+    expect(getTaskById('soul-production-main')!.prompt).toContain(
+      'Research Journal/Souls/',
+    );
+    const digest = getTaskById('soul-research-digest-main')!;
+    expect(digest.schedule_value).toBe('*/15 9-21 * * 1');
+    expect(digest.capability_profile).toBe('soul-maintenance');
+    await soulCapability.teardown!();
+  });
+
+  it('changes nothing without a writable notes mount', async () => {
+    setRegisteredGroup('g@g.us', mainGroupWith());
+    await soulCapability.init(ctx());
+    expect(
+      fs.readFileSync(path.join(tmpDir, 'main', 'CLAUDE.md'), 'utf-8'),
+    ).not.toContain('notes-vault-section');
+    expect(getTaskById('soul-research-digest-main')).toBeUndefined();
+    expect(getTaskById('soul-wiki-curation-main')!.prompt).not.toContain(
+      'vault-comments.json',
+    );
+    await soulCapability.teardown!();
+  });
+
+  it('wakes curation for an unhandled vault comment and hands it over', async () => {
+    await soulCapability.init(ctx());
+    writeVault('Inbox/Trip.md', 'Plan {>> add Seoul <<}');
+    expect(await soulCapability.hooks!.beforeTaskRun!(curationTask())).toBe(
+      true,
+    );
+    const handoff = path.join(tmpDir, 'main', 'soul', 'vault-comments.json');
+    expect(JSON.parse(fs.readFileSync(handoff, 'utf-8')).comments[0].file).toBe(
+      'Inbox/Trip.md',
+    );
+    writeVault(
+      'Inbox/Trip.md',
+      'Plan {>> add Seoul <<}{>> [author=claude] added <<}',
+    );
+    expect(await soulCapability.hooks!.beforeTaskRun!(curationTask())).toBe(
+      false,
+    );
+    expect(fs.existsSync(handoff)).toBe(false);
+    await soulCapability.teardown!();
+  });
+
+  it('runs the digest host-side and never starts a container', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(2026, 9, 26, 12, 0));
+    try {
+      const send = vi.fn().mockResolvedValue('1');
+      await soulCapability.init(ctx(send));
+      logRun('soul-production-main', new Date(2026, 9, 26, 9, 30));
+      writeVault(
+        'Research Journal/Souls/main/2026-10-26.md',
+        '---\ntype: research-journal\nsource: main\nrun: 2026-10-26\nstatus: unread\nflags: 1\nsummary: "one thing"\n---\n# main',
+      );
+      const digestTask = {
+        id: 'soul-research-digest-main',
+        group_folder: 'main',
+        schedule_type: 'cron' as const,
+      };
+      expect(await soulCapability.hooks!.beforeTaskRun!(digestTask)).toBe(
+        false,
+      );
+      expect(send).toHaveBeenCalledWith(
+        'g@g.us',
+        expect.stringContaining('• main: one thing'),
+      );
+      await soulCapability.teardown!();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -5654,7 +5829,9 @@ describe('soul morning-plan / evening-journal idle gates', () => {
       writePlanFile(todayLocal(), [{ type: 'reminder', status: 'pending' }]);
       insertProposedBet();
       expect(await run(morningTask)).toBe(false);
-      expect(JSON.parse(fs.readFileSync(planPath(), 'utf-8')).items).toHaveLength(1);
+      expect(
+        JSON.parse(fs.readFileSync(planPath(), 'utf-8')).items,
+      ).toHaveLength(1);
     });
 
     it('fails open when the gate query throws', async () => {
@@ -5697,7 +5874,9 @@ describe('soul morning-plan / evening-journal idle gates', () => {
     it("runs when today's plan has items", async () => {
       await soulCapability.init(ctx());
       logRun(journalTask.id, new Date(NOW.getTime() - 2 * DAY_MS));
-      writePlanFile(todayLocal(), [{ type: 'project_work', status: 'pending' }]);
+      writePlanFile(todayLocal(), [
+        { type: 'project_work', status: 'pending' },
+      ]);
       expect(await run(journalTask)).toBe(true);
     });
 

@@ -135,6 +135,8 @@ src/capabilities/soul/
   soul-registry.ts      # Runtime ActiveSoul registry; loadActiveSouls, resolvePublicKeyByDid
   soul-lifecycle.ts     # spawnSoul / markDormant / markActive / archive / resurrect / processPendingSpawnApprovals (spawnSoul does NOT create a per-soul curator task — main curates all souls)
   soul-router.ts        # Keyword-based routing of uncurated main observations into spawned souls (rows main's curator later digests into each soul's wiki)
+  research-journal.ts   # Obsidian vault (host side): unanswered CriticMarkup comments, journal sources/outcomes, Monday weekly index + digest
+  research-journal-prompts.ts # Code-managed "Notes Vault" CLAUDE.md section (vault, chat-vs-note, comments, Research Journal rules) + digest stub prompt
   protocol/
     canonical.ts        # Recursive-key-sort JSON canonicalization (shared with identity.ts)
     types.ts            # Verb, MessageEnvelope, SignedMessage, verb body unions + guards
@@ -163,11 +165,12 @@ src/capabilities/soul/
 
 | Task ID | Schedule | Purpose |
 |---------|----------|---------|
-| `soul-wiki-curation-main` | Every 2 hours (interval) | Part 1: curate main's uncurated memory into main's wiki. Part 2: for each active spawned soul, digest its routed uncurated rows into that soul's wiki. Gated: skip unless main or some active spawned soul has uncurated rows. (Spawned souls have **no** curator task of their own.) |
+| `soul-wiki-curation-main` | Every 2 hours (interval) | Part 1: curate main's uncurated memory into main's wiki. Part 2: for each active spawned soul, digest its routed uncurated rows into that soul's wiki. Part 3 (vault mounted): reply to unanswered owner comments in `Research Journal/` and `Inbox/` and record steers in `_Steering.md`. Gated: skip unless main or some active spawned soul has uncurated rows, or the vault has an unanswered comment (listed for the container in `soul/vault-comments.json`). (Spawned souls have **no** curator task of their own.) |
 | `soul-evening-journal-main` | 10 PM daily (cron) | Deep curation + plan reconciliation + staleness review |
 | `soul-morning-plan-main` | 6 AM daily (cron) | Ledger maintenance: retract stale proposed bets, surface pending interventions, write minimal daily-plan.json (reminder/project_work only, ≤2-sentence notes — no outreach items, no quiet-day narration). Gated: skip if today's plan exists. Host processes approved spawn_soul interventions first. |
 | `soul-check-in-main` | Every 2 hours (interval) | Step 0: resolve `sent` bets by topic reference in owner messages. Step 2: publish the single best `proposed` bet via `publish_bet`. Step 3: send pending plan reminders. Gated host-side: expire overdue bets first, then run only if (proposed bet && budget ok) OR (sent bet && uncurated owner observation) OR (pending reminder && budget ok). |
-| `soul-production-main` | Monday 9 AM (cron) | Weekly production pass: for each active soul (spawned + main), read its wiki, research its topics, update the wiki, and INSERT at most ONE decision-ready bet (skip souls with an open bet; global cap 3). Gated: skip when the ledger is at capacity. Never messages the owner directly. |
+| `soul-production-main` | Monday 9 AM (cron) | Weekly production pass: for each active soul (spawned + main), read its wiki, research its topics, update the wiki, and INSERT at most ONE decision-ready bet (no new bet for souls with an open bet; global cap 3). With the vault mounted, also writes one Research Journal note per soul (`Research Journal/Souls/<folder>/<date>.md`) and researches every soul even when the ledger is full. Always runs. Never messages the owner directly. |
+| `soul-research-digest-main` | Monday every 15 min, 09:00–21:45 (cron) | Host-only, registered only when main has a writable `notes` mount. Once every Monday source has run (or at 18:00), writes `Research Journal/<date> Weekly.md` and sends one Telegram digest unless the week was quiet. Sources: main + active souls (production pass) and the tasks listed in `~/.config/nanoclaw/research-journal.json` (`{"tasks": {"<task id>": "<folder under Tasks/>"}}`). Never starts a container. |
 
 ### Parent Spec
 
