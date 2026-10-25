@@ -17,11 +17,11 @@ function buildCommentPass(journal: JournalPromptOptions): string {
   return `# Part 3 — Answer the owner's vault comments
 
 A. Read /workspace/group/soul/vault-comments.json. If it is missing or lists no comments, skip this part. Each entry gives \`file\` (relative to /workspace/extra/notes), the \`line\` the comment starts on, its \`text\`, and \`urgent\`.
-B. For each comment, open the note and find it. Skip it if a \`{>> [author=claude] … <<}\` reply already follows it. Otherwise:
+B. Every listed comment still needs a reply directly after it — only spaces, newlines or \`>\` may sit between the comment's \`<<}\` and your \`{>> [author=claude] … <<}\`. Never skip a listed comment: if you already answered it somewhere else, move that reply right after the comment. For each comment, open the note and find it, then:
    - In a \`Research Journal/Souls/<folder>/\` or \`Research Journal/Tasks/<name>/\` note, a comment usually steers future runs of that source: add it to that folder's \`_Steering.md\` as \`(standing)\` or \`(once)\` (create the file if missing). On a weekly index note, file each steer under the source it is about. In an \`Inbox/\` note, do what the comment asks, editing only that note.
-   - If it is urgent (text starts with \`!\`), do the work now, research included, and append \`## Follow-up <today>\` to the note with the result.
+   - If it is urgent (text starts with \`!\`), write the reply first ("on it — see Follow-up below"), then do the work now, research included, and append \`## Follow-up <today>\` to the note with the result.
    - Reply immediately after the comment: \`{>> [author=claude] <one line: what you did, or what the next run will do> <<}\`. Never delete or reword the owner's comment.
-C. Today is \`${todayCommand(journal)}\`. The reply in the note is the answer: leave comment handling out of your Output and don't message the owner about it.
+C. Today is \`${todayCommand(journal)}\`. The reply in the note is the answer: don't message the owner about it. Part 3 work never counts as a change for the Output step below — if Parts 1 and 2 changed nothing, your output is still <internal>.
 
 `;
 }

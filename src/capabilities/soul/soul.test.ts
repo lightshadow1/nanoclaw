@@ -1621,6 +1621,48 @@ describe('research journal wiring', () => {
     await soulCapability.teardown!();
   });
 
+  it('retries the digest when Telegram reports a failed send', async () => {
+    // TelegramChannel.sendMessage returns null on failure instead of throwing.
+    setRegisteredGroup(
+      'tg:42',
+      mainGroupWith({
+        additionalMounts: [
+          { hostPath: vault, containerPath: 'notes', readonly: false },
+        ],
+      }),
+    );
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(2026, 9, 26, 12, 0));
+    try {
+      const send = vi.fn().mockResolvedValueOnce(null).mockResolvedValue('7');
+      await soulCapability.init({
+        ...ctx(send),
+        registeredGroups: () => ({ 'tg:42': { name: 'Main', folder: 'main' } }),
+      });
+      logRun('soul-production-main', new Date(2026, 9, 26, 9, 30));
+      writeVault(
+        'Research Journal/Souls/main/2026-10-26.md',
+        '---\nflags: 1\nsummary: "one thing"\n---\n# main',
+      );
+      const digestTask = {
+        id: 'soul-research-digest-main',
+        group_folder: 'main',
+        schedule_type: 'cron' as const,
+      };
+      await soulCapability.hooks!.beforeTaskRun!(digestTask);
+      const state = path.join(tmpDir, 'main', 'soul', 'research-digest.json');
+      expect(fs.existsSync(state)).toBe(false);
+      await soulCapability.hooks!.beforeTaskRun!(digestTask);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(fs.existsSync(state)).toBe(true);
+      await soulCapability.hooks!.beforeTaskRun!(digestTask);
+      expect(send).toHaveBeenCalledTimes(2);
+      await soulCapability.teardown!();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('runs the digest host-side and never starts a container', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date(2026, 9, 26, 12, 0));

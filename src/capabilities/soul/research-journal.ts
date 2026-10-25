@@ -10,6 +10,7 @@ import path from 'path';
 import type Database from 'better-sqlite3';
 import { parse as parseYaml } from 'yaml';
 import { logger } from '../../logger.js';
+import { PROACTIVE_QUIET_START } from './proactive-budget.js';
 
 export const VAULT_CONTAINER_DIR = '/workspace/extra/notes';
 export const JOURNAL_DIR = 'Research Journal';
@@ -37,13 +38,15 @@ function maskCode(markdown: string): string {
       if (isFence) inFence = !inFence;
       return ' '.repeat(line.length);
     }
-    return line.replace(/`[^`\n]*`/g, (span) => ' '.repeat(span.length));
+    // A code span opens and closes with the same run of backticks.
+    return line.replace(/(`+)[^\n]*?\1/g, (span) => ' '.repeat(span.length));
   });
   return masked.join('\n');
 }
 
 const COMMENT_RE = /\{>>([\s\S]*?)<<\}/g;
-const NEXT_COMMENT_RE = /^\s*\{>>([\s\S]*?)<<\}/;
+// A reply may sit on the next line of a blockquote or callout, after `>`.
+const NEXT_COMMENT_RE = /^[\s>]*\{>>([\s\S]*?)<<\}/;
 
 export function findUnhandledComments(
   markdown: string,
@@ -467,8 +470,13 @@ function readLastDone(soulDir: string): string | null {
 // retries without rewriting the index.
 export async function runResearchDigest(
   deps: DigestDeps,
-): Promise<'already-done' | 'not-ready' | 'sent' | 'quiet'> {
+): Promise<'off-schedule' | 'already-done' | 'not-ready' | 'sent' | 'quiet'> {
   const { db, vaultPath, soulDir, config, mainFolder, now } = deps;
+  // The scheduler fires an overdue tick after a restart, so check the clock
+  // here: Monday only, and never inside quiet hours.
+  if (now.getDay() !== 1 || now.getHours() >= PROACTIVE_QUIET_START) {
+    return 'off-schedule';
+  }
   const runDate = localDateString(now);
   if (readLastDone(soulDir) === runDate) return 'already-done';
 

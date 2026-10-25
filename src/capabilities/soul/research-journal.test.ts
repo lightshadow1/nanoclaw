@@ -95,6 +95,16 @@ describe('findUnhandledComments', () => {
     expect(findUnhandledComments(md)).toEqual([]);
   });
 
+  it('accepts a reply on the next line of a blockquote or callout', () => {
+    expect(
+      findUnhandledComments('> Para {>> q <<}\n> {>> [author=claude] ok <<}'),
+    ).toEqual([]);
+  });
+
+  it('ignores CriticMarkup inside double-backtick code spans', () => {
+    expect(findUnhandledComments('Use ``{>> x <<}`` here')).toEqual([]);
+  });
+
   it('collapses multi-line comment text and reports the start line', () => {
     expect(findUnhandledComments('x\n{>> line one\nline two <<}')).toEqual([
       { line: 2, text: 'line one line two', urgent: false },
@@ -500,6 +510,19 @@ describe('research digest', () => {
       );
     });
 
+    it('does nothing outside Monday daytime, even on an overdue tick', async () => {
+      const send = vi.fn().mockResolvedValue('m1');
+      // Tuesday evening after a restart, and Monday inside quiet hours.
+      expect(
+        await runResearchDigest(deps(new Date(2026, 9, 27, 19, 0), send)),
+      ).toBe('off-schedule');
+      expect(await runResearchDigest(deps(at(22, 30), send))).toBe(
+        'off-schedule',
+      );
+      expect(send).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(vault, 'Research Journal'))).toBe(false);
+    });
+
     it('retries a failed send without sending twice', async () => {
       logRun('soul-production-main', at(9, 30));
       logRun('t-scout', at(10, 20));
@@ -561,6 +584,11 @@ describe('research journal prompts', () => {
       '_Steering.md',
       '## Follow-up',
       'TZ=America/Toronto date +%F',
+      // Host and agent must agree on "handled", or the pass loops forever.
+      'Never skip a listed comment',
+      'write the reply first',
+      // Comment replies must not leak into a Telegram summary.
+      'never counts as a change',
     ]) {
       expect(p).toContain(needle);
     }

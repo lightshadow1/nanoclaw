@@ -1252,7 +1252,15 @@ export const soulCapability: Capability = {
             config: journal.config,
             mainFolder: MAIN_GROUP_FOLDER,
             now: new Date(),
-            send: (text) => send(chatJid, text),
+            send: async (text) => {
+              const messageId = await send(chatJid, text);
+              // Telegram reports a failed send as null instead of throwing;
+              // throw so the day stays open and the next tick retries.
+              // (WhatsApp returns null for queued sends, which do arrive.)
+              if (messageId === null && chatJid.startsWith('tg:')) {
+                throw new Error('Telegram send failed');
+              }
+            },
           });
           logger.info({ result }, 'Research digest pass');
         } catch (err) {
