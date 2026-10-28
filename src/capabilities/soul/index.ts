@@ -53,6 +53,7 @@ import {
   NOTES_VAULT_MARKER,
   RESEARCH_DIGEST_TASK_PROMPT,
 } from './research-journal-prompts.js';
+import { refreshTaskDirective } from './task-directive.js';
 import {
   canSendProactive,
   readBudget,
@@ -1079,6 +1080,34 @@ export const soulCapability: Capability = {
     },
 
     beforeTaskRun: async (task) => {
+      // Research journal task: refresh its _Directive.md from the live
+      // prompt so the owner sees what this run is told to do. Never blocks.
+      const directiveName = journal?.config.tasks[task.id];
+      if (journal && directiveName && db) {
+        try {
+          const row = db
+            .prepare(
+              'SELECT id, prompt, schedule_type, schedule_value FROM scheduled_tasks WHERE id = ?',
+            )
+            .get(task.id) as Parameters<typeof refreshTaskDirective>[2];
+          if (row) {
+            const result = refreshTaskDirective(
+              journal.vaultPath,
+              directiveName,
+              row,
+              localDateString(new Date()),
+            );
+            logger.info(
+              { taskId: task.id, result },
+              'Research journal directive refresh',
+            );
+          }
+        } catch (err) {
+          logger.error({ err, taskId: task.id }, 'Directive refresh failed');
+        }
+        return true;
+      }
+
       // Wiki curation: main is the sole curator for every soul (only it has
       // DB access). Route main's uncurated observations out to spawned
       // souls first, then run the pass if EITHER main or any active spawned

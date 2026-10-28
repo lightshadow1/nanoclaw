@@ -55,7 +55,7 @@ A new note starts with frontmatter \`type: <plan|research|spec|comparison|checkl
 
 Scheduled research runs write to \`Research Journal/Souls/<soul folder>/\` or \`Research Journal/Tasks/<task name>/\`; the run tells you which.
 
-1. Before researching, read \`_Steering.md\` in your source folder if it exists, and apply every unchecked steer.
+1. Before researching, read \`_Steering.md\` in your source folder if it exists, and apply every unchecked steer. A task run also reads \`_Directive.md\` there, which the host refreshes from your prompt before each run: apply any owner comment on it that has no reply yet (the comment pass replies and files it), and if its \`## In short\` section still holds the placeholder or no longer matches your instructions, rewrite only that section as 2–4 bullets: the goal, what counts as a flag, and what you treat as already known.
 2. After researching, write ONE note at \`<source folder>/<today>.md\`:
 
    \`\`\`

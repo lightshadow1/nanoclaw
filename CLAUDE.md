@@ -137,6 +137,7 @@ src/capabilities/soul/
   soul-router.ts        # Keyword-based routing of uncurated main observations into spawned souls (rows main's curator later digests into each soul's wiki)
   research-journal.ts   # Obsidian vault (host side): unanswered CriticMarkup comments, journal sources/outcomes, Monday weekly index + digest
   research-journal-prompts.ts # Code-managed "Notes Vault" CLAUDE.md section (vault, chat-vs-note, comments, Research Journal rules) + digest stub prompt
+  task-directive.ts     # Research Journal/Tasks/<name>/_Directive.md: refreshed from the task's live prompt + active steers in beforeTaskRun, so the owner can comment on the task's goal
   protocol/
     canonical.ts        # Recursive-key-sort JSON canonicalization (shared with identity.ts)
     types.ts            # Verb, MessageEnvelope, SignedMessage, verb body unions + guards

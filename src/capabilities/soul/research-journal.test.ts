@@ -563,6 +563,8 @@ describe('research journal prompts', () => {
       'type: research-journal',
       'summary:',
       '_Steering.md',
+      '_Directive.md',
+      '## In short',
       '## Re-run',
       'Following your steer',
       'Quiet this week',

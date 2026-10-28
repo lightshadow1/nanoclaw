@@ -6,6 +6,7 @@ import os from 'os';
 import path from 'path';
 import {
   _initTestDatabase,
+  createTask,
   getDb,
   getTaskById,
   setRegisteredGroup,
@@ -1618,6 +1619,52 @@ describe('research journal wiring', () => {
       false,
     );
     expect(fs.existsSync(handoff)).toBe(false);
+    await soulCapability.teardown!();
+  });
+
+  it('refreshes a journal task directive before its run and never blocks it', async () => {
+    const configDir = path.join(tmpDir, '.config', 'nanoclaw');
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(configDir, 'research-journal.json'),
+      JSON.stringify({ tasks: { 't-scout': 'Scout' } }),
+    );
+    for (const id of ['t-scout', 't-other']) {
+      createTask({
+        id,
+        group_folder: 'main',
+        chat_jid: 'g@g.us',
+        prompt: 'You are Scout, a weekly change monitor.',
+        schedule_type: 'cron',
+        schedule_value: '0 10 * * 1',
+        context_mode: 'isolated',
+        next_run: null,
+        status: 'active',
+        created_at: new Date().toISOString(),
+      });
+    }
+    writeVault(
+      'Research Journal/Tasks/Scout/_Steering.md',
+      '- [ ] (standing) drop topic 9 — from [[_Directive]], 2026-10-27\n',
+    );
+    await soulCapability.init(ctx());
+    const run = (id: string) =>
+      soulCapability.hooks!.beforeTaskRun!({
+        id,
+        group_folder: 'main',
+        schedule_type: 'cron',
+      });
+    expect(await run('t-scout')).toBe(true);
+    const page = fs.readFileSync(
+      path.join(vault, 'Research Journal/Tasks/Scout/_Directive.md'),
+      'utf-8',
+    );
+    expect(page).toContain('You are Scout, a weekly change monitor.');
+    expect(page).toContain('- (standing) drop topic 9');
+    expect(await run('t-other')).toBe(true);
+    expect(fs.readdirSync(path.join(vault, 'Research Journal/Tasks'))).toEqual([
+      'Scout',
+    ]);
     await soulCapability.teardown!();
   });
 
