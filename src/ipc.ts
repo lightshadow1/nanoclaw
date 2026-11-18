@@ -19,6 +19,7 @@ import {
   updateTask,
 } from './db.js';
 import { logger } from './logger.js';
+import { formatOutbound } from './router.js';
 import { MessageButton, RegisteredGroup, SendOptions } from './types.js';
 import {
   resolveTaskCapabilityProfile,
@@ -325,14 +326,17 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text, {
-                    buttons: sanitizeButtons(data.buttons),
-                    silent: data.silent === true || undefined,
-                  });
-                  logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'IPC message sent',
-                  );
+                  const text = formatOutbound(data.text);
+                  if (text) {
+                    await deps.sendMessage(data.chatJid, text, {
+                      buttons: sanitizeButtons(data.buttons),
+                      silent: data.silent === true || undefined,
+                    });
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup },
+                      'IPC message sent',
+                    );
+                  }
                 } else {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
