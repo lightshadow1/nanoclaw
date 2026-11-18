@@ -329,8 +329,11 @@ async function runTask(
         hadStreamedOutput = true;
         if (streamedOutput.result) {
           result = streamedOutput.result;
-          // Forward result to user (sendMessage handles formatting)
-          await deps.sendMessage(task.chat_jid, streamedOutput.result);
+          // Soul tasks reach the owner only via publish_bet/send_message; their
+          // final text is a run log the model often leaves outside <internal>.
+          if (profile.name !== 'soul-maintenance') {
+            await deps.sendMessage(task.chat_jid, streamedOutput.result);
+          }
           scheduleClose();
         }
         if (streamedOutput.status === 'success') {

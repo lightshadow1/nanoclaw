@@ -87,7 +87,7 @@ them. Their observations were routed into their memory_stream by the host.
 
 ${journal ? buildCommentPass(journal) : ''}# Output
 
-13. Output a 1-2 sentence summary of what changed across yourself and the spawned souls (this goes to the user's chat). If nothing changed (other than marking entries curated), wrap your final output in <internal>...</internal> so nothing is sent.
+13. Output a 1-2 sentence summary of what changed across yourself and the spawned souls, wrapped in <internal>...</internal>. It is logged, never sent; don't message the owner about curation.
 `;
 }
 
@@ -128,7 +128,7 @@ D. Intervention cleanup
 1. Query uncurated memory entries:
    sqlite3 /workspace/project/store/messages.db "SELECT id, timestamp, type, source, content, importance FROM memory_stream WHERE group_folder = '${folder}' AND curated = 0 ORDER BY timestamp ASC LIMIT 200"
 
-2. If there are no uncurated entries, or every returned row has importance <= 2, still do the deep staleness review (step C above), then output a 1-2 sentence end-of-day note (or wrap in <internal> if there's nothing meaningful to report).
+2. If there are no uncurated entries, or every returned row has importance <= 2, still do the deep staleness review (step C above), then output a 1-2 sentence end-of-day note in <internal>...</internal>.
 
 3. Read your wiki index at /workspace/group/soul/wiki/_index.md and list the directory.
 
@@ -143,6 +143,6 @@ D. Intervention cleanup
 8. Mark processed entries as curated:
    sqlite3 /workspace/project/store/messages.db "UPDATE memory_stream SET curated = 1 WHERE id IN ('id1','id2',...)"
 
-9. Send a brief end-of-day summary (1-3 sentences) covering both wiki updates and what got accomplished today. If nothing meaningful happened, wrap in <internal>...</internal>.
+9. Output a brief end-of-day summary (1-3 sentences) of wiki updates and what got accomplished today, wrapped in <internal>...</internal>. It is logged, never sent; don't message the owner about it.
 `;
 }

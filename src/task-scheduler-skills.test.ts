@@ -67,6 +67,7 @@ async function executeClaimedTask() {
   await pollSchedulerOnce(deps, new Date('2026-01-01T00:01:00.000Z'));
   expect(queued).toBeDefined();
   await queued!();
+  return deps;
 }
 
 function latestRun() {
@@ -153,5 +154,18 @@ describe('scheduled task skill execution', () => {
     const context = JSON.parse(run.execution_context);
     expect(context.max_runtime_ms).toBe(60000);
     expect(context.termination_reason).toBe('absolute_timeout');
+  });
+
+  it('keeps soul-maintenance output out of the chat but forwards other tasks', async () => {
+    runContainerAgent.mockImplementation(async (_g, _i, _p, onOutput) => {
+      await onOutput({ status: 'success', result: '<internal>x</internal> Quiet pass complete.' });
+      return { status: 'success', result: null };
+    });
+    addDueTask({ capability_profile: 'soul-maintenance', skills: [] });
+    expect((await executeClaimedTask()).sendMessage).not.toHaveBeenCalled();
+
+    _initTestDatabase();
+    addDueTask({ skills: [] });
+    expect((await executeClaimedTask()).sendMessage).toHaveBeenCalledTimes(1);
   });
 });
