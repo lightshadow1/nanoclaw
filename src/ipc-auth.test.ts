@@ -1136,6 +1136,23 @@ describe('send_document', () => {
     expect(sendDocument).toHaveBeenCalledWith('tg:999', 'report.pdf', 'data', 'my caption');
   });
 
+  it('strips <internal> from the caption and sends no caption when nothing is left', async () => {
+    const sendDocument = vi.fn().mockResolvedValue(undefined);
+    deps.sendDocument = sendDocument;
+    for (const caption of ['<internal>notes</internal>Draft attached.', '<internal>only notes</internal>']) {
+      await processTaskIpc(
+        { type: 'send_document', chatJid: 'tg:999', filename: 'd.md', content: 'x', caption },
+        'main',
+        true,
+        deps,
+      );
+    }
+    expect(sendDocument.mock.calls).toEqual([
+      ['tg:999', 'd.md', 'x', 'Draft attached.'],
+      ['tg:999', 'd.md', 'x', undefined],
+    ]);
+  });
+
   it('drops request when host has no sendDocument wired', async () => {
     deps.sendDocument = undefined;
     // Must not throw

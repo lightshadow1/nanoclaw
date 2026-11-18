@@ -851,7 +851,9 @@ export async function processTaskIpc(
           break;
         }
         const caption =
-          typeof data.caption === 'string' ? data.caption.slice(0, 1024) : undefined;
+          typeof data.caption === 'string'
+            ? formatOutbound(data.caption).slice(0, 1024) || undefined
+            : undefined;
         await deps.sendDocument(data.chatJid, data.filename, data.content, caption);
         logger.info(
           { chatJid: data.chatJid, filename: data.filename, sourceGroup },
